@@ -5,6 +5,14 @@ also include the bioinformatics review documentation packets for
 23andclaude.com (the genomics service that lives in the sibling
 `23andClaude` repository).
 
+## 2026-08-23 / MultiBuilder live agent streams
+
+- Added a live per-agent work panel to the project Overview with direct links to every complete run stream.
+- Agent streams now repaint on event-only updates, follow the latest output, preserve scroll position when inspecting history, and expose command output, exit codes, messages, tools, and state changes.
+- Complete run histories load with cursor pagination. Provider output deltas and repeated heartbeats are grouped without dropping content.
+- Added server-side run filtering for efficient history retrieval after the next safe service restart. The compatible frontend pagination is already live without interrupting active agents.
+- Verified desktop and 375 px mobile layouts, zero browser console errors, and the full MultiBuilder test suite.
+
 ## 2026-05-14 / 2026-05-15 — `pipelinesdocsv2/` + `pipelinesdocs/`
 
 Two markdown documentation packets served under nginx at

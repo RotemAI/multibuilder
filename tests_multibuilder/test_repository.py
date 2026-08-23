@@ -109,6 +109,35 @@ async def test_event_cursor_returns_only_newer_events(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_event_cursor_can_filter_a_complete_agent_run(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'run-events.db'}")
+    await database.create_schema()
+    repository = ControlPlaneRepository(database.session_factory)
+    project = ProjectSpec(
+        id=uuid4(),
+        name="run-events",
+        goal="Inspect each agent independently",
+        repository_url="git@example.test:events.git",
+        base_branch="main",
+        acceptance_criteria=["Every run has a complete event stream"],
+        max_parallelism=2,
+    )
+    await repository.create_project(project)
+    selected_run = uuid4()
+    other_run = uuid4()
+    first = await repository.append_event(project.id, "command.started", {"command": "one"}, run_id=selected_run)
+    await repository.append_event(project.id, "command.started", {"command": "other"}, run_id=other_run)
+    await repository.append_event(project.id, "command.completed", {"output": "done"}, run_id=selected_run)
+
+    events = await repository.list_events(project.id, after_id=first.id, run_id=selected_run)
+    await database.dispose()
+
+    assert [(event.run_id, event.event_type) for event in events] == [
+        (selected_run, "command.completed"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_workspace_ownership_survives_database_reconnection(tmp_path) -> None:
     database_url = f"sqlite+aiosqlite:///{tmp_path / 'workspaces.db'}"
     database = Database(database_url)

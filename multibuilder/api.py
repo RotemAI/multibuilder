@@ -216,9 +216,20 @@ def create_app(
         return await apply_lifecycle_action(project_id, request, "cancel")
 
     @app.get("/api/projects/{project_id}/events")
-    async def project_events(project_id: UUID, request: Request, after: int = 0, limit: int = 500) -> dict:
+    async def project_events(
+        project_id: UUID,
+        request: Request,
+        after: int = 0,
+        limit: int = 500,
+        run_id: UUID | None = None,
+    ) -> dict:
         repository: ControlPlaneRepository = request.app.state.repository
-        events = await repository.list_events(project_id, after_id=max(after, 0), limit=min(max(limit, 1), 2_000))
+        events = await repository.list_events(
+            project_id,
+            after_id=max(after, 0),
+            limit=min(max(limit, 1), 2_000),
+            run_id=run_id,
+        )
         return {"events": [event.model_dump(mode="json") for event in events]}
 
     @app.get("/api/projects/{project_id}/events/stream")

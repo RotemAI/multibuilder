@@ -85,6 +85,56 @@ def test_agent_inspection_exposes_all_requested_tabs() -> None:
         assert tab in script
 
 
+def test_overview_surfaces_live_work_for_each_agent() -> None:
+    script = read_asset("app.js")
+
+    assert "Live agent work" in script
+    assert "Open full stream" in script
+    assert "renderAgentActivity" in script
+    assert "meaningfulRunEvents" in script
+    assert 'data-agent-activity' in script
+
+
+def test_agent_stream_shows_command_output_and_repaints_on_event_only_updates() -> None:
+    script = read_asset("app.js")
+
+    for field in ("aggregated_output", "exit_code", "status"):
+        assert f"payload.{field}" in script
+
+    assert "forceRender" in script
+    assert "refreshLiveSnapshot(projectId, true)" in script
+    assert "setupLiveStreams" in script
+    assert 'data-live-stream="${escapeHTML(run.id)}"' in script
+
+
+def test_agent_detail_loads_complete_paginated_run_history() -> None:
+    script = read_asset("app.js")
+
+    assert "RUN_EVENT_PAGE_SIZE = 2_000" in script
+    assert "runEventHistory: new Map()" in script
+    assert "loadRunEventHistory" in script
+    assert "runHistoryLoaded" in script
+    assert "run_id=${encodeURIComponent(runId)}" in script
+    assert "incoming.length < RUN_EVENT_PAGE_SIZE" in script
+
+
+def test_agent_stream_coalesces_provider_output_deltas_without_hiding_work() -> None:
+    script = read_asset("app.js")
+
+    assert "groupStreamEvents" in script
+    assert 'native.payload_type !== "run.output.delta"' in script
+    assert 'event_type: "agent.output"' in script
+    assert "grouped_count" in script
+
+
+def test_agent_activity_and_long_goals_fit_small_viewports() -> None:
+    styles = read_asset("styles.css")
+
+    assert "minmax(min(280px, 100%), 1fr)" in styles
+    assert ".goal-copy" in styles
+    assert "overflow-wrap: anywhere" in styles
+
+
 def test_operational_tables_implement_the_shared_table_ux_contract() -> None:
     script = read_asset("app.js")
     styles = read_asset("styles.css")

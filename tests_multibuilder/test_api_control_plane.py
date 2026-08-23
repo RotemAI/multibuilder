@@ -1,3 +1,6 @@
+from functools import partial
+from uuid import UUID, uuid4
+
 from fastapi.testclient import TestClient
 
 from multibuilder.api import create_app
@@ -89,6 +92,42 @@ def test_project_creation_persists_a_director_task_and_event(tmp_path) -> None:
     assert "independent review" in task["instructions"]
     assert "integration and preview" in task["instructions"]
     assert ".multibuilder/validation.json" in task["instructions"]
+
+
+def test_project_events_can_be_scoped_to_one_agent_run(tmp_path) -> None:
+    app = create_app(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'run-events.db'}",
+        scheduler_enabled=False,
+    )
+    selected_run = uuid4()
+    other_run = uuid4()
+
+    with TestClient(app) as client:
+        project_id = client.post("/api/projects", json=project_payload()).json()["id"]
+        assert client.portal is not None
+        client.portal.call(
+            partial(
+                app.state.repository.append_event,
+                UUID(project_id),
+                "agent.message",
+                {"text": "selected"},
+                run_id=selected_run,
+            )
+        )
+        client.portal.call(
+            partial(
+                app.state.repository.append_event,
+                UUID(project_id),
+                "agent.message",
+                {"text": "other"},
+                run_id=other_run,
+            )
+        )
+        response = client.get(f"/api/projects/{project_id}/events", params={"run_id": str(selected_run)})
+
+    assert [(event["run_id"], event["payload"]["text"]) for event in response.json()["events"]] == [
+        (str(selected_run), "selected"),
+    ]
 
 
 def test_access_configuration_is_absent_from_the_api_surface(tmp_path) -> None:

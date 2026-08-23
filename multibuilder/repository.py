@@ -1497,11 +1497,15 @@ class ControlPlaneRepository:
         *,
         after_id: int = 0,
         limit: int = 500,
+        run_id: UUID | None = None,
     ) -> list[EventRecord]:
         async with self._sessions() as session:
+            conditions = [EventRow.project_id == str(project_id), EventRow.id > after_id]
+            if run_id is not None:
+                conditions.append(EventRow.run_id == str(run_id))
             result = await session.execute(
                 select(EventRow)
-                .where(EventRow.project_id == str(project_id), EventRow.id > after_id)
+                .where(*conditions)
                 .order_by(EventRow.id)
                 .limit(limit)
             )

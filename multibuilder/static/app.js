@@ -20,6 +20,7 @@
   const STREAM_FAILURES_BEFORE_FALLBACK = 3;
   const STREAM_RECONNECT_BASE_MS = 1_000;
   const STREAM_STABLE_AFTER_MS = 15_000;
+  const RUN_EVENT_PAGE_SIZE = 2_000;
   const STREAM_EVENT_TYPES = Object.freeze([
     "project.paused",
     "project.resumed",
@@ -86,6 +87,10 @@
     streamStableTimer: null,
     streamFailures: 0,
     snapshotRefreshTimer: null,
+    runEventHistory: new Map(),
+    runHistoryEventIds: new Map(),
+    runHistoryLoaded: new Set(),
+    runHistoryProjectId: null,
     tableCleanups: [],
     demo: false,
     loading: false,
@@ -263,11 +268,38 @@
     cellPopover.hidden = true;
   }
 
+  function liveStreamPositions() {
+    const positions = new Map();
+    appView.querySelectorAll("[data-live-stream]").forEach((stream) => {
+      const remaining = stream.scrollHeight - stream.clientHeight - stream.scrollTop;
+      positions.set(stream.dataset.liveStream, {
+        top: stream.scrollTop,
+        following: remaining < 32,
+      });
+    });
+    return positions;
+  }
+
+  function setupLiveStreams(previousPositions = new Map()) {
+    appView.querySelectorAll("[data-live-stream]").forEach((stream) => {
+      const previous = previousPositions.get(stream.dataset.liveStream);
+      if (!previous || previous.following) {
+        stream.scrollTop = stream.scrollHeight;
+        return;
+      }
+      stream.scrollTop = Math.min(previous.top, Math.max(0, stream.scrollHeight - stream.clientHeight));
+    });
+  }
+
   function setView(html) {
+    const streamPositions = liveStreamPositions();
     cleanTableInteractions();
     appView.innerHTML = html;
     appView.setAttribute("aria-busy", "false");
-    requestAnimationFrame(setupTables);
+    requestAnimationFrame(() => {
+      setupTables();
+      setupLiveStreams(streamPositions);
+    });
   }
 
   function loadingView() {
@@ -345,6 +377,12 @@
   }
 
   async function loadProject(projectId, refresh = false) {
+    if (state.runHistoryProjectId !== projectId) {
+      state.runEventHistory.clear();
+      state.runHistoryEventIds.clear();
+      state.runHistoryLoaded.clear();
+      state.runHistoryProjectId = projectId;
+    }
     if (projectId === "demo-project") {
       state.demo = true;
       state.snapshot = demoSnapshot();
@@ -373,12 +411,42 @@
     incoming.forEach(ingestEvent);
   }
 
+  async function loadRunEventHistory(projectId, runId, refresh = false) {
+    if (state.demo) return;
+    const historyKey = `${projectId}:${runId}`;
+    if (!refresh && state.runHistoryLoaded.has(historyKey)) return;
+    const history = [];
+    let cursor = 0;
+    while (true) {
+      const response = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/events?after=${cursor}&limit=${RUN_EVENT_PAGE_SIZE}&run_id=${encodeURIComponent(runId)}`);
+      const incoming = Array.isArray(response.events) ? response.events : [];
+      incoming.forEach((event) => {
+        if (event.run_id === runId || event.payload?.run_id === runId) history.push(event);
+      });
+      if (!incoming.length) break;
+      const nextCursor = Math.max(...incoming.map((event) => Number(event.id) || 0));
+      if (!nextCursor || nextCursor <= cursor) break;
+      cursor = nextCursor;
+      if (incoming.length < RUN_EVENT_PAGE_SIZE) break;
+    }
+    state.runEventHistory.set(runId, history);
+    state.runHistoryEventIds.set(runId, new Set(history.map((event) => Number(event.id)).filter(Boolean)));
+    state.runHistoryLoaded.add(historyKey);
+  }
+
   function ingestEvent(event) {
     if (!event || typeof event !== "object") return false;
     const eventId = Number(event.id) || 0;
     if (eventId && eventId <= state.eventCursor) return false;
     state.events.push(event);
     state.events = state.events.slice(-3000);
+    const runId = event.run_id || event.payload?.run_id;
+    const history = runId ? state.runEventHistory.get(runId) : null;
+    const historyIds = runId ? state.runHistoryEventIds.get(runId) : null;
+    if (history && historyIds && (!eventId || !historyIds.has(eventId))) {
+      history.push(event);
+      if (eventId) historyIds.add(eventId);
+    }
     if (eventId) state.eventCursor = Math.max(state.eventCursor, eventId);
     return true;
   }
@@ -425,12 +493,12 @@
     return columnsOpen || Boolean(active && active !== document.body && active.matches("input, textarea, select, [contenteditable]"));
   }
 
-  async function refreshLiveSnapshot(projectId) {
+  async function refreshLiveSnapshot(projectId, forceRender = false) {
     if (parseRoute().projectId !== projectId || state.demo) return;
     const beforeSnapshot = snapshotVersion(state.snapshot);
     const latest = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}`);
     state.snapshot = latest;
-    if (snapshotVersion(latest) !== beforeSnapshot && !userIsInteracting()) {
+    if ((forceRender || snapshotVersion(latest) !== beforeSnapshot) && !userIsInteracting()) {
       const route = parseRoute();
       renderChrome(route);
       renderProjectView(route);
@@ -442,7 +510,7 @@
     state.snapshotRefreshTimer = window.setTimeout(async () => {
       state.snapshotRefreshTimer = null;
       try {
-        await refreshLiveSnapshot(projectId);
+        await refreshLiveSnapshot(projectId, true);
       } catch (_error) {
         setConnection("bad", "Snapshot refresh failed");
       }
@@ -570,6 +638,13 @@
     if (refresh || state.snapshot?.project?.id !== route.projectId) loadingView();
     try {
       await loadProject(route.projectId, refresh);
+      if (route.name === "agent") {
+        try {
+          await loadRunEventHistory(route.projectId, route.runId, refresh);
+        } catch (_error) {
+          setConnection("bad", "Full agent history unavailable");
+        }
+      }
       renderChrome(route);
       renderProjectView(route);
       startEventStream(route.projectId);
@@ -680,6 +755,31 @@
     }
   }
 
+  function meaningfulRunEvents(runId) {
+    return runEvents(runId).filter((event) => event.event_type !== "run.heartbeat");
+  }
+
+  function activityPreviewText(event) {
+    const detail = eventText(event);
+    return detail.length > 700 ? `${detail.slice(0, 700)}...` : detail;
+  }
+
+  function renderAgentActivity(run, task, projectId) {
+    const allEvents = runEvents(run.id);
+    const workEvents = meaningfulRunEvents(run.id);
+    const latestEvents = groupStreamEvents(workEvents).slice(-3);
+    const streamUrl = replaceRouteValue(ROUTES.agentDetail, projectId, run.id);
+    const preview = latestEvents.length
+      ? `<div class="agent-activity-preview" aria-label="Recent work from ${escapeHTML(humanize(run.role))}">${latestEvents.map((event) => `<div class="agent-activity-line"><div><time>${escapeHTML(formatDate(event.created_at))}</time><span>${escapeHTML(event.event_type)}</span></div><pre>${escapeHTML(activityPreviewText(event))}</pre></div>`).join("")}</div>`
+      : emptyInline(`Waiting for the first command or message. Last heartbeat ${formatDate(run.heartbeat_at)}.`);
+    return `<article class="agent-activity-card" data-agent-activity>
+      <div class="agent-activity-head"><div><strong>${escapeHTML(humanize(run.role))}</strong><span>${escapeHTML(run.provider)} / ${escapeHTML(run.model || "default model")}</span></div>${statusPill(run.status)}</div>
+      <p>${escapeHTML(task?.goal || compactId(run.task_id))}</p>
+      ${preview}
+      <footer><span>${workEvents.length} work events, ${allEvents.length} total</span><a class="button button-secondary button-small" href="${streamUrl}">Open full stream</a></footer>
+    </article>`;
+  }
+
   function renderOverview() {
     const snapshot = state.snapshot;
     const project = snapshot.project;
@@ -690,6 +790,11 @@
     const criticalTasks = tasks.filter((task) => criticalIds.has(task.id));
     const blockers = snapshot.blockers || [];
     const planTasks = tasks.filter((task) => !["succeeded", "cancelled"].includes(task.status)).slice(0, 8);
+    const tasksById = new Map(tasks.map((task) => [task.id, task]));
+    const runs = [...(snapshot.runs || [])].sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
+    const activeRuns = runs.filter((run) => ["starting", "running"].includes(run.status));
+    const recentRuns = runs.filter((run) => !["starting", "running"].includes(run.status));
+    const visibleRuns = [...activeRuns, ...recentRuns.slice(0, Math.max(0, 8 - activeRuns.length))];
     setView(`
       ${pageHeader("Project / Goal", project.name, "Live execution state from the durable scheduler.", `${statusPill(snapshot.status)}${state.demo ? '<span class="tag">Demo data</span>' : ""}${projectActionControls(snapshot.status)}`)}
       <section class="grid grid-4" aria-label="Overall progress metrics">
@@ -697,6 +802,9 @@
         <article class="metric-card"><div class="metric-label">Active work</div><div class="metric-value">${progress.active}</div><div class="metric-detail">Ready, queued, and running tasks</div></article>
         <article class="metric-card"><div class="metric-label">Active agents</div><div class="metric-value">${(snapshot.runs || []).filter((run) => ["starting", "running"].includes(run.status)).length}</div><div class="metric-detail">Across ${(snapshot.providers || []).length} provider backends</div></article>
         <article class="metric-card"><div class="metric-label">Blocked or failed</div><div class="metric-value">${progress.failed}</div><div class="metric-detail">Bounded recovery requires attention</div></article>
+      </section>
+      <section class="panel mt-16 agent-activity-panel"><div class="section-head"><div><h2>Live agent work</h2><p>Commands, output, messages, and state changes from each current agent.</p></div><a href="${replaceRouteValue(ROUTES.agents, project.id)}">All agent streams</a></div>
+        ${visibleRuns.length ? `<div class="agent-activity-grid">${visibleRuns.map((run) => renderAgentActivity(run, tasksById.get(run.task_id), project.id)).join("")}</div>` : emptyInline("Waiting for the Director to start.")}
       </section>
       <div class="grid grid-2 mt-16">
         <section class="panel grid-span-2"><div class="section-head"><div><h2>User goal</h2><p>The Director decomposes this goal into milestones and scoped work.</p></div></div><p class="goal-copy">${escapeHTML(project.goal)}</p></section>
@@ -809,10 +917,10 @@
     const tree = runs.length ? runs.map((run) => {
       const task = tasks.get(run.task_id);
       const depth = agentDepth(run, byId);
-      return `<li><a class="tree-node" data-depth="${depth}" href="${replaceRouteValue(ROUTES.agentDetail, snapshot.project.id, run.id)}"><span><strong>${escapeHTML(humanize(run.role))}</strong><small>${escapeHTML(run.provider)} / ${escapeHTML(run.model || "default model")} • ${escapeHTML(task?.goal || compactId(run.task_id))}</small></span>${statusPill(run.status)}</a></li>`;
+      return `<li><a class="tree-node" data-depth="${depth}" href="${replaceRouteValue(ROUTES.agentDetail, snapshot.project.id, run.id)}"><span><strong>${escapeHTML(humanize(run.role))}</strong><small>${escapeHTML(run.provider)} / ${escapeHTML(run.model || "default model")} • ${escapeHTML(task?.goal || compactId(run.task_id))}</small><small class="tree-action">Open full stream</small></span>${statusPill(run.status)}</a></li>`;
     }).join("") : emptyInline("No active agents");
     const columns = [
-      { key: "role", label: "Role", help: "Scheduler-assigned agent role.", type: "enum", max: 60, width: 150, pinned: true, short: true, value: (run) => humanize(run.role) },
+      { key: "role", label: "Role", help: "Scheduler-assigned agent role. Open it to inspect the full stream.", type: "enum", max: 60, width: 150, pinned: true, short: true, value: (run) => humanize(run.role), format: (value, run) => `<a href="${replaceRouteValue(ROUTES.agentDetail, snapshot.project.id, run.id)}">${escapeHTML(value)}</a>` },
       { key: "provider", label: "Provider", help: "Independent worker backend.", type: "enum", max: 40, width: 110, short: true },
       { key: "model", label: "Model", help: "Configured model identifier.", type: "string", max: 100, width: 165, short: true, value: (run) => run.model || "Provider default" },
       { key: "parent", label: "Parent", help: "Parent agent run in the hierarchy.", type: "string", max: 40, width: 120, short: true, value: (run) => compactId(run.parent_run_id) },
@@ -830,8 +938,8 @@
   }
 
   const AGENT_TABS = Object.freeze([
-    ["instructions", "Instructions"],
     ["events", "Live events"],
+    ["instructions", "Instructions"],
     ["commands", "Commands"],
     ["tools", "Tool calls"],
     ["files", "Files changed"],
@@ -842,7 +950,61 @@
   ]);
 
   function runEvents(runId) {
-    return state.events.filter((event) => event.run_id === runId || event.payload?.run_id === runId);
+    const history = state.runEventHistory.get(runId) || [];
+    const live = state.events.filter((event) => event.run_id === runId || event.payload?.run_id === runId);
+    const merged = new Map();
+    [...history, ...live].forEach((event, index) => {
+      const key = Number(event.id) || `${event.created_at || "event"}:${event.event_type || "unknown"}:${index}`;
+      merged.set(key, event);
+    });
+    return [...merged.values()].sort((left, right) => {
+      const byId = (Number(left.id) || 0) - (Number(right.id) || 0);
+      return byId || new Date(left.created_at || 0) - new Date(right.created_at || 0);
+    });
+  }
+
+  function providerOutputDelta(event) {
+    const native = event.payload?.native;
+    if (!native || native.payload_type !== "run.output.delta") return null;
+    const text = native.payload?.text;
+    return typeof text === "string" ? text : "";
+  }
+
+  function groupStreamEvents(events) {
+    const grouped = [];
+    events.forEach((event) => {
+      const previous = grouped[grouped.length - 1];
+      const delta = providerOutputDelta(event);
+      if (delta !== null) {
+        if (previous?.event_type === "agent.output") {
+          grouped[grouped.length - 1] = {
+            ...event,
+            event_type: "agent.output",
+            grouped_count: Number(previous.grouped_count || 1) + 1,
+            payload: { provider: event.payload?.provider, message: `${previous.payload.message}${delta}` },
+          };
+        } else {
+          grouped.push({
+            ...event,
+            event_type: "agent.output",
+            grouped_count: 1,
+            payload: { provider: event.payload?.provider, message: delta },
+          });
+        }
+        return;
+      }
+      if (event.event_type === "run.heartbeat" && previous?.event_type === "run.heartbeat") {
+        const count = Number(previous.grouped_count || 1) + 1;
+        grouped[grouped.length - 1] = {
+          ...event,
+          grouped_count: count,
+          payload: { ...event.payload, message: `${count} consecutive heartbeats, latest received` },
+        };
+        return;
+      }
+      grouped.push(event);
+    });
+    return grouped;
   }
 
   function renderAgentDetail(runId, requestedTab) {
@@ -875,11 +1037,12 @@
     }
     if (tab === "events") {
       if (!events.length) return emptyInline("Waiting for the first live event.");
-      return `<div class="section-head"><div><h2>Live events</h2><p>Cursor-polled, redacted scheduler events.</p></div><span class="tag">${events.length} events</span></div><div class="terminal">${events.map((event) => `<div class="terminal-line"><time>${escapeHTML(formatDate(event.created_at))}</time><span class="terminal-type">${escapeHTML(event.event_type)}</span><span>${escapeHTML(eventText(event))}</span></div>`).join("")}</div>`;
+      const displayEvents = groupStreamEvents(events);
+      return `<div class="section-head"><div><h2>Full work stream</h2><p>Every retained command, output, message, tool event, and state change. Output deltas and consecutive heartbeats are grouped without dropping content.</p></div><span class="tag">${events.length} events</span></div><div class="terminal" data-live-stream="${escapeHTML(run.id)}" role="log" aria-live="polite" aria-label="Full live work stream">${displayEvents.map((event) => `<div class="terminal-line ${event.event_type === "run.heartbeat" ? "heartbeat" : "work"}"><time>${escapeHTML(formatDate(event.created_at))}</time><span class="terminal-type">${escapeHTML(event.event_type)}</span><span>${escapeHTML(eventText(event))}</span></div>`).join("")}</div>`;
     }
     if (tab === "commands") {
       const commandEvents = events.filter((event) => event.event_type.includes("command") || event.payload?.command);
-      return listEventPayloads("Commands", "Commands captured by the worker runtime.", commandEvents, (event) => event.payload?.command || eventText(event));
+      return listEventPayloads("Commands", "Commands, captured output, exit codes, and completion status.", commandEvents, eventText);
     }
     if (tab === "tools") {
       const toolEvents = events.filter((event) => event.event_type.includes("tool") || event.payload?.tool);
@@ -907,7 +1070,21 @@
 
   function eventText(event) {
     const payload = event.payload || {};
-    return payload.message || payload.text || payload.summary || payload.command || escapeJson(payload);
+    const displayValue = (value) => typeof value === "string" ? value : escapeJson(value);
+    if (payload.command !== undefined) {
+      const lines = [`$ ${displayValue(payload.command)}`];
+      const output = payload.aggregated_output ?? payload.output;
+      if (output !== undefined) lines.push(displayValue(output).replace(/\s+$/, "") || "(no output)");
+      const result = [];
+      if (payload.status !== undefined) result.push(displayValue(payload.status));
+      if (payload.exit_code !== undefined) result.push(`exit ${displayValue(payload.exit_code)}`);
+      if (result.length) lines.push(`[${result.join(", ")}]`);
+      return lines.join("\n");
+    }
+    for (const key of ["message", "text", "summary"]) {
+      if (payload[key] !== undefined) return displayValue(payload[key]);
+    }
+    return escapeJson(payload);
   }
 
   function listEventPayloads(title, copy, events, value) {
