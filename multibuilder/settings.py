@@ -68,8 +68,6 @@ class ProviderRuntimeSettings:
 @dataclass(frozen=True, slots=True)
 class RuntimeSettings:
     database_url: str
-    admin_token: str = field(repr=False)
-    cookie_signing_secret: str = field(repr=False)
     public_url: str
     state_root: Path
     bind_host: str = "127.0.0.1"
@@ -85,16 +83,12 @@ class RuntimeSettings:
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> RuntimeSettings:
         values = os.environ if environment is None else environment
         database_url = values.get("MULTIBUILDER_DATABASE_URL", "").strip()
-        admin_token = values.get("MULTIBUILDER_ADMIN_TOKEN", "")
-        cookie_secret = values.get("MULTIBUILDER_COOKIE_SECRET", "")
         public_url = values.get("MULTIBUILDER_PUBLIC_URL", "").rstrip("/")
         state_root_text = values.get("MULTIBUILDER_STATE_ROOT", "").strip()
         missing = [
             name
             for name, value in (
                 ("MULTIBUILDER_DATABASE_URL", database_url),
-                ("MULTIBUILDER_ADMIN_TOKEN", admin_token),
-                ("MULTIBUILDER_COOKIE_SECRET", cookie_secret),
                 ("MULTIBUILDER_PUBLIC_URL", public_url),
                 ("MULTIBUILDER_STATE_ROOT", state_root_text),
             )
@@ -102,8 +96,6 @@ class RuntimeSettings:
         ]
         if missing:
             raise ValueError("missing required settings: " + ", ".join(missing))
-        if len(admin_token) < 24 or len(cookie_secret) < 24:
-            raise ValueError("admin and cookie secrets must contain at least 24 characters")
         if not public_url.startswith("https://"):
             raise ValueError("the public URL must use HTTPS")
 
@@ -211,8 +203,6 @@ class RuntimeSettings:
         }
         return cls(
             database_url=database_url,
-            admin_token=admin_token,
-            cookie_signing_secret=cookie_secret,
             public_url=public_url,
             state_root=Path(state_root_text).resolve(),
             bind_host=bind_host,

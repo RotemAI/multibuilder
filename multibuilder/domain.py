@@ -91,8 +91,8 @@ class ProjectSpec(BaseModel):
     id: UUID
     name: str = Field(min_length=1, max_length=120, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
     goal: str = Field(min_length=1, max_length=30_000)
-    repository_url: str = Field(min_length=1, max_length=2_000)
-    base_branch: str = Field(min_length=1, max_length=255)
+    repository_url: str = Field(default="", max_length=2_000)
+    base_branch: str = Field(default="main", min_length=1, max_length=255)
     acceptance_criteria: list[str] = Field(min_length=1)
     max_parallelism: int = Field(ge=1, le=256)
 

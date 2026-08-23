@@ -34,6 +34,7 @@ from .recovery import (
 from .routing import ProviderProfile
 from .scheduler import Assignment, DeferredTask, SchedulingPlanner
 from .schemas import strict_completed_task_result_schema
+from .sources import project_base_ref
 from .worker_runtime import NormalizedEvent, PromptBuilder, extract_completed_result
 from .workspaces import FinalizedCommit, Workspace
 
@@ -584,7 +585,7 @@ class Orchestrator:
             frontier = list(dict.fromkeys(next_frontier))
         if any(item.status is MergeStatus.MERGED for item in snapshot.merge_queue):
             return f"integration/{project.id.hex[:12]}"
-        return f"origin/{project.base_branch}"
+        return project_base_ref(project.repository_url, project.base_branch)
 
     async def _execute(self, request: ExecutionRequest) -> None:
         process_started = False

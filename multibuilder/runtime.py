@@ -320,11 +320,7 @@ def build_runtime(settings: RuntimeSettings, repository: ControlPlaneRepository)
     state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(state_root, 0o700)
     redactor = SecretRedactor(
-        [
-            settings.admin_token,
-            settings.cookie_signing_secret,
-            *([settings.openai_api_key] if settings.openai_api_key else []),
-        ]
+        [settings.openai_api_key] if settings.openai_api_key else []
     )
     normalizer = EventNormalizer(redactor)
     process_runner = SubprocessAgentRunner(normalizer=normalizer)

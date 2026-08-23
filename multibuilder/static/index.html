@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#f5f7fb">
   <title>MultiBuilder Control Plane</title>
-  <link rel="icon" href="/static/favicon.svg?v=20260823.1" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/styles.css?v=20260823.1">
+  <link rel="icon" href="/static/favicon.svg?v=20260823.2" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css?v=20260823.2">
 </head>
 <body>
   <a class="skip-link" href="#app-view">Skip to workspace</a>
@@ -35,10 +35,6 @@
         <div class="breadcrumb" id="breadcrumb" aria-label="Breadcrumb"></div>
         <div class="topbar-actions">
           <button class="button button-quiet hidden" id="refresh-button" type="button">Refresh</button>
-          <button class="icon-button hidden" id="sign-out-button" type="button" title="End this browser session"
-                  aria-label="End this browser session">
-            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M9 4H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h4M15 8l4 4-4 4M19 12H9"/></svg>
-          </button>
         </div>
       </header>
       <main id="app-view" tabindex="-1" aria-busy="false"></main>
@@ -48,7 +44,6 @@
   <div id="header-tooltip" class="header-tooltip" role="tooltip" hidden></div>
   <div id="cell-popover" class="cell-popover" role="tooltip" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
-  <div id="modal-root"></div>
-  <script src="/static/app.js?v=20260823.1" defer></script>
+  <script src="/static/app.js?v=20260823.2" defer></script>
 </body>
 </html>

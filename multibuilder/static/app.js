@@ -68,13 +68,11 @@
   const sidebar = document.getElementById("sidebar");
   const mobileNavigation = document.getElementById("mobile-navigation");
   const refreshButton = document.getElementById("refresh-button");
-  const signOutButton = document.getElementById("sign-out-button");
   const connectionLabel = document.getElementById("connection-label");
   const connectionDot = document.querySelector(".live-dot");
   const tooltip = document.getElementById("header-tooltip");
   const cellPopover = document.getElementById("cell-popover");
   const toastRegion = document.getElementById("toast-region");
-  const modalRoot = document.getElementById("modal-root");
 
   const state = {
     snapshot: null,
@@ -92,7 +90,6 @@
     demo: false,
     loading: false,
     connection: "checking",
-    authenticated: null,
     projects: null,
   };
 
@@ -206,12 +203,7 @@
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
     if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-    const response = await fetch(path, { ...options, credentials: "same-origin", headers });
-    if (response.status === 401) {
-      state.authenticated = false;
-      updateSessionControls();
-      throw new Error("AUTH_REQUIRED");
-    }
+    const response = await fetch(path, { ...options, headers });
     if (!response.ok) {
       let detail = `Request failed with status ${response.status}`;
       try {
@@ -222,27 +214,12 @@
       }
       throw new Error(detail);
     }
-    state.authenticated = true;
-    updateSessionControls();
     return response.json();
   }
 
   async function loadProjectList() {
-    const response = await fetch("/api/projects", {
-      credentials: "same-origin",
-      headers: { Accept: "application/json" },
-    });
-    if (response.status === 401) {
-      state.authenticated = false;
-      state.projects = [];
-      updateSessionControls();
-      return;
-    }
-    if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
-    const payload = await response.json();
-    state.authenticated = true;
+    const payload = await apiFetch("/api/projects");
     state.projects = Array.isArray(payload.projects) ? payload.projects : [];
-    updateSessionControls();
   }
 
   function replaceRouteValue(template, projectId, runId = "") {
@@ -313,10 +290,6 @@
     `);
   }
 
-  function updateSessionControls() {
-    signOutButton.classList.toggle("hidden", state.authenticated !== true);
-  }
-
   function projectName(projectId) {
     if (state.snapshot?.project?.id === projectId) return state.snapshot.project.name;
     return (state.projects || []).find((project) => project.id === projectId)?.name || "Project";
@@ -350,7 +323,6 @@
       `;
     }
     refreshButton.classList.toggle("hidden", !projectId || state.demo);
-    updateSessionControls();
   }
 
   function navLink(href, key, icon, label, active) {
@@ -471,19 +443,14 @@
       state.snapshotRefreshTimer = null;
       try {
         await refreshLiveSnapshot(projectId);
-      } catch (error) {
-        if (error.message === "AUTH_REQUIRED") {
-          stopLiveUpdates();
-          renderAuthRequired(projectId);
-        } else {
-          setConnection("bad", "Snapshot refresh failed");
-        }
+      } catch (_error) {
+        setConnection("bad", "Snapshot refresh failed");
       }
     }, 300);
   }
 
   function startPollingFallback(projectId) {
-    if (state.pollingFallback || state.demo || state.authenticated !== true) return;
+    if (state.pollingFallback || state.demo) return;
     state.pollingFallback = true;
     const poll = async () => {
       if (parseRoute().projectId !== projectId) return;
@@ -500,15 +467,10 @@
           renderChrome(route);
           renderProjectView(route);
         }
-      } catch (error) {
-        if (error.message === "AUTH_REQUIRED") {
-          stopLiveUpdates();
-          renderAuthRequired(projectId);
-        } else {
-          setConnection("bad", "Event updates paused");
-        }
+      } catch (_error) {
+        setConnection("bad", "Event updates paused");
       } finally {
-        if (state.pollingFallback && state.authenticated === true && parseRoute().projectId === projectId) state.pollTimer = window.setTimeout(poll, 5000);
+        if (state.pollingFallback && parseRoute().projectId === projectId) state.pollTimer = window.setTimeout(poll, 5000);
       }
     };
     setConnection("bad", "Using event polling fallback");
@@ -546,14 +508,14 @@
     closeEventSource();
     if (state.streamReconnectTimer) window.clearTimeout(state.streamReconnectTimer);
     state.streamReconnectTimer = null;
-    if (state.demo || state.authenticated !== true || parseRoute().projectId !== projectId) return;
+    if (state.demo || parseRoute().projectId !== projectId) return;
     if (!("EventSource" in window)) {
       startPollingFallback(projectId);
       return;
     }
 
     const streamUrl = `/api/projects/${encodeURIComponent(projectId)}/events/stream?after=${state.eventCursor}&follow=true`;
-    const source = new EventSource(streamUrl, { withCredentials: true });
+    const source = new EventSource(streamUrl);
     state.eventSource = source;
     const receive = (message) => {
       if (state.eventSource === source) handleStreamEvent(projectId, message);
@@ -612,8 +574,7 @@
       renderProjectView(route);
       startEventStream(route.projectId);
     } catch (error) {
-      if (error.message === "AUTH_REQUIRED") renderAuthRequired(route.projectId);
-      else renderProjectError(route.projectId, error.message);
+      renderProjectError(route.projectId, error.message);
     }
   }
 
@@ -632,27 +593,18 @@
         <div><div class="eyebrow">Autonomous software factory</div><h1>Projects</h1><p>Plan, execute, review, and integrate software across independent provider capacity.</p></div>
         <div class="page-actions"><button class="button button-secondary" type="button" data-load-demo>Load demo project</button><a class="button button-primary" href="${ROUTES.newProject}">${icons.plus} New project</a></div>
       </header>
-      ${state.authenticated !== true ? `
-        <section class="panel mb-16"><div class="section-head"><div><h2>Connect this browser session</h2><p>The access token is exchanged for a secure, HttpOnly session cookie and is not persisted by this page.</p></div><button class="button button-secondary" type="button" data-open-auth>Connect</button></div></section>
-      ` : ""}
       ${projects.length ? `<div class="project-grid">${cards}</div>` : `
-        <div class="state-wrap"><section class="state-card"><div class="state-symbol" aria-hidden="true">+</div><h1>${state.authenticated === true ? "No projects yet" : "Connect to load projects"}</h1><p>${state.authenticated === true ? "Create a project from a high-level goal, or inspect the populated demo." : "Connect this browser session, or inspect the populated demo without connecting."}</p><div class="state-actions">${state.authenticated === true ? `<a class="button button-primary" href="${ROUTES.newProject}">Create first project</a>` : `<button class="button button-primary" type="button" data-open-auth>Connect</button>`}<button class="button button-secondary" type="button" data-load-demo>Load demo project</button></div></section></div>
+        <div class="state-wrap"><section class="state-card"><div class="state-symbol" aria-hidden="true">+</div><h1>No projects yet</h1><p>Create a project from a high-level goal, or inspect the populated demo.</p><div class="state-actions"><a class="button button-primary" href="${ROUTES.newProject}">Create first project</a><button class="button button-secondary" type="button" data-load-demo>Load demo project</button></div></section></div>
       `}
     `);
   }
 
   function renderNewProject() {
-    if (state.authenticated === false) {
-      renderAuthRequired(null, true);
-      return;
-    }
     setView(`
-      <header class="page-head"><div><div class="eyebrow">Project / Goal</div><h1>Start an autonomous build</h1><p>Give the Director a repository, acceptance criteria, and a safe parallelism limit.</p></div></header>
+      <header class="page-head"><div><div class="eyebrow">Project / Goal</div><h1>Start an autonomous build</h1><p>Give the Director a goal and acceptance criteria. MultiBuilder creates a fresh managed Git workspace automatically.</p></div></header>
       <form id="new-project-form" class="panel" novalidate>
         <div class="form-grid">
           <div class="field"><label for="project-name">Project name</label><input class="input" id="project-name" name="name" required maxlength="120" pattern="[a-zA-Z0-9][a-zA-Z0-9._-]*" placeholder="customer-portal"><span class="field-help">Letters, numbers, dots, underscores, and hyphens.</span></div>
-          <div class="field"><label for="base-branch">Base branch</label><input class="input" id="base-branch" name="base_branch" required value="main" maxlength="255"></div>
-          <div class="field full"><label for="repository-url">Repository URL</label><input class="input" id="repository-url" name="repository_url" required maxlength="2000" placeholder="git@github.com:organization/repository.git"></div>
           <div class="field full"><label for="project-goal">User goal</label><textarea class="textarea" id="project-goal" name="goal" required maxlength="30000" placeholder="Build, test, and deploy..."></textarea></div>
           <div class="field full"><label for="acceptance-criteria">Acceptance criteria</label><textarea class="textarea" id="acceptance-criteria" name="acceptance_criteria" required placeholder="One criterion per line"></textarea><span class="field-help">The integrated build is not complete until every criterion passes.</span></div>
           <div class="field"><label for="max-parallelism">Maximum parallel workers</label><input class="input" id="max-parallelism" name="max_parallelism" type="number" min="1" max="256" value="8" required></div>
@@ -660,19 +612,6 @@
         <div id="project-form-error" class="field-error" role="alert"></div>
         <div class="form-actions"><a class="button button-secondary" href="${ROUTES.projects}">Cancel</a><button class="button button-primary" type="submit">Create project</button></div>
       </form>
-    `);
-  }
-
-  function renderAuthRequired(projectId, createAfter = false) {
-    setView(`
-      <div class="state-wrap"><form id="auth-form" class="auth-card" data-project-id="${escapeHTML(projectId || "")}" data-create-after="${createAfter ? "true" : "false"}">
-        <div class="state-symbol" aria-hidden="true">K</div>
-        <h1>Connect to the control plane</h1>
-        <p>Enter the admin access token once. The server exchanges it for an HttpOnly session cookie, and this page does not persist or display the token.</p>
-        <div class="field text-left"><label for="admin-token">Admin access token</label><input class="input" id="admin-token" name="token" type="password" autocomplete="off" required minlength="12"></div>
-        <div id="auth-error" class="field-error" role="alert"></div>
-        <div class="form-actions"><a class="button button-secondary" href="${ROUTES.projects}">Back</a><button class="button button-primary" type="submit">Connect session</button></div>
-      </form></div>
     `);
   }
 
@@ -735,7 +674,7 @@
       showToast(messages[action], "success");
       await renderCurrentRoute({ refresh: true });
     } catch (error) {
-      showToast(error.message === "AUTH_REQUIRED" ? "Connect this browser session to manage the project." : error.message, "error");
+      showToast(error.message, "error");
       buttons.forEach((item) => { item.disabled = false; });
       button.textContent = originalLabel;
     }
@@ -1354,15 +1293,6 @@
     });
   }
 
-  function openAuthModal() {
-    modalRoot.innerHTML = `<div class="modal-backdrop" data-modal-backdrop><form class="modal" id="auth-form"><header class="modal-head"><h2>Connect browser session</h2><button class="icon-button" type="button" data-close-modal aria-label="Close">×</button></header><div class="modal-body"><div class="field"><label for="modal-admin-token">Admin access token</label><input class="input" id="modal-admin-token" name="token" type="password" autocomplete="off" required minlength="12"><span class="field-help">Exchanged for a secure, HttpOnly server session and never persisted by this page.</span></div><div id="auth-error" class="field-error" role="alert"></div></div><footer class="modal-foot"><button class="button button-secondary" type="button" data-close-modal>Cancel</button><button class="button button-primary" type="submit">Connect</button></footer></form></div>`;
-    requestAnimationFrame(() => document.getElementById("modal-admin-token")?.focus());
-  }
-
-  function closeModal() {
-    modalRoot.innerHTML = "";
-  }
-
   function updateDagSelection(taskId) {
     const route = parseRoute();
     route.query.set("task", taskId);
@@ -1382,18 +1312,6 @@
     }
     if (target.closest("[data-load-demo]")) {
       navigate(replaceRouteValue(ROUTES.overview, "demo-project"));
-      return;
-    }
-    if (target.closest("[data-open-auth]")) {
-      openAuthModal();
-      return;
-    }
-    if (target.closest("[data-close-modal]")) {
-      closeModal();
-      return;
-    }
-    if (target.matches("[data-modal-backdrop]")) {
-      closeModal();
       return;
     }
     const retry = target.closest("[data-retry-project]");
@@ -1497,47 +1415,6 @@
   });
 
   document.addEventListener("submit", async (event) => {
-    if (event.target.id === "auth-form") {
-      event.preventDefault();
-      const form = event.target;
-      const token = new FormData(form).get("token")?.toString().trim() || "";
-      const error = form.querySelector("#auth-error");
-      if (token.length < 12) {
-        error.textContent = "Enter an access token with at least 12 characters.";
-        return;
-      }
-      const projectId = form.dataset.projectId;
-      const createAfter = form.dataset.createAfter === "true";
-      const submit = form.querySelector('button[type="submit"]');
-      submit.disabled = true;
-      submit.textContent = "Connecting...";
-      try {
-        const response = await fetch("/api/auth/login", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { Accept: "application/json", "Content-Type": "application/json" },
-          body: JSON.stringify({ token }),
-        });
-        form.reset();
-        if (!response.ok) throw new Error(response.status === 401 ? "Access token was not accepted." : `Login failed with status ${response.status}`);
-        state.authenticated = true;
-        state.projects = null;
-        updateSessionControls();
-        closeModal();
-        showToast("Browser session connected", "success");
-        if (createAfter) navigate(ROUTES.newProject);
-        else if (projectId) renderCurrentRoute({ refresh: true });
-        else {
-          await loadProjectList();
-          renderProjects();
-        }
-      } catch (failure) {
-        error.textContent = failure.message;
-        submit.disabled = false;
-        submit.textContent = "Connect";
-      }
-      return;
-    }
     if (event.target.id === "new-project-form") {
       event.preventDefault();
       const form = event.target;
@@ -1556,8 +1433,6 @@
       const payload = {
         name: String(formData.get("name") || "").trim(),
         goal: String(formData.get("goal") || "").trim(),
-        repository_url: String(formData.get("repository_url") || "").trim(),
-        base_branch: String(formData.get("base_branch") || "main").trim(),
         acceptance_criteria: criteria,
         max_parallelism: Number(formData.get("max_parallelism") || 8),
       };
@@ -1567,19 +1442,15 @@
         showToast("Project created and Director queued", "success");
         navigate(replaceRouteValue(ROUTES.overview, created.id));
       } catch (failure) {
-        if (failure.message === "AUTH_REQUIRED") renderAuthRequired(null, true);
-        else {
-          error.textContent = failure.message;
-          submit.disabled = false;
-          submit.textContent = "Create project";
-        }
+        error.textContent = failure.message;
+        submit.disabled = false;
+        submit.textContent = "Create project";
       }
     }
   });
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      closeModal();
       sidebar.classList.remove("open");
       mobileNavigation.setAttribute("aria-expanded", "false");
       document.querySelectorAll("[data-columns-popover]").forEach((item) => { item.hidden = true; });
@@ -1593,22 +1464,6 @@
   });
 
   refreshButton.addEventListener("click", () => renderCurrentRoute({ refresh: true }));
-  signOutButton.addEventListener("click", async () => {
-    try {
-      await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", headers: { Accept: "application/json" } });
-    } catch (_error) {
-      // Local UI state is cleared even when the server cannot be reached.
-    }
-    state.authenticated = false;
-    state.projects = [];
-    state.snapshot = null;
-    state.events = [];
-    stopLiveUpdates();
-    updateSessionControls();
-    showToast("Browser session ended");
-    navigate(ROUTES.projects);
-  });
-
   window.addEventListener("hashchange", () => {
     const route = parseRoute();
     const canReuseSnapshot = Boolean(route.projectId && state.snapshot?.project?.id === route.projectId);
@@ -1644,7 +1499,7 @@
       { id: "run-tests", project_id: "demo-project", task_id: "task-tests", parent_run_id: "run-backend", provider: "codex", model: "code-worker", role: "test", status: "running", attempt: 2, started_at: minutesAgo(19), heartbeat_at: minutesAgo(1), progress_at: minutesAgo(4), finished_at: null, result: null },
     ];
     return {
-      project: { id: "demo-project", name: "commerce-platform", goal: "Build a secure multi-tenant commerce platform with inventory, checkout, audit trails, comprehensive tests, and a validated preview deployment.", repository_url: "git@example.invalid:demo/commerce.git", base_branch: "main", acceptance_criteria: ["Integrated test suite passes", "Preview checkout passes browser validation"], max_parallelism: 16 },
+      project: { id: "demo-project", name: "commerce-platform", goal: "Build a secure multi-tenant commerce platform with inventory, checkout, audit trails, comprehensive tests, and a validated preview deployment.", acceptance_criteria: ["Integrated test suite passes", "Preview checkout passes browser validation"], max_parallelism: 16 },
       status: "running",
       tasks,
       milestones: [
@@ -1699,7 +1554,6 @@
   }
 
   if (!window.location.hash) window.location.hash = "#/projects";
-  updateSessionControls();
   checkHealth();
   renderCurrentRoute({ refresh: true });
 })();

@@ -27,6 +27,10 @@ class SourceRepositoryManager:
         "NO_PROXY",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
     )
 
     def __init__(
@@ -43,10 +47,13 @@ class SourceRepositoryManager:
             raise ValueError("at least one Git host must be allowed")
 
     def prepare(self, project_id: UUID, repository_url: str, base_branch: str) -> Path:
-        remote = self._validate_remote(repository_url)
         self._validate_branch(base_branch)
         repository = self.repositories_root / project_id.hex
         self._assert_below_root(repository)
+        remote = repository_url.strip()
+        if not remote:
+            return self._prepare_managed(repository, base_branch)
+        remote = self._validate_remote(remote)
 
         if repository.exists():
             if self._git(repository, "rev-parse", "--is-inside-work-tree") != "true":
@@ -70,6 +77,49 @@ class SourceRepositoryManager:
             )
 
         self._git(repository, "rev-parse", "--verify", f"origin/{base_branch}^{{commit}}")
+        return repository
+
+    def _prepare_managed(self, repository: Path, base_branch: str) -> Path:
+        needs_initial_commit = False
+        if repository.exists():
+            if self._git(repository, "rev-parse", "--is-inside-work-tree") != "true":
+                raise SourceRepositoryError("the existing project source is not a Git working tree")
+            if self._git(repository, "remote"):
+                raise SourceRepositoryError("the managed project source unexpectedly has a remote")
+            branch_commit = self._command(
+                repository,
+                "git",
+                "-C",
+                str(repository),
+                "rev-parse",
+                "--verify",
+                f"{base_branch}^{{commit}}",
+                check=False,
+            )
+            if branch_commit.returncode != 0:
+                if self._git(repository, "symbolic-ref", "--short", "HEAD") != base_branch:
+                    raise SourceRepositoryError("the managed project source is on an unexpected branch")
+                if self._git(repository, "status", "--porcelain"):
+                    raise SourceRepositoryError("the incomplete managed project source contains unexpected files")
+                needs_initial_commit = True
+        else:
+            repository.parent.mkdir(parents=True, exist_ok=True)
+            self._command(repository.parent, "git", "init", "-b", base_branch, str(repository))
+            needs_initial_commit = True
+        if needs_initial_commit:
+            self._command(
+                repository,
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "[init] Create managed MultiBuilder workspace",
+            )
+        self._git(repository, "rev-parse", "--verify", f"{base_branch}^{{commit}}")
         return repository
 
     def _validate_remote(self, value: str) -> str:
@@ -148,4 +198,8 @@ class SourceRepositoryManager:
         return result
 
 
-__all__ = ["SourceRepositoryError", "SourceRepositoryManager"]
+def project_base_ref(repository_url: str, base_branch: str) -> str:
+    return f"origin/{base_branch}" if repository_url.strip() else base_branch
+
+
+__all__ = ["SourceRepositoryError", "SourceRepositoryManager", "project_base_ref"]

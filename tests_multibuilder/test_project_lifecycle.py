@@ -347,36 +347,30 @@ async def test_service_prevents_scheduling_before_it_stops_project_workers(tmp_p
     )
 
 
-def test_authenticated_lifecycle_routes_enforce_status_and_missing_project_contracts(tmp_path: Path) -> None:
+def test_token_free_lifecycle_routes_enforce_status_and_missing_project_contracts(tmp_path: Path) -> None:
     app = create_app(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'lifecycle-api.db'}",
-        admin_token="test-admin-token",
         scheduler_enabled=False,
     )
-    headers = {"Authorization": "Bearer test-admin-token"}
     payload = {
         "name": "lifecycle-api",
         "goal": "Exercise project lifecycle routes",
-        "repository_url": "git@example.test:lifecycle-api.git",
-        "base_branch": "main",
         "acceptance_criteria": ["Lifecycle routes work"],
         "max_parallelism": 2,
     }
 
     with TestClient(app) as client:
-        created = client.post("/api/projects", json=payload, headers=headers).json()
+        created = client.post("/api/projects", json=payload).json()
         project_id = created["id"]
-        unauthenticated = client.post(f"/api/projects/{project_id}/pause")
-        paused = client.post(f"/api/projects/{project_id}/pause", headers=headers)
-        resumed = client.post(f"/api/projects/{project_id}/resume", headers=headers)
-        cancelled = client.post(f"/api/projects/{project_id}/cancel", headers=headers)
-        cancelled_again = client.post(f"/api/projects/{project_id}/cancel", headers=headers)
-        invalid_pause = client.post(f"/api/projects/{project_id}/pause", headers=headers)
-        invalid_resume = client.post(f"/api/projects/{project_id}/resume", headers=headers)
-        missing = client.post(f"/api/projects/{uuid4()}/cancel", headers=headers)
+        paused = client.post(f"/api/projects/{project_id}/pause")
+        resumed = client.post(f"/api/projects/{project_id}/resume")
+        cancelled = client.post(f"/api/projects/{project_id}/cancel")
+        cancelled_again = client.post(f"/api/projects/{project_id}/cancel")
+        invalid_pause = client.post(f"/api/projects/{project_id}/pause")
+        invalid_resume = client.post(f"/api/projects/{project_id}/resume")
+        missing = client.post(f"/api/projects/{uuid4()}/cancel")
 
     assert (
-        unauthenticated.status_code,
         paused.status_code,
         paused.json()["status"],
         resumed.json()["status"],
@@ -385,4 +379,4 @@ def test_authenticated_lifecycle_routes_enforce_status_and_missing_project_contr
         invalid_pause.status_code,
         invalid_resume.status_code,
         missing.status_code,
-    ) == (401, 200, "paused", "running", "cancelled", 200, 409, 409, 404)
+    ) == (200, "paused", "running", "cancelled", 200, 409, 409, 404)

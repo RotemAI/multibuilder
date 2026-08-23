@@ -440,8 +440,7 @@ select:focus-visible,
 .panel,
 .metric-card,
 .project-card,
-.state-card,
-.auth-card {
+.state-card {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--panel);
@@ -490,7 +489,6 @@ select:focus-visible,
 .stack { display: grid; gap: 16px; }
 .mb-16 { margin-bottom: 16px; }
 .mt-16 { margin-top: 16px; }
-.text-left { text-align: left; }
 
 .metric-card {
   min-height: 102px;
@@ -804,8 +802,7 @@ select:focus-visible,
   place-items: center;
 }
 
-.state-card,
-.auth-card {
+.state-card {
   width: min(100%, 480px);
   padding: 27px;
   text-align: center;
@@ -824,14 +821,12 @@ select:focus-visible,
   font-weight: 800;
 }
 
-.state-card h1,
-.auth-card h1 {
+.state-card h1 {
   margin: 0;
   font-size: 19px;
 }
 
-.state-card p,
-.auth-card p {
+.state-card p {
   margin: 7px 0 18px;
   color: var(--muted);
 }
@@ -1552,44 +1547,6 @@ select:focus-visible,
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(5px); }
 }
-
-.modal-backdrop {
-  position: fixed;
-  z-index: 150;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  background: var(--overlay);
-}
-
-.modal {
-  width: min(100%, 500px);
-  max-height: 90vh;
-  overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--panel);
-  box-shadow: var(--shadow-strong);
-}
-
-.modal-head,
-.modal-body,
-.modal-foot {
-  padding: 15px 17px;
-}
-
-.modal-head,
-.modal-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.modal-head { border-bottom: 1px solid var(--border); }
-.modal-foot { border-top: 1px solid var(--border); }
-.modal-head h2 { margin: 0; font-size: 15px; }
 
 .visually-hidden {
   position: absolute !important;

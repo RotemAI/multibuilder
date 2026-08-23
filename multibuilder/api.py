@@ -1,19 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
-import secrets
-import time
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Callable, Protocol
 from uuid import UUID, uuid4
 
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -29,22 +23,10 @@ class CreateProjectRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=120, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
     goal: str = Field(min_length=1, max_length=30_000)
-    repository_url: str = Field(min_length=1, max_length=2_000)
+    repository_url: str = Field(default="", max_length=2_000)
     base_branch: str = Field(default="main", min_length=1, max_length=255)
     acceptance_criteria: list[str] = Field(min_length=1)
     max_parallelism: int = Field(default=8, ge=1, le=256)
-
-
-class LoginRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    token: str = Field(min_length=1, max_length=4_096)
-
-
-_SESSION_COOKIE = "multibuilder_session"
-_SESSION_MAX_AGE_SECONDS = 43_200
-_LOGIN_WINDOW_SECONDS = 300
-_LOGIN_FAILURE_LIMIT = 5
 
 
 class ApplicationRuntime(Protocol):
@@ -58,43 +40,10 @@ class ApplicationRuntime(Protocol):
 def create_app(
     *,
     database_url: str,
-    admin_token: str,
-    cookie_signing_secret: str | None = None,
     scheduler_enabled: bool = True,
     runtime_factory: Callable[[ControlPlaneRepository], ApplicationRuntime] | None = None,
 ) -> FastAPI:
-    if len(admin_token) < 12:
-        raise ValueError("admin_token must contain at least 12 characters")
-
-    signing_secret = (cookie_signing_secret or hashlib.sha256(f"cookie:{admin_token}".encode()).hexdigest()).encode()
     static_directory = Path(__file__).with_name("static")
-    login_failures: dict[str, deque[float]] = defaultdict(deque)
-
-    def create_session_cookie() -> str:
-        issued_at = str(int(time.time()))
-        signature = hmac.new(signing_secret, f"admin:{issued_at}".encode(), hashlib.sha256).digest()
-        encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
-        return f"{issued_at}.{encoded_signature}"
-
-    def valid_session_cookie(value: str | None) -> bool:
-        if not value:
-            return False
-        try:
-            issued_at_text, signature = value.split(".", 1)
-            issued_at = int(issued_at_text)
-        except (TypeError, ValueError):
-            return False
-        now = int(time.time())
-        if issued_at > now + 60 or now - issued_at > _SESSION_MAX_AGE_SECONDS:
-            return False
-        expected = (
-            base64.urlsafe_b64encode(
-                hmac.new(signing_secret, f"admin:{issued_at_text}".encode(), hashlib.sha256).digest()
-            )
-            .decode()
-            .rstrip("=")
-        )
-        return secrets.compare_digest(signature, expected)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -139,53 +88,6 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
         return response
 
-    async def require_admin(
-        authorization: Annotated[str | None, Header()] = None,
-        session_cookie: Annotated[str | None, Cookie(alias=_SESSION_COOKIE)] = None,
-    ) -> None:
-        prefix = "Bearer "
-        bearer_valid = bool(
-            authorization
-            and authorization.startswith(prefix)
-            and secrets.compare_digest(authorization[len(prefix) :], admin_token)
-        )
-        if not bearer_valid and not valid_session_cookie(session_cookie):
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
-
-    @app.post("/api/auth/login")
-    async def login(payload: LoginRequest, request: Request, response: Response) -> dict[str, bool]:
-        client_key = request.client.host if request.client else "unknown"
-        now = time.monotonic()
-        failures = login_failures[client_key]
-        while failures and now - failures[0] >= _LOGIN_WINDOW_SECONDS:
-            failures.popleft()
-        if len(failures) >= _LOGIN_FAILURE_LIMIT:
-            retry_after = max(1, int(_LOGIN_WINDOW_SECONDS - (now - failures[0])))
-            raise HTTPException(
-                status.HTTP_429_TOO_MANY_REQUESTS,
-                "Too many login attempts",
-                headers={"Retry-After": str(retry_after)},
-            )
-        if not secrets.compare_digest(payload.token, admin_token):
-            failures.append(now)
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
-        login_failures.pop(client_key, None)
-        response.set_cookie(
-            _SESSION_COOKIE,
-            create_session_cookie(),
-            max_age=_SESSION_MAX_AGE_SECONDS,
-            httponly=True,
-            secure=True,
-            samesite="strict",
-            path="/",
-        )
-        return {"authenticated": True}
-
-    @app.post("/api/auth/logout")
-    async def logout(response: Response) -> dict[str, bool]:
-        response.delete_cookie(_SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
-        return {"authenticated": False}
-
     @app.get("/api/health")
     async def health(request: Request) -> dict:
         repository: ControlPlaneRepository = request.app.state.repository
@@ -196,7 +98,7 @@ def create_app(
             "scheduler": "enabled" if request.app.state.scheduler_enabled else "disabled",
         }
 
-    @app.post("/api/projects", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
+    @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
     async def create_project(payload: CreateProjectRequest, request: Request) -> JSONResponse:
         repository: ControlPlaneRepository = request.app.state.repository
         project = ProjectSpec(id=uuid4(), **payload.model_dump())
@@ -207,7 +109,7 @@ def create_app(
             task_type=TaskType.DIRECTOR,
             goal="Create the milestones and executable task DAG for this project",
             instructions=(
-                "Analyze the project goal and repository, then create a hierarchy of Workstream Leads and narrowly "
+                "Analyze the project goal and managed Git workspace, then create a hierarchy of Workstream Leads and narrowly "
                 "scoped worker tasks. Return milestones and an acyclic DAG with explicit dependencies, non-overlapping "
                 "write scopes, acceptance criteria, timeouts, retry limits, and preferred capabilities. Use strong "
                 "reasoning for architecture, difficult debugging, integration, and critical review. Use fast workers "
@@ -239,7 +141,7 @@ def create_app(
             content={"id": str(project.id), "status": "planning", "director_task_id": str(director.id)},
         )
 
-    @app.get("/api/projects", dependencies=[Depends(require_admin)])
+    @app.get("/api/projects")
     async def list_projects(request: Request) -> dict:
         repository: ControlPlaneRepository = request.app.state.repository
         projects = await repository.list_projects()
@@ -257,7 +159,7 @@ def create_app(
             ]
         }
 
-    @app.get("/api/projects/{project_id}", dependencies=[Depends(require_admin)])
+    @app.get("/api/projects/{project_id}")
     async def project_snapshot(project_id: UUID, request: Request) -> dict:
         repository: ControlPlaneRepository = request.app.state.repository
         try:
@@ -288,25 +190,25 @@ def create_app(
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return lifecycle_response(result)
 
-    @app.post("/api/projects/{project_id}/pause", dependencies=[Depends(require_admin)])
+    @app.post("/api/projects/{project_id}/pause")
     async def pause_project(project_id: UUID, request: Request) -> dict:
         return await apply_lifecycle_action(project_id, request, "pause")
 
-    @app.post("/api/projects/{project_id}/resume", dependencies=[Depends(require_admin)])
+    @app.post("/api/projects/{project_id}/resume")
     async def resume_project(project_id: UUID, request: Request) -> dict:
         return await apply_lifecycle_action(project_id, request, "resume")
 
-    @app.post("/api/projects/{project_id}/cancel", dependencies=[Depends(require_admin)])
+    @app.post("/api/projects/{project_id}/cancel")
     async def cancel_project(project_id: UUID, request: Request) -> dict:
         return await apply_lifecycle_action(project_id, request, "cancel")
 
-    @app.get("/api/projects/{project_id}/events", dependencies=[Depends(require_admin)])
+    @app.get("/api/projects/{project_id}/events")
     async def project_events(project_id: UUID, request: Request, after: int = 0, limit: int = 500) -> dict:
         repository: ControlPlaneRepository = request.app.state.repository
         events = await repository.list_events(project_id, after_id=max(after, 0), limit=min(max(limit, 1), 2_000))
         return {"events": [event.model_dump(mode="json") for event in events]}
 
-    @app.get("/api/projects/{project_id}/events/stream", dependencies=[Depends(require_admin)])
+    @app.get("/api/projects/{project_id}/events/stream")
     async def project_event_stream(
         project_id: UUID,
         request: Request,

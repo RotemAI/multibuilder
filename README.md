@@ -1,6 +1,6 @@
 # MultiBuilder
 
-MultiBuilder is a durable, multi-provider autonomous coding control plane. A user supplies a software goal and a Git repository. A Director plans the work, workstream leads decompose it, isolated workers implement it, independent agents review it, and a controlled integration pipeline validates each merge.
+MultiBuilder is a durable, multi-provider autonomous coding control plane. A user supplies a software goal and MultiBuilder creates a fresh managed Git workspace. A Director plans the work, workstream leads decompose it, isolated workers implement it, independent agents review it, and a controlled integration pipeline validates each merge.
 
 The production UI is served at [multibuilder.grabo.tools](https://multibuilder.grabo.tools).
 
@@ -43,8 +43,7 @@ Unavailable or rate-limited providers are excluded automatically. Routing scores
 - Independent review and bounded repair tasks
 - Sequential integration branch merge queue
 - Build, typecheck, lint, unit, integration, and security validation stages
-- HttpOnly, Secure, SameSite authentication cookie
-- Login throttling, strict CSP, HSTS, and no-store API responses
+- Direct token-free control-plane access, strict CSP, HSTS, and no-store API responses
 - Git source host allowlist and credential-free repository URLs
 - Private prompt and schema artifacts with secret redaction
 
@@ -68,8 +67,6 @@ The application fails closed when required production settings are absent.
 
 ```bash
 export MULTIBUILDER_DATABASE_URL='postgresql+asyncpg:///multibuilder?host=/var/run/postgresql'
-export MULTIBUILDER_ADMIN_TOKEN='replace-with-a-random-operator-token'
-export MULTIBUILDER_COOKIE_SECRET='replace-with-a-separate-random-secret'
 export MULTIBUILDER_PUBLIC_URL='https://multibuilder.grabo.tools'
 export MULTIBUILDER_STATE_ROOT='/srv/multibuilder/state'
 export MULTIBUILDER_GIT_ALLOWED_HOSTS='github.com'
@@ -100,12 +97,10 @@ Provider-specific `*_ENABLED`, `*_BINARY`, `*_MODEL`, and `*_REASONING` variable
 
 ## HTTP API
 
-`GET /api/health` is public and reports database and scheduler health. All project, task, event, agent, integration, and capacity data requires either the operator bearer token or the signed browser session cookie.
+`GET /api/health` reports database and scheduler health. The control-plane API is available directly without an admin token or browser login.
 
 Core routes:
 
-- `POST /api/auth/login`
-- `POST /api/auth/logout`
 - `POST /api/projects`
 - `GET /api/projects`
 - `GET /api/projects/{project_id}`
@@ -116,6 +111,6 @@ The event stream supports `Last-Event-ID`, cursor replay, keepalives, and reconn
 
 ## Project contract
 
-A new project requires a name, goal, repository URL, base branch, acceptance criteria, and a maximum parallelism limit. The initial Director task must produce an acyclic task DAG with explicit dependencies, scopes, acceptance criteria, provider preferences, timeouts, retry limits, and milestones.
+A new project requires a name, goal, acceptance criteria, and a maximum parallelism limit. MultiBuilder initializes a dedicated managed Git repository on `main` automatically. Advanced API clients may still supply an allowed remote repository and base branch. The initial Director task must produce an acyclic task DAG with explicit dependencies, scopes, acceptance criteria, provider preferences, timeouts, retry limits, and milestones.
 
 A project is complete only when its integrated acceptance criteria and validation gates pass. A green worker test by itself is not completion.

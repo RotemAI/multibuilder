@@ -34,6 +34,7 @@ from .integration import (
     ValidationSuiteResult,
 )
 from .routing import ProviderProfile
+from .sources import project_base_ref
 
 
 class IntegrationRepository(Protocol):
@@ -317,7 +318,7 @@ class AutonomousIntegrationRuntime:
             return IntegrationTickReport()
         target = IntegrationTarget(
             f"integration/{snapshot.project.id.hex[:12]}",
-            base_ref=f"origin/{snapshot.project.base_branch}",
+            base_ref=project_base_ref(snapshot.project.repository_url, snapshot.project.base_branch),
         )
         result = await self.merge_coordinator.process_next(
             snapshot.project.id,

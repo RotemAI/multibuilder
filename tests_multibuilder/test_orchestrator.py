@@ -593,6 +593,20 @@ async def test_initial_workspace_uses_the_verified_remote_base_branch(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_initial_managed_workspace_uses_its_local_base_branch(tmp_path: Path) -> None:
+    project = make_project(tmp_path).model_copy(update={"repository_url": ""})
+    task = make_task(project.id, "API", "api/**")
+    repository = FakeRepository(project, [task], [provider()])
+    workspaces = FakeWorkspaceManager()
+    orchestrator = make_orchestrator(repository, SuccessfulExecutor(), workspaces)
+
+    await orchestrator.tick()
+    await orchestrator.drain()
+
+    assert workspaces.base_refs == ["main"]
+
+
+@pytest.mark.asyncio
 async def test_dependent_workspace_uses_the_nearest_upstream_task_commit(tmp_path: Path) -> None:
     project = make_project(tmp_path)
     upstream = make_task(project.id, "Contract", "contract/**").model_copy(

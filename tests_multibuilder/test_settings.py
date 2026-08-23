@@ -8,14 +8,12 @@ from multibuilder.settings import RuntimeSettings
 def valid_environment() -> dict[str, str]:
     return {
         "MULTIBUILDER_DATABASE_URL": "postgresql+asyncpg:///multibuilder",
-        "MULTIBUILDER_ADMIN_TOKEN": "an-admin-token-with-enough-entropy",
-        "MULTIBUILDER_COOKIE_SECRET": "a-cookie-secret-with-enough-entropy",
         "MULTIBUILDER_PUBLIC_URL": "https://multibuilder.grabo.tools",
         "MULTIBUILDER_STATE_ROOT": "/srv/multibuilder/state",
     }
 
 
-def test_runtime_settings_are_fail_closed_and_do_not_repr_secrets() -> None:
+def test_runtime_settings_need_no_access_secrets() -> None:
     settings = RuntimeSettings.from_environment(valid_environment())
 
     assert settings.bind_host == "127.0.0.1"
@@ -23,8 +21,8 @@ def test_runtime_settings_are_fail_closed_and_do_not_repr_secrets() -> None:
     assert settings.scheduler_enabled is True
     assert settings.git_allowed_hosts == frozenset({"github.com"})
     assert settings.providers["codex"].enabled is True
-    assert "an-admin-token" not in repr(settings)
-    assert "cookie-secret" not in repr(settings)
+    assert not hasattr(settings, "admin_token")
+    assert not hasattr(settings, "cookie_signing_secret")
 
 
 def test_public_bind_requires_an_explicit_override() -> None:

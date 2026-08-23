@@ -117,7 +117,7 @@ async def test_reviewed_commit_is_validated_merged_and_finalized_durably(tmp_pat
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}")
     await database.create_schema()
     repository = ControlPlaneRepository(database.session_factory)
-    item_project = project()
+    item_project = project().model_copy(update={"repository_url": ""})
     code = implementation(item_project.id)
     repository_path = tmp_path / "repository"
     worktree_path = tmp_path / "worktree"
@@ -170,7 +170,8 @@ async def test_reviewed_commit_is_validated_merged_and_finalized_durably(tmp_pat
         snapshot.merge_queue[0].status,
         [record.stage for record in snapshot.validations],
         len(merge.calls),
-    ) == (1, 1, TaskStatus.SUCCEEDED, MergeStatus.MERGED, ["unit", "build"], 1)
+        merge.calls[0][1].base_ref,
+    ) == (1, 1, TaskStatus.SUCCEEDED, MergeStatus.MERGED, ["unit", "build"], 1, "main")
 
 
 @pytest.mark.asyncio

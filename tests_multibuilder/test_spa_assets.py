@@ -140,14 +140,23 @@ def test_spa_has_loading_empty_error_and_demo_states() -> None:
     assert "requestAnimationFrame" in script
 
 
-def test_auth_uses_an_http_only_cookie_contract_and_lists_server_projects() -> None:
+def test_spa_needs_no_admin_token_or_repository_url() -> None:
     script = read_asset("app.js")
+    html = read_asset("index.html")
 
-    assert 'fetch("/api/projects"' in script
-    assert 'fetch("/api/auth/login"' in script
-    assert 'credentials: "same-origin"' in script
-    assert "Authorization" not in script
-    assert "sessionStorage" not in script
+    assert 'apiFetch("/api/projects"' in script
+    assert "fresh managed Git workspace" in script
+    for removed in (
+        "Admin access token",
+        "Repository URL",
+        "repository_url",
+        "base_branch",
+        "/api/auth/login",
+        "/api/auth/logout",
+        "data-open-auth",
+        "sign-out-button",
+    ):
+        assert removed not in script + html
 
 
 def test_templates_are_compatible_with_the_strict_style_csp() -> None:
@@ -163,7 +172,7 @@ def test_live_events_use_eventsource_with_reconnect_and_polling_fallback() -> No
 
     assert "new EventSource" in script
     assert "/events/stream?after=" in script
-    assert "withCredentials: true" in script
+    assert "withCredentials" not in script
     assert 'source.addEventListener("project.created"' in script
     assert "source.onerror" in script
     assert "source.close()" in script

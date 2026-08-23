@@ -49,6 +49,43 @@ def test_source_repository_is_cloned_once_and_refreshed_safely(tmp_path) -> None
     assert git(first, "rev-parse", "--verify", "origin/main^{commit}")
 
 
+def test_blank_source_bootstraps_one_managed_repository(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Fixture User")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "fixture@example.test")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Fixture User")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "fixture@example.test")
+    manager = SourceRepositoryManager(tmp_path / "state")
+    project_id = uuid4()
+
+    first = manager.prepare(project_id, "", "main")
+    second = manager.prepare(project_id, "", "main")
+
+    assert first == second
+    assert git(first, "branch", "--show-current") == "main"
+    assert git(first, "rev-list", "--count", "HEAD") == "1"
+    assert git(first, "log", "-1", "--format=%s") == "[init] Create managed MultiBuilder workspace"
+    assert git(first, "remote") == ""
+    assert git(first, "status", "--porcelain") == ""
+
+
+def test_blank_source_recovers_an_interrupted_managed_repository_initialization(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Fixture User")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "fixture@example.test")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Fixture User")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "fixture@example.test")
+    manager = SourceRepositoryManager(tmp_path / "state")
+    project_id = uuid4()
+    repository = manager.repositories_root / project_id.hex
+    repository.mkdir(parents=True)
+    git(repository, "init", "-b", "main")
+
+    prepared = manager.prepare(project_id, "", "main")
+
+    assert prepared == repository
+    assert git(prepared, "rev-list", "--count", "HEAD") == "1"
+    assert git(prepared, "log", "-1", "--format=%s") == "[init] Create managed MultiBuilder workspace"
+
+
 def test_source_repository_rejects_credentials_embedded_in_urls(tmp_path) -> None:
     manager = SourceRepositoryManager(tmp_path / "state")
 

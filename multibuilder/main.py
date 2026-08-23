@@ -11,8 +11,6 @@ def create_application(settings: RuntimeSettings | None = None) -> FastAPI:
     runtime_settings = settings or RuntimeSettings.from_environment()
     return create_app(
         database_url=runtime_settings.database_url,
-        admin_token=runtime_settings.admin_token,
-        cookie_signing_secret=runtime_settings.cookie_signing_secret,
         scheduler_enabled=runtime_settings.scheduler_enabled,
         runtime_factory=lambda repository: build_runtime(runtime_settings, repository),
     )
