@@ -8,6 +8,7 @@ from typing import Annotated, Callable, Protocol
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -21,7 +22,7 @@ from .repository import ControlPlaneRepository, InvalidProjectTransition
 class CreateProjectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=120, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+    name: str = Field(min_length=1, max_length=120)
     goal: str = Field(min_length=1, max_length=30_000)
     repository_url: str = Field(default="", max_length=2_000)
     base_branch: str = Field(default="main", min_length=1, max_length=255)
@@ -69,6 +70,18 @@ def create_app(
             await database.dispose()
 
     app = FastAPI(title="MultiBuilder", version="0.1.0", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def readable_request_validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        messages = []
+        for error in exc.errors():
+            location = ".".join(str(item) for item in error.get("loc", ()) if item != "body")
+            message = str(error.get("msg") or "Invalid value")
+            messages.append(f"{location}: {message}" if location else message)
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": "; ".join(messages) or "Request validation failed"},
+        )
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):

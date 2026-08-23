@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 STATIC = Path(__file__).parents[1] / "multibuilder" / "static"
@@ -157,6 +158,13 @@ def test_spa_needs_no_admin_token_or_repository_url() -> None:
         "sign-out-button",
     ):
         assert removed not in script + html
+
+
+def test_project_name_accepts_human_readable_text() -> None:
+    script = read_asset("app.js")
+    name_input = re.search(r'<input[^>]+name="name"[^>]*>', script)
+
+    assert name_input and "pattern=" not in name_input.group(0)
 
 
 def test_templates_are_compatible_with_the_strict_style_csp() -> None:

@@ -604,7 +604,7 @@
       <header class="page-head"><div><div class="eyebrow">Project / Goal</div><h1>Start an autonomous build</h1><p>Give the Director a goal and acceptance criteria. MultiBuilder creates a fresh managed Git workspace automatically.</p></div></header>
       <form id="new-project-form" class="panel" novalidate>
         <div class="form-grid">
-          <div class="field"><label for="project-name">Project name</label><input class="input" id="project-name" name="name" required maxlength="120" pattern="[a-zA-Z0-9][a-zA-Z0-9._-]*" placeholder="customer-portal"><span class="field-help">Letters, numbers, dots, underscores, and hyphens.</span></div>
+          <div class="field"><label for="project-name">Project name</label><input class="input" id="project-name" name="name" required maxlength="120" placeholder="Customer portal"><span class="field-help">Use a short descriptive name. Spaces are allowed.</span></div>
           <div class="field full"><label for="project-goal">User goal</label><textarea class="textarea" id="project-goal" name="goal" required maxlength="30000" placeholder="Build, test, and deploy..."></textarea></div>
           <div class="field full"><label for="acceptance-criteria">Acceptance criteria</label><textarea class="textarea" id="acceptance-criteria" name="acceptance_criteria" required placeholder="One criterion per line"></textarea><span class="field-help">The integrated build is not complete until every criterion passes.</span></div>
           <div class="field"><label for="max-parallelism">Maximum parallel workers</label><input class="input" id="max-parallelism" name="max_parallelism" type="number" min="1" max="256" value="8" required></div>

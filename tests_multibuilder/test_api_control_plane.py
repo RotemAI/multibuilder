@@ -40,6 +40,33 @@ def test_project_creation_needs_no_token_or_repository_url(tmp_path) -> None:
     assert snapshot.json()["project"]["base_branch"] == "main"
 
 
+def test_project_creation_accepts_a_human_readable_name(tmp_path) -> None:
+    app = create_app(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'readable-name.db'}",
+        scheduler_enabled=False,
+    )
+    payload = project_payload() | {"name": "hello project"}
+
+    with TestClient(app) as client:
+        response = client.post("/api/projects", json=payload)
+        snapshot = client.get(f"/api/projects/{response.json().get('id', 'missing')}")
+
+    assert (response.status_code, snapshot.json().get("project", {}).get("name")) == (201, "hello project")
+
+
+def test_request_validation_errors_are_readable_text(tmp_path) -> None:
+    app = create_app(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'readable-errors.db'}",
+        scheduler_enabled=False,
+    )
+    payload = project_payload() | {"max_parallelism": 0}
+
+    with TestClient(app) as client:
+        response = client.post("/api/projects", json=payload)
+
+    assert response.json() == {"detail": "max_parallelism: Input should be greater than or equal to 1"}
+
+
 def test_project_creation_persists_a_director_task_and_event(tmp_path) -> None:
     app = create_app(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'project.db'}",

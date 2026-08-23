@@ -89,7 +89,7 @@ class ProjectSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: UUID
-    name: str = Field(min_length=1, max_length=120, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+    name: str = Field(min_length=1, max_length=120)
     goal: str = Field(min_length=1, max_length=30_000)
     repository_url: str = Field(default="", max_length=2_000)
     base_branch: str = Field(default="main", min_length=1, max_length=255)
