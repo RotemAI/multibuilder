@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f5f7fb">
+  <title>MultiBuilder Control Plane</title>
+  <link rel="icon" href="/static/favicon.svg?v=20260823.3" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css?v=20260823.8">
+</head>
+<body>
+  <a class="skip-link" href="#app-view">Skip to workspace</a>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#/projects" aria-label="MultiBuilder projects">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <span><strong>MultiBuilder</strong><small>Control plane</small></span>
+      </a>
+      <nav id="primary-navigation" class="primary-navigation" aria-label="Primary navigation"></nav>
+      <div class="sidebar-foot">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span><strong>Scheduler link</strong><small id="connection-label">Checking status</small></span>
+      </div>
+    </aside>
+
+    <div class="workspace-shell">
+      <header class="topbar">
+        <button id="mobile-navigation" class="icon-button mobile-menu" type="button"
+                aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">
+          <span></span><span></span><span></span>
+        </button>
+        <div class="breadcrumb" id="breadcrumb" aria-label="Breadcrumb"></div>
+        <div class="topbar-actions">
+          <button class="button button-quiet hidden" id="refresh-button" type="button">Refresh</button>
+        </div>
+      </header>
+      <main id="app-view" tabindex="-1" aria-busy="false"></main>
+    </div>
+  </div>
+
+  <div id="header-tooltip" class="header-tooltip" role="tooltip" hidden></div>
+  <div id="cell-popover" class="cell-popover" role="tooltip" hidden></div>
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+  <script src="/static/app.js?v=20260823.8" defer></script>
+</body>
+</html>
