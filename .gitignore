@@ -73,3 +73,7 @@ codex-config.tmp.toml
 # Environment / secrets
 .env
 .env.*
+*.pem
+*.key
+credentials.*
+secrets.*

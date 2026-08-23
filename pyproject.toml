@@ -1,3 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multibuilder-control-plane"
+version = "0.1.0"
+description = "Durable multi-provider autonomous software factory"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.140.7",
+    "uvicorn==0.39.0",
+    "pydantic==2.12.5",
+    "SQLAlchemy==2.0.52",
+    "asyncpg==0.31.0",
+    "aiosqlite==0.22.1",
+    "httpx==0.28.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["multibuilder*"]
+
+[tool.setuptools.package-data]
+multibuilder = ["static/*.html", "static/*.css", "static/*.js", "static/*.svg"]
+
 [tool.ruff]
 target-version = "py39"
 line-length = 120
@@ -5,10 +30,10 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "W", "UP", "I", "B"]
 ignore = [
-    "E501",   # line too long — single-file app with embedded HTML/JS strings
-    "F401",   # unused imports — sometimes needed for side-effects
-    "E402",   # module-level import not at top — intentional: logging init before imports
-    "B008",   # FastAPI File(...) in default args — correct FastAPI pattern, not a bug
+    "E501",   # line too long: single-file app with embedded HTML/JS strings
+    "F401",   # unused imports: sometimes needed for side-effects
+    "E402",   # module-level import not at top: intentional logging init before imports
+    "B008",   # FastAPI File(...) in default args: correct FastAPI pattern, not a bug
 ]
 
 [tool.ruff.lint.per-file-ignores]
