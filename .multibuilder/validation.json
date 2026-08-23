@@ -1,0 +1,8 @@
+{
+  "build": ["sh", "scripts/validate.sh", "build"],
+  "typecheck": ["sh", "scripts/validate.sh", "typecheck"],
+  "lint": ["sh", "scripts/validate.sh", "lint"],
+  "unit": ["sh", "scripts/validate.sh", "unit"],
+  "integration": ["sh", "scripts/validate.sh", "integration"],
+  "security": ["sh", "scripts/validate.sh", "security"]
+}
