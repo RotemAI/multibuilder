@@ -1059,3 +1059,174 @@ class TestAtomicWriteJson:
         _atomic_write_json(target, {"tok": "abc"})
         mode = oct(target.stat().st_mode & 0o777)
         assert mode == "0o600", f"Expected 0o600, got {mode}"
+
+
+class TestSshIdeSafety:
+    """Guard the small, deliberately non-interactive SSH execution surface."""
+
+    @pytest.mark.parametrize("host", ["example.com", "host-1.internal", "192.0.2.10", "2001:db8::1"])
+    def test_accepts_hostnames_and_ip_addresses(self, host):
+        from app import _valid_ssh_host
+
+        assert _valid_ssh_host(host) is True
+
+    @pytest.mark.parametrize("host", ["", "host;id", "host name", "example..com", "$(id)"])
+    def test_rejects_shell_syntax_and_invalid_hosts(self, host):
+        from app import _valid_ssh_host
+
+        assert _valid_ssh_host(host) is False
+
+    def test_remote_command_quotes_path_without_executing_it(self):
+        from app import _ssh_remote_command
+
+        command = _ssh_remote_command("print('ok')", "/srv/app; touch /tmp/pwned")
+
+        assert "touch /tmp/pwned" in command
+        assert command.count("'") >= 2
+        assert command.startswith("python3 -c ")
+
+    def test_remote_filesystem_script_only_deletes_empty_folders(self):
+        from app import _SSH_FILESYSTEM_SCRIPT
+
+        assert "os.rmdir(path)" in _SSH_FILESYSTEM_SCRIPT
+        assert "rmtree" not in _SSH_FILESYSTEM_SCRIPT
+        assert "os.O_EXCL" in _SSH_FILESYSTEM_SCRIPT
+
+    def test_remote_search_is_bounded_and_does_not_follow_links(self):
+        from app import _SSH_SEARCH_SCRIPT
+
+        assert "os.walk(root, followlinks=False)" in _SSH_SEARCH_SCRIPT
+        assert "depth >= 12" in _SSH_SEARCH_SCRIPT
+        assert "len(matches) >= 120" in _SSH_SEARCH_SCRIPT
+
+    def test_terminal_audit_is_private_and_credential_free(self, tmp_path, monkeypatch):
+        import app as app_module
+
+        from app import _append_ssh_ide_audit
+
+        audit_file = tmp_path / "ssh-ide-audit.jsonl"
+        monkeypatch.setattr(app_module, "SSH_IDE_AUDIT_FILE", audit_file)
+        entry = _append_ssh_ide_audit(
+            {"id": "admin", "username": "admin"},
+            "test-session",
+            {"id": "connection-id", "label": "Production", "password": "never-record-this"},
+            "terminal_focus_requested",
+        )
+
+        assert entry["action"] == "terminal_focus_requested"
+        assert "never-record-this" not in audit_file.read_text()
+        assert oct(audit_file.stat().st_mode & 0o777) == "0o600"
+
+    def test_git_input_validators_reject_path_traversal_and_bad_branches(self):
+        from app import _valid_git_branch, _valid_git_pathspec
+
+        assert _valid_git_pathspec("src/main.py")
+        assert not _valid_git_pathspec("../secret")
+        assert _valid_git_branch("feature/remote-ide")
+        assert not _valid_git_branch("feature/../secret")
+
+    def test_workspace_paths_are_relative_and_commands_enter_configured_root(self):
+        from app import _normalized_workspace_path, _ssh_workspace_command
+
+        profile = {"workspace_root": "/srv/app"}
+        assert _normalized_workspace_path(profile, "src/main.py") == "src/main.py"
+        assert _normalized_workspace_path(profile, "../secret") is None
+        assert _normalized_workspace_path(profile, "/etc/passwd") is None
+        command = _ssh_workspace_command(profile, "print('ok')", "src/main.py")
+        assert command.startswith("cd -- /srv/app && python3 -c ")
+
+    def test_rejects_nul_and_overlong_remote_paths(self):
+        from app import _normalized_remote_path
+
+        assert _normalized_remote_path("src/main.py") == "src/main.py"
+        assert _normalized_remote_path("bad\x00path") is None
+        assert _normalized_remote_path("a" * 4097) is None
+
+    def test_control_socket_is_short_and_scoped_to_session_and_connection(self):
+        from app import _ssh_control_socket
+
+        first = _ssh_control_socket("project-alpha", "abcdefghijkl")
+        other_session = _ssh_control_socket("project-beta", "abcdefghijkl")
+        other_connection = _ssh_control_socket("project-alpha", "zyxwvutsrqpo")
+
+        assert len(str(first)) < 100
+        assert first != other_session
+        assert first != other_connection
+
+    @pytest.mark.parametrize("session, connection", [("bad/name", "abcdefghijkl"), ("valid", "short")])
+    def test_control_socket_rejects_invalid_workspace_identifiers(self, session, connection):
+        from app import _ssh_control_socket
+
+        with pytest.raises(ValueError):
+            _ssh_control_socket(session, connection)
+
+    @patch("app.shutil.which", return_value="/usr/bin/ssh")
+    def test_argv_disables_interactive_auth_and_forwarding(self, _which):
+        from app import _ssh_argv
+
+        argv = _ssh_argv({"host": "example.com", "username": "deploy", "port": 2222})
+
+        assert argv[-1] == "deploy@example.com"
+        assert "BatchMode=yes" in argv
+        assert "ClearAllForwardings=yes" in argv
+        assert "StrictHostKeyChecking=yes" in argv
+
+    @patch("app._ssh_control_is_alive", side_effect=[False, True])
+    @patch("app.shutil.which", return_value="/usr/bin/ssh")
+    @patch("app.subprocess.run")
+    def test_starts_a_session_scoped_control_master(self, run, _which, _alive, tmp_path, monkeypatch):
+        import app as app_module
+        from app import _ssh_start_control_master
+
+        monkeypatch.setattr(app_module, "SSH_CONTROL_DIR", tmp_path / "ssh-control")
+        run.return_value = MagicMock(returncode=0, stderr=b"")
+        profile = {"id": "abcdefghijkl", "host": "example.com", "username": "deploy", "port": 22}
+
+        socket_path = _ssh_start_control_master(profile, "test-session")
+
+        command = run.call_args.args[0]
+        assert socket_path.parent == tmp_path / "ssh-control"
+        assert "ControlMaster=yes" in command
+        assert "ControlPersist=30m" in command
+        assert command[-1] == "deploy@example.com"
+
+    @patch("app._ssh_control_is_alive", return_value=True)
+    @patch("app.shutil.which", return_value="/usr/bin/tmux")
+    @patch("app.subprocess.run")
+    def test_opens_dedicated_tmux_window_for_live_connection(self, run, _which, _alive):
+        from app import _ssh_open_tmux_window
+
+        run.return_value = MagicMock(returncode=0, stderr=b"")
+        profile = {"id": "abcdefghijkl", "label": "Production API", "host": "example.com", "username": "deploy"}
+
+        window_name = _ssh_open_tmux_window(profile, "test-session")
+
+        command = run.call_args.args[0]
+        assert command[:5] == ["tmux", "new-window", "-d", "-t", "test-session"]
+        assert window_name == "ssh:Production-API"
+
+    @patch("app._ssh_control_is_alive", side_effect=[False, True])
+    @patch("app.shutil.which", return_value="/usr/bin/ssh")
+    @patch("app.subprocess.run")
+    def test_password_uses_ephemeral_askpass_script(self, run, _which, _alive):
+        from app import _ssh_start_control_master
+
+        run.return_value = MagicMock(returncode=0, stderr=b"")
+        profile = {"id": "abcdefghijkl", "auth_mode": "password", "host": "example.com", "username": "deploy"}
+
+        _ssh_start_control_master(profile, "test-session", password="correct horse battery staple")
+
+        environment = run.call_args.kwargs["env"]
+        assert environment["TMUX_DASH_SSH_PASSWORD"] == "correct horse battery staple"
+        assert not os.path.exists(environment["SSH_ASKPASS"])
+
+    @patch("app.shutil.which", return_value="/usr/bin/tmux")
+    @patch("app.subprocess.run")
+    def test_focuses_matching_tmux_ssh_window(self, run, _which):
+        from app import _ssh_focus_tmux_window
+
+        run.return_value = MagicMock(returncode=0, stderr=b"")
+        window_name = _ssh_focus_tmux_window({"label": "Production API"}, "test-session")
+
+        assert window_name == "ssh:Production-API"
+        assert run.call_args.args[0] == ["tmux", "select-window", "-t", "test-session:ssh:Production-API"]

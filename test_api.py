@@ -1222,6 +1222,283 @@ class TestExtendedSecurityHeaders:
             resp = authed_client.get("/api/sessions-fast")
         assert "Content-Security-Policy" in resp.headers
 
+    def test_csp_allows_pinned_monaco_assets_and_blob_workers(self, authed_client):
+        csp = authed_client.get("/").headers.get("Content-Security-Policy", "")
+
+        assert "https://cdn.jsdelivr.net" in csp
+        assert "worker-src 'self' blob:" in csp
+
+
+class TestSshIdeEndpoints:
+    def test_dashboard_includes_three_pane_remote_ide(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert 'id="ide-files"' in html
+        assert 'id="ide-editor"' in html
+        assert 'id="ide-chat-messages"' in html
+        assert "Active file contents (first 12,000 characters)" in html
+        assert "IDE_WORKSPACE_STORAGE" in html
+        assert "ideRestoreWorkspace" in html
+        assert 'id="ide-connection-state"' in html
+        assert "ideFocusTerminal" in html
+        assert "ideCreateRemote" in html
+        assert "ideRenameSelected" in html
+        assert "ideDeleteSelected" in html
+        assert 'id="ide-file-filter"' in html
+        assert "ideShowQuickOpen" in html
+        assert "ideToggleTree" in html
+        assert "ideShowGit" in html
+        assert "ideGitCommit" in html
+        assert "ideShowCommandPalette" in html
+        assert "editor.action.startFindReplaceAction" in html
+        assert "editor.action.gotoLine" in html
+
+    def test_routes_are_admin_only(self, authed_client):
+        with (
+            patch("app._current_user", return_value={"id": "member", "role": "member"}),
+            patch("app._user_can_access_session", return_value=True),
+        ):
+            response = authed_client.get("/api/sessions/test-session/ide/ssh-connections")
+
+        assert response.status_code == 403
+
+    def test_create_list_and_delete_connection_metadata(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(
+            app_module,
+            "get_tmux_sessions",
+            lambda: [{"name": "test-session"}, {"name": "work-session"}],
+        )
+        body = {"label": "Test host", "host": "example.com", "username": "deploy", "port": 2222}
+
+        created = authed_client.post("/api/sessions/test-session/ide/ssh-connections", json=body)
+        assert created.status_code == 201
+        connection = created.json()["connection"]
+        assert connection["label"] == "Test host"
+        assert connection["host"] == "example.com"
+        assert connection["username"] == "deploy"
+        assert connection["port"] == 2222
+        assert connection["identity_file"] == ""
+        assert connection["id"]
+
+        listed = authed_client.get("/api/sessions/test-session/ide/ssh-connections")
+        assert listed.status_code == 200
+        assert listed.json()["connections"] == [connection]
+        assert authed_client.get("/api/sessions/work-session/ide/ssh-connections").json()["connections"] == []
+
+        deleted = authed_client.delete(
+            f"/api/sessions/test-session/ide/ssh-connections/{connection['id']}"
+        )
+        assert deleted.status_code == 200
+        assert authed_client.get("/api/sessions/test-session/ide/ssh-connections").json()["connections"] == []
+
+    def test_connect_opens_session_ssh_workspace(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "SSH_IDE_AUDIT_FILE", tmp_path / "ssh-ide-audit.jsonl")
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        created = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy"},
+        )
+        connection_id = created.json()["connection"]["id"]
+        with (
+            patch("app._ssh_start_control_master"),
+            patch("app._ssh_open_tmux_window", return_value="ssh:example.com"),
+        ):
+            connected = authed_client.post(
+                f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/connect"
+            )
+
+        assert connected.status_code == 200
+        assert connected.json() == {"ok": True, "connected": True, "window_name": "ssh:example.com"}
+
+    def test_password_is_not_persisted_or_returned(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        store_path = tmp_path / "ssh-connections.json"
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", store_path)
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        password = "correct horse battery staple"
+
+        created = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy", "auth_mode": "password", "password": password},
+        )
+
+        assert created.status_code == 201
+        assert created.json()["connection"]["auth_mode"] == "password"
+        assert password not in created.text
+        assert password not in store_path.read_text()
+
+    def test_status_reports_when_session_connection_needs_reconnect(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "SSH_IDE_AUDIT_FILE", tmp_path / "ssh-ide-audit.jsonl")
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy"},
+        ).json()["connection"]["id"]
+        with patch("app._ssh_control_is_alive", return_value=False):
+            status = authed_client.get(
+                f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/status"
+            )
+
+        assert status.status_code == 200
+        assert status.json() == {"connected": False, "window_name": ""}
+
+    def test_focus_terminal_selects_session_ssh_window(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        audit_file = tmp_path / "ssh-ide-audit.jsonl"
+        monkeypatch.setattr(app_module, "SSH_IDE_AUDIT_FILE", audit_file)
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy"},
+        ).json()["connection"]["id"]
+        with patch("app._ssh_focus_tmux_window", return_value="ssh:example.com"):
+            focused = authed_client.post(
+                f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/focus-terminal"
+        )
+
+        assert focused.status_code == 200
+        assert focused.json()["ok"] is True
+        assert focused.json()["window_name"] == "ssh:example.com"
+        assert focused.json()["audit_id"]
+        audit = json.loads(audit_file.read_text().strip())
+        assert audit["action"] == "terminal_focus_requested"
+        assert audit["terminal_mode"] == "focus_existing_tmux_window"
+        assert audit["session_name"] == "test-session"
+
+    def test_remote_filesystem_actions_use_live_session_connection(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "SSH_IDE_AUDIT_FILE", tmp_path / "ssh-ide-audit.jsonl")
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy"},
+        ).json()["connection"]["id"]
+        with patch(
+            "app._ssh_run",
+            return_value=json.dumps({"ok": True, "action": "create_file", "path": "new.py", "new_path": ""}),
+        ) as run:
+            changed = authed_client.post(
+                f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/fs",
+                json={"action": "create_file", "path": "new.py"},
+            )
+
+        assert changed.status_code == 200
+        assert changed.json()["path"] == "new.py"
+        command = run.call_args.args[2]
+        assert '"action": "create_file"' in command
+        assert '"path": "new.py"' in command
+
+    def test_remote_filesystem_rejects_invalid_actions_and_destinations(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy"},
+        ).json()["connection"]["id"]
+
+        invalid_action = authed_client.post(
+            f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/fs",
+            json={"action": "remove_tree", "path": "/srv/app"},
+        )
+        unexpected_destination = authed_client.post(
+            f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/fs",
+            json={"action": "delete", "path": "/srv/app/file.py", "new_path": "/srv/app/other.py"},
+        )
+
+        assert invalid_action.status_code == 400
+        assert unexpected_destination.status_code == 400
+
+    def test_quick_open_search_uses_session_control_connection(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy"},
+        ).json()["connection"]["id"]
+        with patch(
+            "app._ssh_run",
+            return_value=json.dumps({"path": ".", "matches": [{"path": "main.py", "name": "main.py"}], "truncated": False}),
+        ) as run:
+            found = authed_client.get(
+                f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/files/search",
+                params={"path": ".", "query": "main"},
+            )
+
+        assert found.status_code == 200
+        assert found.json()["matches"][0]["path"] == "main.py"
+        command = run.call_args.args[2]
+        assert '"query": "main"' in command
+        assert "os.walk" in command
+
+    def test_quick_open_rejects_empty_query(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy"},
+        ).json()["connection"]["id"]
+
+        response = authed_client.get(
+            f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/files/search",
+            params={"path": "/srv/app", "query": ""},
+        )
+
+        assert response.status_code == 400
+
+    def test_remote_git_uses_fixed_command_bridge(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        connection_id = authed_client.post("/api/sessions/test-session/ide/ssh-connections", json={"host": "example.com", "username": "deploy"}).json()["connection"]["id"]
+        with patch("app._ssh_run", return_value=json.dumps({"ok": True, "root": "/srv/app", "status": "## main", "output": "## main", "current_branch": "main", "branches": ["main"]})) as run:
+            response = authed_client.post(f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/git", json={"action": "status", "path": "."})
+
+        assert response.status_code == 200
+        assert response.json()["current_branch"] == "main"
+        command = run.call_args.args[2]
+        assert "subprocess.run" in command
+        assert "rev-parse" in command
+        assert "--show-current" in command
+
+    def test_rejects_invalid_host_and_private_key_outside_ssh_directory(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        invalid_host = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "server;id", "username": "deploy"},
+        )
+        assert invalid_host.status_code == 400
+
+        key = tmp_path / "private_key"
+        key.write_text("not a key")
+        outside_ssh = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"host": "example.com", "username": "deploy", "identity_file": str(key)},
+        )
+        assert outside_ssh.status_code == 400
+
 
 # ─── Login Rate Limit Endpoint Tests ───
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -1930,14 +1932,16 @@ def _apply_security_headers(request: Request, response: Response) -> Response:
         response.headers["Strict-Transport-Security"] = (
             "max-age=31536000; includeSubDomains"
         )
-    # CSP: allow inline scripts/styles (needed for the embedded single-page HTML) and blob: for xterm.js
+    # CSP: Monaco is deliberately pinned to a known CDN release.  Its workers are
+    # created as blobs, while every API and WebSocket call stays same-origin.
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' blob:; "
-        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline' blob: https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
-        "font-src 'self' data:; "
+        "font-src 'self' data: https://cdn.jsdelivr.net; "
+        "worker-src 'self' blob:; "
         "frame-ancestors 'self'"
     )
     return response
@@ -1982,6 +1986,7 @@ _ADMIN_ONLY_PREFIXES = (
     "/api/auth/usage",
     "/api/usage/limits",
     "/api/models/refresh",
+    "/api/ide",
 )
 
 
@@ -3850,7 +3855,6 @@ async def api_me(request: Request):
 # Multi-tenant mode: shared auth, global context, soft sandbox, Google connections.
 # Enabled explicitly or automatically once a non-admin account exists.
 # ===========================================================================
-import base64
 import urllib.parse
 import urllib.request
 
@@ -10468,6 +10472,958 @@ async def api_save_session_project_file(session_name: str, body: ProjectFileBody
     except Exception:
         logger.exception("Failed to write project file %s", target)
         return JSONResponse({"error": "Failed to save"}, status_code=500)
+
+
+# --- Remote SSH IDE ---------------------------------------------------------
+#
+# This workspace is deliberately admin-only.  The dashboard process runs as one
+# OS account and therefore sees that account's SSH agent and ~/.ssh directory;
+# exposing those identities to a dashboard member would pierce tenant isolation.
+# Profiles contain only connection metadata.  Passwords and private-key contents
+# are never stored or accepted here. Pasted private keys are deliberately out of
+# scope: use a pre-existing ~/.ssh key or SSH agent instead.
+SSH_CONNECTIONS_FILE = MESSAGES_DIR / "ssh-connections.json"
+SSH_IDE_AUDIT_FILE = MESSAGES_DIR / "ssh-ide-audit.jsonl"
+_ssh_ide_audit_lock = threading.Lock()
+# Keep UNIX-domain socket paths short enough for OpenSSH on macOS and Linux.
+# The socket identifies a dashboard session + SSH profile but contains neither
+# name, host, nor credential material.
+SSH_CONTROL_DIR = Path("/tmp") / f"nssh-{os.getuid()}"
+SSH_MAX_FILE_BYTES = 1_000_000
+_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+_SSH_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+
+
+def _append_ssh_ide_audit(user: dict, session_name: str, profile: dict, action: str) -> dict:
+    """Append a credential-free record before a Remote IDE terminal action."""
+    entry = {
+        "id": secrets.token_hex(12),
+        "ts": time.time(),
+        "action": action,
+        "user_id": str(user.get("id") or ""),
+        "username": str(user.get("username") or ""),
+        "session_name": session_name,
+        "connection_id": str(profile.get("id") or ""),
+        "connection_label": str(profile.get("label") or ""),
+        "terminal_mode": "focus_existing_tmux_window" if action == "terminal_focus_requested" else "open_tmux_window",
+    }
+    encoded = (json.dumps(entry, separators=(",", ":")) + "\n").encode("utf-8")
+    with _ssh_ide_audit_lock:
+        SSH_IDE_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(SSH_IDE_AUDIT_FILE, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return entry
+
+
+async def _record_ssh_ide_audit(request: Request, session_name: str, profile: dict, action: str) -> None:
+    """Best-effort audit logging must not turn a completed remote operation into an error."""
+    try:
+        await asyncio.to_thread(_append_ssh_ide_audit, _current_user(request), session_name, profile, action)
+    except OSError:
+        logger.exception("Could not append SSH IDE audit event %s", action)
+
+
+def _require_ssh_ide_admin(request: Request) -> dict | None:
+    user = _current_user(request)
+    return user if _is_admin(user) else None
+
+
+def _ssh_connections_store() -> LockedJsonStore:
+    return LockedJsonStore(SSH_CONNECTIONS_FILE, lambda: {"version": 1, "connections": []})
+
+
+def _ssh_control_socket(session_name: str, connection_id: str) -> Path:
+    """Return a short, non-guessable control path for one tmux SSH workspace."""
+    if not _is_valid_session_name(session_name) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", connection_id):
+        raise ValueError("Invalid SSH workspace identity")
+    digest = hashlib.sha256(f"{session_name}\0{connection_id}".encode()).hexdigest()[:32]
+    return SSH_CONTROL_DIR / f"ide-{digest}.sock"
+
+
+def _valid_ssh_host(host: str) -> bool:
+    candidate = (host or "").strip()
+    if not candidate or len(candidate) > 253:
+        return False
+    try:
+        ipaddress.ip_address(candidate)
+        return True
+    except ValueError:
+        return bool(_SSH_HOST_RE.fullmatch(candidate)) and ".." not in candidate
+
+
+def _normalized_ssh_identity_file(value: str) -> str | None:
+    """Allow an explicit key only from this dashboard host's ~/.ssh directory."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    try:
+        candidate = Path(raw).expanduser().resolve(strict=True)
+        ssh_root = (Path.home() / ".ssh").resolve(strict=False)
+        candidate.relative_to(ssh_root)
+    except (OSError, ValueError):
+        return None
+    if not candidate.is_file():
+        return None
+    return str(candidate)
+
+
+def _ssh_public_profile(profile: dict) -> dict:
+    """Return connection metadata suitable for the browser; no credentials exist."""
+    return {
+        "id": str(profile.get("id") or ""),
+        "label": str(profile.get("label") or ""),
+        "host": str(profile.get("host") or ""),
+        "username": str(profile.get("username") or ""),
+        "port": int(profile.get("port") or 22),
+        "identity_file": str(profile.get("identity_file") or ""),
+        "auth_mode": str(profile.get("auth_mode") or "agent"),
+        "workspace_root": str(profile.get("workspace_root") or "."),
+        "max_file_bytes": int(profile.get("max_file_bytes") or SSH_MAX_FILE_BYTES),
+    }
+
+
+def _ssh_profiles(session_name: str) -> list[dict]:
+    data = _ssh_connections_store().read()
+    profiles = data.get("connections") if isinstance(data, dict) else []
+    return [
+        dict(profile)
+        for profile in profiles
+        if isinstance(profile, dict) and profile.get("session_name") == session_name
+    ]
+
+
+def _ssh_profile(session_name: str, connection_id: str) -> dict | None:
+    return next(
+        (profile for profile in _ssh_profiles(session_name) if profile.get("id") == connection_id),
+        None,
+    )
+
+
+def _normalized_remote_path(value: str) -> str | None:
+    path = (value or ".").strip()
+    if not path or len(path) > 4096 or "\x00" in path:
+        return None
+    return path
+
+
+def _normalized_workspace_path(profile: dict, value: str) -> str | None:
+    """Return a relative workspace path, never a lexical escape from its root."""
+    path = _normalized_remote_path(value)
+    if path is None or path.startswith("/"):
+        return None
+    normalized = os.path.normpath(path)
+    if normalized == ".." or normalized.startswith(".." + os.sep):
+        return None
+    return "." if normalized == "." else normalized
+
+
+def _valid_git_pathspec(value: str) -> bool:
+    path = (value or "").strip()
+    return bool(
+        path
+        and len(path) <= 4096
+        and "\x00" not in path
+        and not path.startswith("/")
+        and all(part not in {"", ".", ".."} for part in path.split("/"))
+    )
+
+
+def _valid_git_branch(value: str) -> bool:
+    branch = (value or "").strip()
+    return bool(
+        branch
+        and len(branch) <= 100
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch)
+        and ".." not in branch
+        and not branch.endswith((".", "/", ".lock"))
+        and "@{" not in branch
+    )
+
+
+def _ssh_argv(profile: dict, *, password_auth: bool = False) -> list[str]:
+    """Build a non-interactive, no-forwarding SSH invocation from validated data."""
+    if not shutil.which("ssh"):
+        raise RuntimeError("OpenSSH client is not installed on the dashboard host")
+    port = int(profile.get("port") or 22)
+    host = str(profile.get("host") or "")
+    username = str(profile.get("username") or "")
+    if not _valid_ssh_host(host) or not _SSH_USER_RE.fullmatch(username) or not 1 <= port <= 65535:
+        raise RuntimeError("SSH connection profile is invalid")
+    argv = [
+        "ssh",
+        "-o", "BatchMode=no" if password_auth else "BatchMode=yes",
+        "-o", "ConnectTimeout=12",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "ClearAllForwardings=yes",
+        "-o", "RequestTTY=no",
+        "-p", str(port),
+    ]
+    if password_auth:
+        argv.extend(("-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=keyboard-interactive,password"))
+    identity_file = _normalized_ssh_identity_file(str(profile.get("identity_file") or ""))
+    if identity_file is None:
+        raise RuntimeError("Configured SSH key is unavailable or outside ~/.ssh")
+    if identity_file:
+        argv.extend(("-i", identity_file, "-o", "IdentitiesOnly=yes"))
+    argv.append(f"{username}@{host}")
+    return argv
+
+
+def _ssh_control_is_alive(profile: dict, session_name: str) -> bool:
+    """Ask OpenSSH whether this session/profile control master is still live."""
+    socket_path = _ssh_control_socket(session_name, str(profile.get("id") or ""))
+    if not socket_path.exists():
+        return False
+    target = _ssh_argv(profile).pop()
+    result = subprocess.run(
+        ["ssh", "-S", str(socket_path), "-O", "check", target],
+        capture_output=True,
+        timeout=8,
+    )
+    return result.returncode == 0
+
+
+def _ssh_start_control_master(profile: dict, session_name: str, *, password: str = "") -> Path:
+    """Start the live SSH transport used by one Remote IDE tmux session."""
+    socket_path = _ssh_control_socket(session_name, str(profile.get("id") or ""))
+    SSH_CONTROL_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        SSH_CONTROL_DIR.chmod(0o700)
+    except OSError:
+        pass
+    if _ssh_control_is_alive(profile, session_name):
+        return socket_path
+    try:
+        socket_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Could not reset SSH control socket: {exc}") from exc
+    password_auth = str(profile.get("auth_mode") or "agent") == "password"
+    if password_auth and (not password or "\x00" in password or len(password) > 4096):
+        raise RuntimeError("Enter a valid SSH password to connect")
+    argv = _ssh_argv(profile, password_auth=password_auth)
+    target = argv.pop()
+    askpass_path = None
+    environment = None
+    if password_auth:
+        fd, askpass_name = tempfile.mkstemp(prefix="nemo-ssh-askpass-", text=True)
+        askpass_path = Path(askpass_name)
+        with os.fdopen(fd, "w") as handle:
+            handle.write('#!/bin/sh\nprintf "%s\\n" "$TMUX_DASH_SSH_PASSWORD"\n')
+        askpass_path.chmod(0o700)
+        environment = os.environ.copy()
+        environment.update({
+            "SSH_ASKPASS": str(askpass_path),
+            "SSH_ASKPASS_REQUIRE": "force",
+            "DISPLAY": "nemo-ssh",
+            "TMUX_DASH_SSH_PASSWORD": password,
+        })
+    try:
+        result = subprocess.run(
+            [
+                *argv,
+                "-S", str(socket_path),
+                "-o", "ControlMaster=yes",
+                "-o", "ControlPersist=30m",
+                "-N",
+                "-f",
+                target,
+            ],
+            capture_output=True,
+            timeout=25,
+            env=environment,
+        )
+    finally:
+        if askpass_path:
+            askpass_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
+        raise RuntimeError((detail or "Could not establish SSH connection")[:800])
+    if not _ssh_control_is_alive(profile, session_name):
+        raise RuntimeError("SSH connection did not stay active")
+    return socket_path
+
+
+def _ssh_tmux_window_name(profile: dict) -> str:
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile.get("label") or "remote")).strip("-.")
+    return f"ssh:{(label or 'remote')[:36]}"
+
+
+def _ssh_open_tmux_window(profile: dict, session_name: str) -> str:
+    """Open an interactive view of the already-authenticated SSH control master."""
+    if not shutil.which("tmux"):
+        raise RuntimeError("tmux is not installed on the dashboard host")
+    socket_path = _ssh_control_socket(session_name, str(profile.get("id") or ""))
+    if not _ssh_control_is_alive(profile, session_name):
+        raise RuntimeError("SSH connection is not live; reconnect from the Remote IDE")
+    argv = _ssh_argv(profile)
+    target = argv.pop()
+    terminal_argv = [
+        *argv,
+        "-tt",
+        "-S", str(socket_path),
+        "-o", "ControlMaster=no",
+        target,
+    ]
+    command = "exec " + " ".join(shlex.quote(arg) for arg in terminal_argv)
+    window_name = _ssh_tmux_window_name(profile)
+    result = subprocess.run(
+        ["tmux", "new-window", "-d", "-t", session_name, "-n", window_name, command],
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
+        raise RuntimeError((detail or "Could not open SSH tmux window")[:800])
+    return window_name
+
+
+def _ssh_focus_tmux_window(profile: dict, session_name: str) -> str:
+    """Select the Remote IDE's interactive SSH window in its owning session."""
+    if not shutil.which("tmux"):
+        raise RuntimeError("tmux is not installed on the dashboard host")
+    window_name = _ssh_tmux_window_name(profile)
+    result = subprocess.run(
+        ["tmux", "select-window", "-t", f"{session_name}:{window_name}"],
+        capture_output=True,
+        timeout=8,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
+        raise RuntimeError((detail or "SSH terminal window is not available; reconnect first")[:800])
+    return window_name
+
+
+def _ssh_remote_command(script: str, path: str) -> str:
+    """Quote the only remote shell command; user-controlled paths never become syntax."""
+    return "python3 -c " + shlex.quote(script) + " -- " + shlex.quote(path)
+
+
+def _ssh_workspace_command(profile: dict, script: str, path: str) -> str:
+    """Run a fixed script inside the configured remote root, without shell interpolation."""
+    root = str(profile.get("workspace_root") or ".")
+    if not root or len(root) > 4096 or "\x00" in root:
+        raise RuntimeError("Configured remote workspace root is invalid")
+    return "cd -- " + shlex.quote(root) + " && " + _ssh_remote_command(script, path)
+
+
+def _ssh_run(
+    profile: dict,
+    session_name: str,
+    remote_command: str,
+    *,
+    input_data: bytes | None = None,
+    timeout: int = 30,
+) -> str:
+    if not _ssh_control_is_alive(profile, session_name):
+        raise RuntimeError("SSH connection is not live; reconnect from the Remote IDE")
+    argv = _ssh_argv(profile)
+    target = argv.pop()
+    result = subprocess.run(
+        [
+            *argv,
+            "-S", str(_ssh_control_socket(session_name, str(profile.get("id") or ""))),
+            target,
+            remote_command,
+        ],
+        input=input_data,
+        capture_output=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
+        raise RuntimeError((detail or "SSH command failed")[:800])
+    return result.stdout.decode("utf-8", "replace")
+
+
+_SSH_LIST_SCRIPT = """
+import json, os, stat, sys
+root = os.path.realpath('.')
+path = os.path.realpath(sys.argv[-1])
+if os.path.commonpath((root, path)) != root:
+    raise RuntimeError('Path is outside the configured workspace root')
+entries = []
+with os.scandir(path) as children:
+    for entry in children:
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        entries.append({
+            'name': entry.name,
+            'is_dir': stat.S_ISDIR(info.st_mode),
+            'is_file': stat.S_ISREG(info.st_mode),
+            'is_symlink': stat.S_ISLNK(info.st_mode),
+            'size': info.st_size,
+            'modified': info.st_mtime,
+        })
+entries.sort(key=lambda item: (not item['is_dir'], item['name'].lower()))
+print(json.dumps({'path': sys.argv[-1], 'entries': entries}))
+"""
+
+_SSH_READ_SCRIPT = f"""
+import base64, json, os, sys
+root = os.path.realpath('.')
+path = os.path.realpath(sys.argv[-1])
+if os.path.commonpath((root, path)) != root:
+    raise RuntimeError('Path is outside the configured workspace root')
+if not os.path.isfile(path):
+    raise RuntimeError('Not a regular file')
+with open(path, 'rb') as handle:
+    raw = handle.read({SSH_MAX_FILE_BYTES + 1})
+if len(raw) > {SSH_MAX_FILE_BYTES}:
+    raise RuntimeError('File exceeds the {SSH_MAX_FILE_BYTES // 1_000_000} MB IDE limit')
+try:
+    content = raw.decode('utf-8')
+except UnicodeDecodeError:
+    raise RuntimeError('Only UTF-8 text files can be opened in the IDE')
+print(json.dumps({{'path': sys.argv[-1], 'content': content, 'size': len(raw), 'modified': os.path.getmtime(path)}}))
+"""
+
+_SSH_WRITE_SCRIPT = """
+import base64, json, os, tempfile, sys
+root = os.path.realpath('.')
+path = os.path.realpath(sys.argv[-1])
+if os.path.commonpath((root, path)) != root:
+    raise RuntimeError('Path is outside the configured workspace root')
+raw = base64.b64decode(sys.stdin.buffer.read(), validate=True)
+directory = os.path.dirname(os.path.abspath(path)) or '.'
+if not os.path.isdir(directory):
+    raise RuntimeError('Parent directory does not exist')
+mode = None
+try:
+    mode = os.stat(path).st_mode & 0o777
+except FileNotFoundError:
+    pass
+fd, temporary = tempfile.mkstemp(prefix='.nemo-ide-', dir=directory)
+try:
+    with os.fdopen(fd, 'wb') as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if mode is not None:
+        os.chmod(temporary, mode)
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+print(json.dumps({'ok': True, 'path': sys.argv[-1], 'size': len(raw)}))
+"""
+
+_SSH_FILESYSTEM_SCRIPT = """
+import json, os, sys
+request = json.loads(sys.argv[-1])
+action = request['action']
+root = os.path.realpath('.')
+path = os.path.realpath(request['path'])
+new_path = os.path.realpath(request.get('new_path', '')) if request.get('new_path') else ''
+if os.path.commonpath((root, path)) != root or (new_path and os.path.commonpath((root, new_path)) != root):
+    raise RuntimeError('Path is outside the configured workspace root')
+if action == 'create_file':
+    directory = os.path.dirname(os.path.abspath(path)) or '.'
+    if not os.path.isdir(directory):
+        raise RuntimeError('Parent directory does not exist')
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    os.close(fd)
+elif action == 'create_dir':
+    os.mkdir(path)
+elif action == 'rename':
+    if os.path.lexists(new_path):
+        raise RuntimeError('Destination already exists')
+    directory = os.path.dirname(os.path.abspath(new_path)) or '.'
+    if not os.path.isdir(directory):
+        raise RuntimeError('Destination directory does not exist')
+    os.rename(path, new_path)
+elif action == 'delete':
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        os.rmdir(path)
+    else:
+        raise RuntimeError('File or folder does not exist')
+else:
+    raise RuntimeError('Unsupported filesystem action')
+print(json.dumps({'ok': True, 'action': action, 'path': request['path'], 'new_path': request.get('new_path', '')}))
+"""
+
+_SSH_SEARCH_SCRIPT = """
+import json, os, sys
+request = json.loads(sys.argv[-1])
+workspace_root = os.path.realpath('.')
+root = os.path.realpath(request['path'])
+if os.path.commonpath((workspace_root, root)) != workspace_root:
+    raise RuntimeError('Path is outside the configured workspace root')
+query = request['query'].casefold()
+matches = []
+for directory, subdirs, files in os.walk(root, followlinks=False):
+    depth = os.path.relpath(directory, root).count(os.sep)
+    if depth >= 12:
+        subdirs[:] = []
+    for name in sorted(files):
+        if query in name.casefold():
+            matches.append({'path': os.path.relpath(os.path.join(directory, name), root), 'name': name})
+            if len(matches) >= 120:
+                break
+    if len(matches) >= 120:
+        break
+print(json.dumps({'path': root, 'matches': matches, 'truncated': len(matches) >= 120}))
+"""
+
+_SSH_GIT_SCRIPT = """
+import json, os, subprocess, sys
+request = json.loads(sys.argv[-1])
+workspace_root = os.path.realpath('.')
+root = os.path.realpath(request['path'])
+if os.path.commonpath((workspace_root, root)) != workspace_root:
+    raise RuntimeError('Path is outside the configured workspace root')
+action = request['action']
+def git(*args):
+    result = subprocess.run(['git', '-C', root, *args], text=True, capture_output=True, timeout=25)
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout or 'Git command failed').strip()[:1200])
+    return result.stdout[:250000]
+git('rev-parse', '--show-toplevel')
+if action == 'status':
+    output = git('status', '--short', '--branch')
+elif action == 'diff':
+    output = git('diff', '--no-ext-diff', '--')
+elif action == 'stage':
+    output = git('add', '--', *request['files'])
+elif action == 'unstage':
+    output = git('restore', '--staged', '--', *request['files'])
+elif action == 'commit':
+    output = git('commit', '-m', request['message'])
+elif action == 'switch':
+    output = git('switch', request['branch'])
+elif action == 'create_branch':
+    output = git('switch', '-c', request['branch'])
+else:
+    raise RuntimeError('Unsupported Git action')
+print(json.dumps({'ok': True, 'action': action, 'root': root, 'output': output, 'status': git('status', '--short', '--branch'), 'current_branch': git('branch', '--show-current').strip(), 'branches': git('branch', '--format=%(refname:short)').splitlines()}))
+"""
+
+_SSH_LSP_STATUS_SCRIPT = """
+import json, shutil
+servers = [
+    ('python', 'pylsp'),
+    ('python', 'basedpyright-langserver'),
+    ('typescript', 'typescript-language-server'),
+    ('go', 'gopls'),
+    ('rust', 'rust-analyzer'),
+]
+available = [{'language': language, 'command': command} for language, command in servers if shutil.which(command)]
+print(json.dumps({'available': available, 'bridge': 'not-configured'}))
+"""
+
+
+class SSHConnectionBody(BaseModel):
+    label: str = ""
+    host: str
+    username: str
+    port: int = 22
+    identity_file: str = ""
+    auth_mode: str = "agent"
+    password: str = ""
+    workspace_root: str = "."
+    max_file_bytes: int = SSH_MAX_FILE_BYTES
+
+
+class SSHConnectBody(BaseModel):
+    password: str = ""
+
+
+class SSHRemoteFileBody(BaseModel):
+    path: str
+    content: str
+
+
+class SSHRemoteFilesystemBody(BaseModel):
+    action: str
+    path: str
+    new_path: str = ""
+
+
+class SSHGitBody(BaseModel):
+    action: str
+    path: str = "."
+    files: list[str] = []
+    message: str = ""
+    branch: str = ""
+
+
+def _ssh_ide_denied(request: Request) -> JSONResponse | None:
+    if _require_ssh_ide_admin(request):
+        return None
+    return JSONResponse({"error": "SSH IDE is restricted to dashboard administrators"}, status_code=403)
+
+
+def _ssh_ide_session_or_response(
+    request: Request, session_name: str
+) -> tuple[dict | None, JSONResponse | None]:
+    """Resolve an owned tmux session before exposing its SSH workspace."""
+    denied = _ssh_ide_denied(request)
+    if denied:
+        return None, denied
+    _sessions, session = _find_session_for_user(session_name, _current_user(request))
+    if not session:
+        return None, JSONResponse({"error": "Session not found"}, status_code=404)
+    return session, None
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections")
+async def api_list_ssh_connections(request: Request, session_name: str):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    return JSONResponse({"connections": [_ssh_public_profile(item) for item in _ssh_profiles(session_name)]})
+
+
+@app.post("/api/sessions/{session_name}/ide/ssh-connections")
+async def api_create_ssh_connection(request: Request, session_name: str, body: SSHConnectionBody):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    host = body.host.strip()
+    username = body.username.strip()
+    label = (body.label.strip() or f"{username}@{host}")[:80]
+    auth_mode = body.auth_mode.strip().lower()
+    identity_file = _normalized_ssh_identity_file(body.identity_file)
+    if not _valid_ssh_host(host):
+        return JSONResponse({"error": "Enter a valid hostname or IP address"}, status_code=400)
+    if not _SSH_USER_RE.fullmatch(username):
+        return JSONResponse({"error": "Enter a valid SSH username"}, status_code=400)
+    if not 1 <= body.port <= 65535:
+        return JSONResponse({"error": "SSH port must be between 1 and 65535"}, status_code=400)
+    if identity_file is None:
+        return JSONResponse({"error": "Identity file must be a readable file under ~/.ssh"}, status_code=400)
+    if auth_mode not in {"agent", "key", "password"}:
+        return JSONResponse({"error": "Choose SSH agent, key, or password authentication"}, status_code=400)
+    if auth_mode == "key" and not identity_file:
+        return JSONResponse({"error": "Choose an existing identity file under ~/.ssh"}, status_code=400)
+    if auth_mode == "password" and (not body.password or "\x00" in body.password or len(body.password) > 4096):
+        return JSONResponse({"error": "Enter a valid SSH password"}, status_code=400)
+    workspace_root = body.workspace_root.strip() or "."
+    if len(workspace_root) > 4096 or "\x00" in workspace_root:
+        return JSONResponse({"error": "Enter a valid remote workspace root"}, status_code=400)
+    if not 1_024 <= body.max_file_bytes <= SSH_MAX_FILE_BYTES:
+        return JSONResponse({"error": "File limit must be between 1 KB and 1 MB"}, status_code=400)
+    profile = {
+        "id": secrets.token_urlsafe(12),
+        "session_name": session_name,
+        "label": label,
+        "host": host,
+        "username": username,
+        "port": body.port,
+        "identity_file": identity_file,
+        "auth_mode": auth_mode,
+        "workspace_root": workspace_root,
+        "max_file_bytes": body.max_file_bytes,
+    }
+
+    def add(data: dict):
+        data.setdefault("connections", []).append(profile)
+
+    _ssh_connections_store().update(add)
+    return JSONResponse({"ok": True, "connection": _ssh_public_profile(profile)}, status_code=201)
+
+
+@app.delete("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}")
+async def api_delete_ssh_connection(request: Request, session_name: str, connection_id: str):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+
+    def remove(data: dict) -> bool:
+        profiles = data.setdefault("connections", [])
+        before = len(profiles)
+        data["connections"] = [
+            item
+            for item in profiles
+            if not (item.get("id") == connection_id and item.get("session_name") == session_name)
+        ]
+        return len(data["connections"]) != before
+
+    _data, removed = _ssh_connections_store().update(remove)
+    if not removed:
+        return JSONResponse({"error": "SSH connection not found"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/connect")
+async def api_connect_ssh_connection(
+    request: Request,
+    session_name: str,
+    connection_id: str,
+    body: SSHConnectBody | None = None,
+):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    try:
+        await asyncio.to_thread(_ssh_start_control_master, profile, session_name, password=(body.password if body else ""))
+        await _record_ssh_ide_audit(request, session_name, profile, "connect_requested")
+        window_name = await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name)
+        return JSONResponse({"ok": True, "connected": True, "window_name": window_name})
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/status")
+async def api_ssh_connection_status(request: Request, session_name: str, connection_id: str):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    try:
+        connected = await asyncio.to_thread(_ssh_control_is_alive, profile, session_name)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse({"connected": connected, "window_name": _ssh_tmux_window_name(profile) if connected else ""})
+
+
+@app.post("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/focus-terminal")
+async def api_focus_ssh_terminal(request: Request, session_name: str, connection_id: str):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    try:
+        audit = await asyncio.to_thread(
+            _append_ssh_ide_audit, _current_user(request), session_name, profile, "terminal_focus_requested"
+        )
+        window_name = await asyncio.to_thread(_ssh_focus_tmux_window, profile, session_name)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse({"ok": True, "window_name": window_name, "audit_id": audit["id"]})
+
+
+def _ssh_profile_or_response(
+    session_name: str, connection_id: str
+) -> tuple[dict | None, JSONResponse | None]:
+    profile = _ssh_profile(session_name, connection_id)
+    if not profile:
+        return None, JSONResponse({"error": "SSH connection not found"}, status_code=404)
+    return profile, None
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/files/search")
+async def api_search_ssh_files(
+    request: Request, session_name: str, connection_id: str, path: str = ".", query: str = ""
+):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    remote_path = _normalized_workspace_path(profile, path)
+    search_query = query.strip()
+    if remote_path is None:
+        return JSONResponse({"error": "Invalid remote path"}, status_code=400)
+    if not search_query or len(search_query) > 160 or "\x00" in search_query:
+        return JSONResponse({"error": "Enter a file name query up to 160 characters"}, status_code=400)
+    payload = json.dumps({"path": remote_path, "query": search_query})
+    try:
+        raw = await asyncio.to_thread(
+            _ssh_run,
+            profile,
+            session_name,
+            _ssh_workspace_command(profile, _SSH_SEARCH_SCRIPT, payload),
+            timeout=30,
+        )
+        return JSONResponse(json.loads(raw))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/lsp/status")
+async def api_ssh_lsp_status(request: Request, session_name: str, connection_id: str):
+    """Discover supported remote language servers without starting a protocol process."""
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    try:
+        raw = await asyncio.to_thread(
+            _ssh_run, profile, session_name, _ssh_workspace_command(profile, _SSH_LSP_STATUS_SCRIPT, "."), timeout=20
+        )
+        return JSONResponse(json.loads(raw))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/files")
+async def api_list_ssh_files(request: Request, session_name: str, connection_id: str, path: str = "."):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    remote_path = _normalized_workspace_path(profile, path)
+    if remote_path is None:
+        return JSONResponse({"error": "Invalid remote path"}, status_code=400)
+    try:
+        raw = await asyncio.to_thread(
+            _ssh_run, profile, session_name, _ssh_workspace_command(profile, _SSH_LIST_SCRIPT, remote_path), timeout=25
+        )
+        await _record_ssh_ide_audit(request, session_name, profile, "remote_list")
+        return JSONResponse(json.loads(raw))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/file")
+async def api_get_ssh_file(request: Request, session_name: str, connection_id: str, path: str):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    remote_path = _normalized_workspace_path(profile, path)
+    if remote_path is None:
+        return JSONResponse({"error": "Invalid remote path"}, status_code=400)
+    try:
+        raw = await asyncio.to_thread(
+            _ssh_run, profile, session_name, _ssh_workspace_command(profile, _SSH_READ_SCRIPT, remote_path), timeout=30
+        )
+        await _record_ssh_ide_audit(request, session_name, profile, "remote_read")
+        return JSONResponse(json.loads(raw))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.put("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/file")
+async def api_save_ssh_file(
+    request: Request, session_name: str, connection_id: str, body: SSHRemoteFileBody
+):
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    remote_path = _normalized_workspace_path(profile, body.path)
+    if remote_path is None:
+        return JSONResponse({"error": "Invalid remote path"}, status_code=400)
+    content = body.content.encode("utf-8")
+    max_file_bytes = int(profile.get("max_file_bytes") or SSH_MAX_FILE_BYTES)
+    if len(content) > max_file_bytes:
+        return JSONResponse({"error": f"File exceeds the {max_file_bytes // 1_000} KB connection limit"}, status_code=413)
+    try:
+        raw = await asyncio.to_thread(
+            _ssh_run,
+            profile,
+            session_name,
+            _ssh_workspace_command(profile, _SSH_WRITE_SCRIPT, remote_path),
+            input_data=base64.b64encode(content),
+            timeout=35,
+        )
+        await _record_ssh_ide_audit(request, session_name, profile, "remote_write")
+        return JSONResponse(json.loads(raw))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.post("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/fs")
+async def api_manage_ssh_filesystem(
+    request: Request, session_name: str, connection_id: str, body: SSHRemoteFilesystemBody
+):
+    """Perform a deliberately small, non-recursive remote filesystem operation."""
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    if body.action not in {"create_file", "create_dir", "rename", "delete"}:
+        return JSONResponse({"error": "Unsupported filesystem action"}, status_code=400)
+    remote_path = _normalized_workspace_path(profile, body.path)
+    if remote_path is None:
+        return JSONResponse({"error": "Invalid remote path"}, status_code=400)
+    new_path = ""
+    if body.action == "rename":
+        new_path = _normalized_workspace_path(profile, body.new_path)
+        if new_path is None:
+            return JSONResponse({"error": "Invalid destination path"}, status_code=400)
+    elif body.new_path:
+        return JSONResponse({"error": "A destination path is only valid for rename"}, status_code=400)
+    payload = json.dumps({"action": body.action, "path": remote_path, "new_path": new_path})
+    try:
+        raw = await asyncio.to_thread(
+            _ssh_run,
+            profile,
+            session_name,
+            _ssh_workspace_command(profile, _SSH_FILESYSTEM_SCRIPT, payload),
+            timeout=30,
+        )
+        await _record_ssh_ide_audit(request, session_name, profile, "remote_filesystem_change")
+        return JSONResponse(json.loads(raw))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.post("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/git")
+async def api_manage_ssh_git(
+    request: Request, session_name: str, connection_id: str, body: SSHGitBody
+):
+    """Run a fixed, validated set of Git operations over the live SSH bridge."""
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    if error:
+        return error
+    if body.action not in {"status", "diff", "stage", "unstage", "commit", "switch", "create_branch"}:
+        return JSONResponse({"error": "Unsupported Git action"}, status_code=400)
+    remote_path = _normalized_workspace_path(profile, body.path)
+    if remote_path is None:
+        return JSONResponse({"error": "Invalid repository path"}, status_code=400)
+    files = [item.strip() for item in body.files]
+    if len(files) > 100 or any(not _valid_git_pathspec(item) for item in files):
+        return JSONResponse({"error": "Invalid Git file selection"}, status_code=400)
+    if body.action in {"stage", "unstage"} and not files:
+        return JSONResponse({"error": "Select at least one file or folder"}, status_code=400)
+    message = body.message.strip()
+    if body.action == "commit" and (not message or len(message) > 1000 or "\x00" in message):
+        return JSONResponse({"error": "Enter a commit message up to 1,000 characters"}, status_code=400)
+    branch = body.branch.strip()
+    if body.action in {"switch", "create_branch"} and not _valid_git_branch(branch):
+        return JSONResponse({"error": "Invalid branch name"}, status_code=400)
+    payload = json.dumps({
+        "action": body.action,
+        "path": remote_path,
+        "files": files,
+        "message": message,
+        "branch": branch,
+    })
+    try:
+        raw = await asyncio.to_thread(
+            _ssh_run,
+            profile,
+            session_name,
+            _ssh_workspace_command(profile, _SSH_GIT_SCRIPT, payload),
+            timeout=40,
+        )
+        return JSONResponse(json.loads(raw))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
 
 
 def _send_session_owner_environment(session_name: str):
@@ -18527,6 +19483,19 @@ body.member-simple .nav-codex-alert{display:none !important}
 .btn-full{background:#1c2333;border-color:#388bfd44;color:#58a6ff}
 .btn-full:hover{background:#253049}
 
+/* Remote SSH IDE — a VS Code-style workspace that stays out of the normal
+   dashboard until explicitly opened from a session's More menu. */
+.ide-overlay{display:none;position:fixed;inset:0;z-index:260;background:#0d1117;color:#c9d1d9}
+.ide-overlay.active{display:flex;flex-direction:column}.ide-shell{display:flex;flex-direction:column;min-height:0;flex:1}
+.ide-head{height:45px;display:flex;align-items:center;gap:8px;padding:0 12px;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0}.ide-title{font-weight:650;color:#f0f6fc;margin-right:8px}.ide-head select,.ide-head input,.ide-dialog input,.ide-dialog select{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:6px 8px;font:inherit;font-size:.8rem}.ide-session{max-width:190px}.ide-connection-state{font-size:.72rem;color:#8b949e;white-space:nowrap}.ide-connection-state.connected{color:#3fb950}.ide-connection-state.connecting{color:#d29922}.ide-connection-state.reconnect,.ide-connection-state.error{color:#f85149}.ide-spacer{flex:1}.ide-btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:6px 9px;font:inherit;font-size:.78rem;cursor:pointer}.ide-btn:hover{background:#30363d}.ide-btn.primary{background:#1f6feb;border-color:#388bfd;color:#fff}.ide-btn.danger{color:#f85149}
+.ide-main{display:grid;grid-template-columns:minmax(190px,260px) minmax(320px,1fr) minmax(250px,340px);min-height:0;flex:1}.ide-explorer,.ide-chat{display:flex;flex-direction:column;min-width:0;background:#161b22}.ide-explorer{border-right:1px solid #30363d}.ide-chat{border-left:1px solid #30363d}.ide-section-head{display:flex;align-items:center;gap:6px;padding:9px 10px;border-bottom:1px solid #30363d;font-size:.72rem;font-weight:650;text-transform:uppercase;letter-spacing:.06em;color:#8b949e}.ide-section-head select{min-width:0;flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:4px;font-size:.76rem}
+.ide-path{display:flex;align-items:center;gap:5px;padding:7px 8px;border-bottom:1px solid #21262d;color:#8b949e;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.ide-path span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}.ide-file-filter{width:calc(100% - 16px);margin:7px 8px 3px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:5px 7px;font-size:.76rem}.ide-files{overflow:auto;flex:1;padding:4px 0}.ide-file{width:100%;display:flex;align-items:center;gap:7px;border:0;background:transparent;color:#c9d1d9;text-align:left;padding:5px 9px;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer}.ide-file:hover,.ide-file.selected{background:#1f6feb66}.ide-file .ide-file-icon{width:16px;text-align:center}.ide-file-dir{color:#79c0ff}.ide-files-empty{padding:16px 10px;color:#8b949e;font-size:.8rem;line-height:1.45}
+.ide-code{display:flex;flex-direction:column;min-width:0;background:#0d1117}.ide-tabs{height:36px;display:flex;overflow-x:auto;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0}.ide-tab{display:flex;align-items:center;gap:6px;min-width:120px;max-width:220px;padding:0 8px;border-right:1px solid #30363d;color:#8b949e;font-size:.78rem;cursor:pointer}.ide-tab.active{background:#0d1117;color:#e6edf3;border-top:1px solid #58a6ff}.ide-tab-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}.ide-tab-close{border:0;background:transparent;color:#8b949e;cursor:pointer;font-size:1rem;line-height:1}.ide-tab-close:hover{color:#f85149}.ide-editor{min-height:0;flex:1}.ide-status{display:flex;align-items:center;justify-content:space-between;min-height:25px;padding:3px 9px;background:#1f6feb;color:#fff;font-size:.72rem;gap:10px}.ide-status span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ide-chat-title{font-size:.72rem;font-weight:650;text-transform:uppercase;letter-spacing:.06em;color:#8b949e}.ide-chat-messages{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px}.ide-chat-msg{padding:8px 9px;border-radius:7px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.82rem;line-height:1.42}.ide-chat-msg.user{background:#1f6feb;color:#fff;align-self:flex-end}.ide-chat-msg.assistant{background:#21262d;color:#c9d1d9;align-self:flex-start}.ide-chat-empty{padding:12px;color:#8b949e;font-size:.82rem;line-height:1.45}.ide-chat-compose{display:flex;gap:7px;padding:9px;border-top:1px solid #30363d}.ide-chat-compose textarea{min-height:56px;max-height:180px;resize:vertical;flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:7px;font:inherit;font-size:.82rem}.ide-chat-compose textarea:focus{outline:none;border-color:#58a6ff}
+.ide-dialog{display:none;position:absolute;z-index:2;top:54px;left:12px;width:min(420px,calc(100vw - 24px));padding:14px;background:#161b22;border:1px solid #484f58;border-radius:8px;box-shadow:0 18px 44px #0009}.ide-dialog.active{display:block}.ide-dialog h3{font-size:.95rem;color:#f0f6fc;margin:0 0 10px}.ide-dialog label{display:block;margin:8px 0 4px;color:#8b949e;font-size:.76rem}.ide-dialog input{width:100%}.ide-dialog-grid{display:grid;grid-template-columns:1fr 90px;gap:8px}.ide-dialog-note{margin:10px 0;color:#8b949e;font-size:.74rem;line-height:1.4}.ide-dialog-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:12px}.ide-quick-open-dialog,.ide-git-dialog,.ide-command-dialog{left:50%;top:64px;transform:translateX(-50%);width:min(620px,calc(100vw - 24px))}.ide-quick-open-results,.ide-git-output,.ide-command-results{max-height:min(55vh,440px);overflow:auto;margin-top:8px;border-top:1px solid #30363d}.ide-quick-open-result,.ide-command-result{display:flex;width:100%;padding:8px 3px;border:0;border-bottom:1px solid #21262d;background:transparent;color:#c9d1d9;text-align:left;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer}.ide-quick-open-result:hover,.ide-command-result:hover{background:#21262d}.ide-quick-open-result span,.ide-command-result span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ide-quick-open-result .ide-quick-open-name{min-width:120px;color:#79c0ff}.ide-command-result .ide-command-label{flex:1;color:#79c0ff}.ide-command-result .ide-command-key{color:#8b949e}.ide-quick-open-empty{padding:14px 3px;color:#8b949e;font-size:.8rem}.ide-git-output{min-height:100px;padding:8px;white-space:pre-wrap;color:#c9d1d9;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.ide-git-actions{display:flex;flex-wrap:wrap;gap:7px}.ide-git-dialog input{margin-top:7px}
+@media (max-width:900px){.ide-main{grid-template-columns:180px minmax(280px,1fr)}.ide-chat{display:none}.ide-overlay.chat-open .ide-chat{display:flex;position:absolute;inset:45px 0 0 0;z-index:3;border-left:0}.ide-overlay.chat-open .ide-main{display:block}.ide-overlay.chat-open .ide-explorer,.ide-overlay.chat-open .ide-code{display:none}}
+@media (max-width:620px){.ide-main{grid-template-columns:1fr}.ide-explorer{display:none}.ide-head{gap:5px;padding:0 7px}.ide-title{font-size:.84rem;margin-right:0}.ide-session{max-width:115px}.ide-head .ide-btn{padding:5px 6px}.ide-head .ide-connection-label{display:none}}
+
 /* Modal */
 .modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
 .modal-overlay.active{display:flex}
@@ -19103,6 +20072,72 @@ body.member-simple .hide-in-simple{display:none!important}
     <div class="codexmd-actions">
       <button class="btn" onclick="closeProjectFile()">Close</button>
       <button class="btn btn-full" onclick="saveProjectFile()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Full-screen remote workspace: SSH explorer + Monaco editor + Codex chat. -->
+<div class="ide-overlay" id="ide-overlay" onclick="if(event.target===this)closeRemoteIde()">
+  <div class="ide-shell">
+    <div class="ide-head">
+      <span class="ide-title">Remote IDE</span>
+      <select class="ide-session" id="ide-session-select" onchange="ideSetSession(this.value)" title="Codex session for the AI panel"></select>
+      <span class="ide-connection-state" id="ide-connection-state">No SSH connection</span>
+      <span class="ide-spacer"></span>
+      <button class="ide-btn" onclick="ideToggleMobileChat()">Chat</button>
+      <button class="ide-btn" onclick="ideFocusTerminal()">Terminal</button>
+      <button class="ide-btn" onclick="ideShowGit()">Git</button>
+      <button class="ide-btn" onclick="ideShowCommandPalette()" title="Command Palette (Ctrl/Cmd+Shift+P)">Commands</button>
+      <button class="ide-btn" onclick="ideShowConnectionForm()"><span class="ide-connection-label">SSH </span>Connections</button>
+      <button class="ide-btn" onclick="closeRemoteIde()">Close</button>
+    </div>
+    <div class="ide-main">
+      <aside class="ide-explorer">
+        <div class="ide-section-head">Explorer <select id="ide-connection-select" onchange="ideSelectConnection(this.value)" title="SSH connection"></select><button class="ide-btn" onclick="ideConnectActive()" title="Connect and open SSH terminal">Connect</button><button class="ide-btn" onclick="ideCreateRemote()" title="Create remote file or folder">+</button><button class="ide-btn" onclick="ideRenameSelected()" title="Rename or move selected remote item">Rename</button><button class="ide-btn" onclick="ideDeleteSelected()" title="Delete selected remote item">Delete</button><button class="ide-btn" onclick="ideRefreshFiles()" title="Refresh files">↻</button><button class="ide-btn" onclick="ideDeleteConnection()" title="Remove selected SSH connection">×</button></div>
+        <div class="ide-path"><button class="ide-btn" onclick="ideGoUp()" title="Parent directory">↑</button><span id="ide-path">No SSH connection selected</span><button class="ide-btn" onclick="ideShowQuickOpen()" title="Quick Open (Ctrl/Cmd+P)">⌕</button></div>
+        <input class="ide-file-filter" id="ide-file-filter" type="search" placeholder="Filter loaded files" oninput="ideSetFileFilter(this.value)">
+        <div class="ide-files" id="ide-files"><div class="ide-files-empty">Add an SSH connection to browse a remote workspace.</div></div>
+      </aside>
+      <section class="ide-code">
+        <div class="ide-tabs" id="ide-tabs"></div>
+        <div class="ide-editor" id="ide-editor"><div class="ide-files-empty">Open a remote text file to start editing.</div></div>
+        <div class="ide-status"><span id="ide-status">Ready</span><span id="ide-lsp-status">Language services: checking…</span><span id="ide-file-status">No file open</span></div>
+      </section>
+      <aside class="ide-chat">
+        <div class="ide-section-head"><span class="ide-chat-title">Codex workspace chat</span></div>
+        <div class="ide-chat-messages" id="ide-chat-messages"></div>
+        <div class="ide-chat-compose"><textarea id="ide-chat-input" placeholder="Ask Codex about the active remote file…" onkeydown="ideChatKey(event)"></textarea><button class="ide-btn primary" onclick="ideSendChat()">Send</button></div>
+      </aside>
+    </div>
+    <div class="ide-dialog" id="ide-connection-dialog">
+      <h3>Add SSH connection</h3>
+      <label>Label</label><input id="ide-conn-label" maxlength="80" placeholder="Production API">
+      <div class="ide-dialog-grid"><div><label>Host</label><input id="ide-conn-host" required placeholder="server.example.com"></div><div><label>Port</label><input id="ide-conn-port" type="number" min="1" max="65535" value="22"></div></div>
+      <label>Username</label><input id="ide-conn-user" required placeholder="deploy">
+      <label>Authentication</label><select id="ide-conn-auth" onchange="ideAuthModeChanged()"><option value="agent">SSH agent</option><option value="key">Existing SSH key</option><option value="password">Password (session only)</option></select>
+      <div id="ide-conn-key-wrap"><label>Identity file (for key authentication)</label><input id="ide-conn-key" placeholder="~/.ssh/id_ed25519"></div>
+      <div id="ide-conn-password-wrap" style="display:none"><label>Password (not saved)</label><input id="ide-conn-password" type="password" autocomplete="new-password"></div>
+      <label>Workspace root</label><input id="ide-conn-workspace" value="." placeholder="/srv/app">
+      <label>Maximum file size (KB)</label><input id="ide-conn-max-file-kb" type="number" min="1" max="1000" value="1000">
+      <div class="ide-dialog-note">Uses an SSH agent, a key already under <code>~/.ssh</code>, or a password held only while the session connection is established. Pasted private keys are not accepted. The host must already be trusted in <code>known_hosts</code>.</div>
+      <div class="ide-dialog-actions"><button class="ide-btn" onclick="ideHideConnectionForm()">Cancel</button><button class="ide-btn primary" onclick="ideSaveConnection()">Save connection</button></div>
+    </div>
+    <div class="ide-dialog ide-quick-open-dialog" id="ide-quick-open-dialog">
+      <h3>Quick Open</h3>
+      <input id="ide-quick-open-input" type="search" autocomplete="off" placeholder="Search filenames under this workspace" oninput="ideQuickOpenSearch(this.value)" onkeydown="ideQuickOpenKey(event)">
+      <div class="ide-quick-open-results" id="ide-quick-open-results"><div class="ide-quick-open-empty">Type a filename to search this workspace.</div></div>
+    </div>
+    <div class="ide-dialog ide-git-dialog" id="ide-git-dialog">
+      <h3>Remote Git</h3><div class="ide-dialog-note" id="ide-git-root">Connect to inspect this workspace.</div>
+      <div class="ide-git-actions"><button class="ide-btn" onclick="ideGitStatus()">Refresh</button><button class="ide-btn" onclick="ideGitDiff()">Diff</button><button class="ide-btn" onclick="ideGitStageSelected(false)">Stage selected</button><button class="ide-btn" onclick="ideGitStageSelected(true)">Unstage selected</button></div>
+      <input id="ide-git-branch" maxlength="100" placeholder="Branch name"><div class="ide-git-actions"><button class="ide-btn" onclick="ideGitBranch(false)">Switch</button><button class="ide-btn" onclick="ideGitBranch(true)">Create & switch</button></div>
+      <input id="ide-git-message" maxlength="1000" placeholder="Commit message"><div class="ide-git-actions"><button class="ide-btn primary" onclick="ideGitCommit()">Commit staged changes</button><button class="ide-btn" onclick="ideHideGit()">Close</button></div>
+      <pre class="ide-git-output" id="ide-git-output">Git status will appear here.</pre>
+    </div>
+    <div class="ide-dialog ide-command-dialog" id="ide-command-dialog">
+      <h3>Command Palette</h3>
+      <input id="ide-command-input" type="search" autocomplete="off" placeholder="Type a command" oninput="ideRenderCommandPalette(this.value)" onkeydown="ideCommandPaletteKey(event)">
+      <div class="ide-command-results" id="ide-command-results"></div>
     </div>
   </div>
 </div>
@@ -20750,6 +21785,7 @@ function renderDetail(){
           ${MEMBER_SIMPLE?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
+          <div class="tab-more-item" onclick="openRemoteIde('${esc(s.name)}');closeTabMore()">Remote SSH IDE</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','AGENTS.md');closeTabMore()">Project AGENTS.md</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.codex/config.toml');closeTabMore()">Project config.toml</div>
@@ -24808,6 +25844,334 @@ async function saveProjectFile(){
     setTimeout(()=>{ ta.style.borderColor=''; }, 600);
   }catch(e){ alert('Failed to save'); }
 }
+
+// ── Remote SSH IDE ─────────────────────────────────────────────────────────
+// Profiles are created by the API only for dashboard administrators.  The IDE
+// intentionally shares the selected session's Codex chat rather than creating
+// another model/authentication path inside the browser.
+const IDE_MONACO_VS='https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs';
+const IDE_WORKSPACE_STORAGE='tmuxDashIdeWorkspace:';
+let _ide={open:false,session:'',connections:[],connectionId:'',path:'.',root:'',selectedPath:'',filter:'',tree:{},expanded:{},treeLoading:{},quickTimer:null,quickResults:[],tabs:[],active:'',editor:null,monacoPromise:null,chatTimer:null,password:'',restoredKey:''};
+
+function ideSetStatus(message,fileMessage){
+  const status=document.getElementById('ide-status');
+  const file=document.getElementById('ide-file-status');
+  if(status)status.textContent=message||'Ready';
+  if(file&&fileMessage!==undefined)file.textContent=fileMessage||'No file open';
+}
+function ideSetConnectionState(state,label){const el=document.getElementById('ide-connection-state');if(!el)return;el.className='ide-connection-state '+(state||'');el.textContent=label||'No SSH connection'}
+function ideSetLspStatus(label){const el=document.getElementById('ide-lsp-status');if(el)el.textContent=label||'Language services: unavailable'}
+function ideApi(path){
+  if(!_ide.session)throw new Error('Select a dashboard session first');
+  return BASE+'/api/sessions/'+encodeURIComponent(_ide.session)+'/ide'+path;
+}
+function ideWorkspaceKey(){return _ide.session&&_ide.connectionId?IDE_WORKSPACE_STORAGE+_ide.session+'|'+_ide.connectionId:''}
+function ideSavedWorkspace(){try{const raw=localStorage.getItem(ideWorkspaceKey());const value=raw?JSON.parse(raw):null;return value&&typeof value==='object'?value:null}catch(error){return null}}
+function ideRememberWorkspace(){
+  const key=ideWorkspaceKey();if(!key)return;const active=ideActiveTab();
+  try{localStorage.setItem(key,JSON.stringify({path:_ide.path||'.',tabs:_ide.tabs.map(tab=>tab.path).slice(0,12),active:active?active.path:''}));}catch(error){}
+}
+function ideActiveConnection(){return _ide.connections.find(c=>c.id===_ide.connectionId)||null}
+function ideActiveTab(){return _ide.tabs.find(tab=>tab.key===_ide.active)||null}
+function ideFilename(path){const pieces=(path||'').split('/');return pieces[pieces.length-1]||path||'untitled'}
+function ideJoinPath(dir,name){return (!dir||dir==='.')?('./'+name):dir.replace(/\/+$/,'')+'/'+name}
+function ideParentPath(path){
+  const clean=(path||'.').replace(/\/+$/,'')||'/';
+  if(clean==='.'||clean==='/')return clean;
+  const parent=clean.slice(0,clean.lastIndexOf('/'));
+  return parent||'/';
+}
+function ideLanguage(path){
+  const lower=(path||'').toLowerCase();
+  if(/\.py$/.test(lower))return'python';if(/\.(js|mjs|cjs)$/.test(lower))return'javascript';
+  if(/\.(ts|tsx)$/.test(lower))return'typescript';if(/\.(json)$/.test(lower))return'json';
+  if(/\.(html?|svg)$/.test(lower))return'html';if(/\.css$/.test(lower))return'css';
+  if(/\.(md|markdown)$/.test(lower))return'markdown';if(/\.(ya?ml)$/.test(lower))return'yaml';
+  if(/\.(sh|bash|zsh)$/.test(lower))return'shell';if(/\.(toml|ini|conf)$/.test(lower))return'plaintext';
+  if(/\.(go)$/.test(lower))return'go';if(/\.(rs)$/.test(lower))return'rust';if(/\.(java)$/.test(lower))return'java';
+  return'plaintext';
+}
+function ideLoadMonaco(){
+  if(window.monaco)return Promise.resolve(window.monaco);
+  if(_ide.monacoPromise)return _ide.monacoPromise;
+  _ide.monacoPromise=new Promise((resolve,reject)=>{
+    const loader=document.createElement('script');
+    loader.src=IDE_MONACO_VS+'/loader.js';
+    loader.onload=()=>{
+      try{
+        window.require.config({paths:{vs:IDE_MONACO_VS}});
+        window.MonacoEnvironment={getWorkerUrl:()=>{
+          const source="self.MonacoEnvironment={baseUrl:'"+IDE_MONACO_VS+"/'};importScripts('"+IDE_MONACO_VS+"/base/worker/workerMain.js');";
+          return URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
+        }};
+        window.require(['vs/editor/editor.main'],()=>resolve(window.monaco),reject);
+      }catch(error){reject(error)}
+    };
+    loader.onerror=()=>reject(new Error('Could not load Monaco from jsDelivr'));
+    document.head.appendChild(loader);
+  });
+  return _ide.monacoPromise;
+}
+async function ideEnsureEditor(){
+  const host=document.getElementById('ide-editor');
+  if(!host)return null;
+  try{
+    const monaco=await ideLoadMonaco();
+    if(!_ide.editor){
+      host.innerHTML='';
+      _ide.editor=monaco.editor.create(host,{theme:'vs-dark',automaticLayout:true,fontSize:13,minimap:{enabled:false},scrollBeyondLastLine:false,wordWrap:'off'});
+      _ide.editor.addAction({id:'nemo.remote-ide.command-palette',label:'Remote IDE: Command Palette',keybindings:[monaco.KeyMod.CtrlCmd|monaco.KeyMod.Shift|monaco.KeyCode.KeyP],run:()=>ideShowCommandPalette()});
+    }
+    return monaco;
+  }catch(error){
+    host.innerHTML='<div class="ide-files-empty">Monaco could not load. Check the dashboard can reach cdn.jsdelivr.net.</div>';
+    ideSetStatus(error.message||'Monaco unavailable');
+    return null;
+  }
+}
+function ideRenderTabs(){
+  const wrap=document.getElementById('ide-tabs');if(!wrap)return;
+  wrap.innerHTML='';
+  _ide.tabs.forEach(tab=>{
+    const el=document.createElement('div');el.className='ide-tab'+(tab.key===_ide.active?' active':'');el.title=tab.path;
+    const name=document.createElement('span');name.className='ide-tab-name';name.textContent=(tab.dirty?'● ':'')+ideFilename(tab.path);
+    const close=document.createElement('button');close.className='ide-tab-close';close.textContent='×';close.title='Close tab';
+    close.onclick=(event)=>{event.stopPropagation();ideCloseTab(tab.key)};el.onclick=()=>ideSelectTab(tab.key);el.append(name,close);wrap.appendChild(el);
+  });
+}
+async function ideSelectTab(key){
+  const tab=_ide.tabs.find(item=>item.key===key);if(!tab)return;
+  _ide.active=key;const monaco=await ideEnsureEditor();if(monaco&&tab.model){_ide.editor.setModel(tab.model);_ide.editor.focus();}
+  ideRenderTabs();ideSetStatus(tab.dirty?'Unsaved changes':'Saved',tab.path);ideRememberWorkspace();
+}
+function ideCloseTab(key){
+  const index=_ide.tabs.findIndex(item=>item.key===key);if(index<0)return;
+  const tab=_ide.tabs[index];if(tab.dirty&&!confirm('Discard unsaved changes to '+ideFilename(tab.path)+'?'))return;
+  if(tab.model)tab.model.dispose();_ide.tabs.splice(index,1);
+  if(_ide.active===key)_ide.active=(_ide.tabs[index]||_ide.tabs[index-1]||{}).key||'';
+  ideRenderTabs();if(_ide.active)ideSelectTab(_ide.active);else{if(_ide.editor)_ide.editor.setModel(null);ideSetStatus('Ready','No file open');}ideRememberWorkspace();
+}
+function ideSetFileFilter(value){_ide.filter=(value||'').trim().toLowerCase();ideRenderFiles()}
+function ideRenderFiles(entries){
+  const root=document.getElementById('ide-files');if(!root)return;
+  if(Array.isArray(entries)){
+    _ide.root=_ide.path;_ide.tree={};_ide.expanded={};_ide.treeLoading={};
+    if(_ide.root){_ide.tree[_ide.root]=entries;_ide.expanded[_ide.root]=true;}
+  }
+  root.innerHTML='';const rootPath=_ide.root||_ide.path;const topEntries=_ide.tree[rootPath]||[];const filter=_ide.filter;
+  const hasMatch=(path,entry)=>{if(!filter||entry.name.toLowerCase().includes(filter))return true;return entry.is_dir&&(_ide.tree[path]||[]).some(child=>hasMatch(ideJoinPath(path,child.name),child))};
+  let visible=0;
+  const appendEntries=(directory,items,depth)=>items.forEach(entry=>{
+    const path=ideJoinPath(directory,entry.name);if(!hasMatch(path,entry))return;visible++;
+    const row=document.createElement('button');row.type='button';row.className='ide-file'+(entry.is_dir?' ide-file-dir':'')+(path===_ide.selectedPath?' selected':'');row.style.paddingLeft=(9+depth*14)+'px';
+    const icon=document.createElement('span');icon.className='ide-file-icon';icon.textContent=entry.is_dir?(_ide.expanded[path]?'▾':'▸'):(entry.is_symlink?'↗':'·');
+    const name=document.createElement('span');name.textContent=entry.name+(entry.is_symlink?' @':'');row.append(icon,name);
+    if(entry.is_dir){row.title='Click to expand or collapse. Double-click to make this the workspace root.';row.onclick=()=>{_ide.selectedPath=path;ideToggleTree(path)};row.ondblclick=event=>{event.preventDefault();ideRefreshFiles(path)}}
+    else{row.onclick=()=>{_ide.selectedPath=path;ideOpenFile(path)}}
+    root.appendChild(row);
+    if(entry.is_dir&&_ide.expanded[path]){if(_ide.treeLoading[path]){const loading=document.createElement('div');loading.className='ide-files-empty';loading.style.paddingLeft=(9+(depth+1)*14)+'px';loading.textContent='Loading…';root.appendChild(loading)}else appendEntries(path,_ide.tree[path]||[],depth+1)}
+  });
+  appendEntries(rootPath,topEntries,0);
+  if(!visible){const empty=document.createElement('div');empty.className='ide-files-empty';empty.textContent=topEntries.length&&filter?'No loaded files match this filter.':'This directory is empty.';root.appendChild(empty)}
+}
+async function ideLoadTreeFiles(path){
+  if(_ide.tree[path])return true;_ide.treeLoading[path]=true;ideRenderFiles();
+  try{
+    const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/files?path='+encodeURIComponent(path)));const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not list remote files');
+    const resolved=data.path||path;_ide.tree[resolved]=data.entries||[];if(resolved!==path)_ide.tree[path]=data.entries||[];return true;
+  }catch(error){_ide.expanded[path]=false;ideSetStatus(error.message||'Could not list remote files');return false}
+  finally{delete _ide.treeLoading[path];ideRenderFiles()}
+}
+async function ideToggleTree(path){
+  if(_ide.expanded[path]){_ide.expanded[path]=false;ideRenderFiles();return;}
+  _ide.expanded[path]=true;await ideLoadTreeFiles(path);ideRenderFiles();
+}
+async function ideLoadConnections(){
+  const select=document.getElementById('ide-connection-select');if(select)select.innerHTML='<option>Loading…</option>';
+  try{
+    const response=await fetch(ideApi('/ssh-connections'));const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||'Could not load SSH connections');
+    _ide.connections=data.connections||[];
+    if(!_ide.connections.some(item=>item.id===_ide.connectionId))_ide.connectionId=(_ide.connections[0]||{}).id||'';
+    if(select){select.innerHTML='';if(!_ide.connections.length){const option=document.createElement('option');option.textContent='No connections';option.value='';select.appendChild(option)}_ide.connections.forEach(connection=>{const option=document.createElement('option');option.value=connection.id;option.textContent=connection.label+' · '+connection.username+'@'+connection.host;option.selected=connection.id===_ide.connectionId;select.appendChild(option)});}
+    if(_ide.connectionId)await ideRefreshConnectionStatus();else{ideSetStatus('Add an SSH connection to begin','No file open');ideSetConnectionState('','No SSH connection');}
+  }catch(error){if(select)select.innerHTML='<option>Unavailable</option>';ideSetStatus(error.message||'SSH connections unavailable');}
+}
+async function ideSelectConnection(connectionId){
+  _ide.connectionId=connectionId||'';_ide.path='.';_ide.root='';_ide.selectedPath='';_ide.tree={};_ide.expanded={};_ide.treeLoading={};_ide.tabs.forEach(tab=>{if(tab.model)tab.model.dispose()});_ide.tabs=[];_ide.active='';ideRenderTabs();
+  if(_ide.connectionId)await ideRefreshConnectionStatus();else{ideRenderFiles([]);ideSetStatus('No SSH connection selected','No file open');ideSetConnectionState('','No SSH connection');}
+}
+async function ideRestoreWorkspace(){
+  const key=ideWorkspaceKey();if(!key)return;const saved=ideSavedWorkspace();
+  if(_ide.restoredKey===key){await ideRefreshFiles((saved&&saved.path)||'.');return;}
+  _ide.restoredKey=key;await ideRefreshFiles((saved&&saved.path)||'.');
+  for(const path of ((saved&&Array.isArray(saved.tabs)&&saved.tabs)||[]).slice(0,12))await ideOpenFile(path);
+  const active=(saved&&saved.active)||'';const tab=_ide.tabs.find(item=>item.path===active);if(tab)await ideSelectTab(tab.key);
+}
+async function ideRefreshConnectionStatus(){
+  if(!_ide.connectionId)return;const connection=ideActiveConnection()||{};
+  try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/status'));const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not check SSH connection');if(data.connected){ideSetConnectionState('connected','● Connected');ideSetStatus('Connected · '+(connection.label||'SSH workspace'),'SSH terminal: '+(data.window_name||'open'));await ideRefreshLspStatus();await ideRestoreWorkspace();}else{ideSetConnectionState('reconnect','● Reconnect required');ideSetLspStatus('Language services: reconnect required');ideRenderFiles([]);ideSetStatus('Reconnect required · '+(connection.label||'SSH workspace'),'Select Connect to reopen SSH');}}
+  catch(error){ideSetConnectionState('error','● Connection error');ideRenderFiles([]);ideSetStatus(error.message||'Could not check SSH connection');}
+}
+async function ideRefreshLspStatus(){
+  if(!_ide.connectionId)return;ideSetLspStatus('Language services: checking…');
+  try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/lsp/status'));const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Unavailable');const names=(data.available||[]).map(item=>item.language).filter((value,index,items)=>items.indexOf(value)===index);ideSetLspStatus(names.length?'Remote LSP detected: '+names.join(', ')+' · bridge pending':'No remote language server detected');}
+  catch(error){ideSetLspStatus('Language services: unavailable');}
+}
+async function ideRefreshFiles(path){
+  if(!_ide.connectionId)return;const requested=path||_ide.path||'.';ideSetStatus('Loading '+requested+'…');
+  try{
+    const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/files?path='+encodeURIComponent(requested)));
+    const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not list remote files');
+    _ide.path=data.path||requested;document.getElementById('ide-path').textContent=_ide.path;ideRenderFiles(data.entries||[]);ideSetStatus('Connected · '+(ideActiveConnection()||{}).label,_ide.active?ideActiveTab().path:'No file open');ideRememberWorkspace();
+  }catch(error){ideRenderFiles([]);ideSetStatus(error.message||'Could not list remote files');}
+}
+function ideGoUp(){ideRefreshFiles(ideParentPath(_ide.path))}
+function ideShowQuickOpen(){
+  if(!_ide.connectionId){ideSetStatus('Connect an SSH workspace first.');return;}
+  const dialog=document.getElementById('ide-quick-open-dialog');const input=document.getElementById('ide-quick-open-input');dialog.classList.add('active');input.value='';_ide.quickResults=[];ideRenderQuickOpen('Type a filename to search this workspace.');input.focus();
+}
+function ideHideQuickOpen(){const dialog=document.getElementById('ide-quick-open-dialog');if(dialog)dialog.classList.remove('active');if(_ide.quickTimer){clearTimeout(_ide.quickTimer);_ide.quickTimer=null}}
+function ideRenderQuickOpen(emptyText){
+  const root=document.getElementById('ide-quick-open-results');if(!root)return;root.innerHTML='';
+  if(!_ide.quickResults.length){root.innerHTML='<div class="ide-quick-open-empty">'+(emptyText||'No matching files.')+'</div>';return}
+  _ide.quickResults.forEach(item=>{const button=document.createElement('button');button.type='button';button.className='ide-quick-open-result';const name=document.createElement('span');name.className='ide-quick-open-name';name.textContent=item.name;const path=document.createElement('span');path.textContent=item.path;button.append(name,path);button.onclick=async()=>{const target=ideJoinPath(_ide.root||_ide.path,item.path);ideHideQuickOpen();_ide.selectedPath=target;await ideOpenFile(target)};root.appendChild(button)});
+}
+function ideQuickOpenSearch(value){
+  const query=(value||'').trim();if(_ide.quickTimer){clearTimeout(_ide.quickTimer);_ide.quickTimer=null}_ide.quickResults=[];
+  if(!query){ideRenderQuickOpen('Type a filename to search this workspace.');return;}
+  ideRenderQuickOpen('Searching…');_ide.quickTimer=setTimeout(async()=>{
+    try{
+      const base=_ide.root||_ide.path||'.';const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/files/search?path='+encodeURIComponent(base)+'&query='+encodeURIComponent(query)));const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not search remote files');
+      const input=document.getElementById('ide-quick-open-input');if(!input||input.value.trim()!==query)return;_ide.quickResults=data.matches||[];ideRenderQuickOpen(data.truncated?'Showing the first 120 matching files.':undefined);
+    }catch(error){ideRenderQuickOpen(error.message||'Could not search remote files');}
+  },180);
+}
+function ideQuickOpenKey(event){if(event.key==='Enter'&&_ide.quickResults[0]){event.preventDefault();const item=_ide.quickResults[0];const target=ideJoinPath(_ide.root||_ide.path,item.path);ideHideQuickOpen();_ide.selectedPath=target;ideOpenFile(target)}else if(event.key==='Escape'){event.preventDefault();ideHideQuickOpen()}}
+const IDE_COMMANDS=[
+  {id:'find',label:'Find',key:'Ctrl/Cmd+F'},
+  {id:'replace',label:'Replace',key:'Ctrl/Cmd+H'},
+  {id:'goto',label:'Go to Line',key:'Ctrl/Cmd+G'},
+  {id:'quickOpen',label:'Quick Open',key:'Ctrl/Cmd+P'},
+  {id:'save',label:'Save Active File',key:'Ctrl/Cmd+S'},
+  {id:'git',label:'Open Remote Git',key:''},
+];
+function ideEditorAction(id){const action=_ide.editor&&_ide.editor.getAction(id);if(action){action.run();return true}ideSetStatus('Open a remote file first.');return false}
+function ideRunCommand(id){ideHideCommandPalette();if(id==='find')return ideEditorAction('actions.find');if(id==='replace')return ideEditorAction('editor.action.startFindReplaceAction');if(id==='goto')return ideEditorAction('editor.action.gotoLine');if(id==='quickOpen')return ideShowQuickOpen();if(id==='save')return ideSaveActive();if(id==='git')return ideShowGit()}
+function ideRenderCommandPalette(query=''){const root=document.getElementById('ide-command-results');if(!root)return;const needle=(query||'').trim().toLowerCase();root.innerHTML='';const entries=IDE_COMMANDS.filter(item=>!needle||item.label.toLowerCase().includes(needle));if(!entries.length){root.innerHTML='<div class="ide-quick-open-empty">No matching commands.</div>';return}entries.forEach(item=>{const button=document.createElement('button');button.type='button';button.className='ide-command-result';const label=document.createElement('span');label.className='ide-command-label';label.textContent=item.label;const key=document.createElement('span');key.className='ide-command-key';key.textContent=item.key;button.append(label,key);button.onclick=()=>ideRunCommand(item.id);root.appendChild(button)})}
+function ideShowCommandPalette(){const dialog=document.getElementById('ide-command-dialog');const input=document.getElementById('ide-command-input');dialog.classList.add('active');input.value='';ideRenderCommandPalette();input.focus()}
+function ideHideCommandPalette(){document.getElementById('ide-command-dialog').classList.remove('active')}
+function ideCommandPaletteKey(event){if(event.key==='Enter'){const query=(event.target.value||'').trim().toLowerCase();const command=IDE_COMMANDS.find(item=>!query||item.label.toLowerCase().includes(query));if(command){event.preventDefault();ideRunCommand(command.id)}}else if(event.key==='Escape'){event.preventDefault();ideHideCommandPalette()}}
+function ideShowGit(){if(!_ide.connectionId){ideSetStatus('Connect an SSH workspace first.');return}document.getElementById('ide-git-dialog').classList.add('active');ideGitStatus()}
+function ideHideGit(){document.getElementById('ide-git-dialog').classList.remove('active')}
+function ideRenderGit(data){const output=document.getElementById('ide-git-output');const root=document.getElementById('ide-git-root');if(root)root.textContent=(data.root||_ide.root||_ide.path)+' · '+(data.current_branch||'detached HEAD');if(output)output.textContent=data.output||data.status||'Working tree clean.'}
+async function ideRunGit(action,extra={}){try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/git'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,path:_ide.root||_ide.path||'.',...extra})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Git command failed');ideRenderGit(data);return data}catch(error){const output=document.getElementById('ide-git-output');if(output)output.textContent=error.message||'Git command failed';ideSetStatus(error.message||'Git command failed');return null}}
+function ideGitStatus(){return ideRunGit('status')}
+function ideGitDiff(){return ideRunGit('diff')}
+function ideGitSelectedPath(){const path=_ide.selectedPath||((ideActiveTab()||{}).path||'');const root=(_ide.root||_ide.path||'').replace(/\/+$/,'');if(!path||!root||!path.startsWith(root+'/'))return '';return path.slice(root.length+1)}
+function ideGitStageSelected(unstage){const path=ideGitSelectedPath();if(!path){ideSetStatus('Select a file or folder inside this workspace first.');return}return ideRunGit(unstage?'unstage':'stage',{files:[path]})}
+function ideGitBranch(create){const branch=(document.getElementById('ide-git-branch').value||'').trim();if(!branch)return;return ideRunGit(create?'create_branch':'switch',{branch})}
+async function ideGitCommit(){const message=(document.getElementById('ide-git-message').value||'').trim();if(!message)return;if(!confirm('Create a remote Git commit with this message?'))return;const data=await ideRunGit('commit',{message});if(data)document.getElementById('ide-git-message').value=''}
+async function ideRunFilesystem(action,path,newPath=''){
+  if(!_ide.connectionId)return false;
+  try{
+    const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/fs'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,path,new_path:newPath})});
+    const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not change remote files');
+    return data;
+  }catch(error){ideSetStatus(error.message||'Could not change remote files');return false;}
+}
+async function ideCreateRemote(){
+  if(!_ide.connectionId)return;const kind=(prompt('Create a remote "file" or "folder"?','file')||'').trim().toLowerCase();
+  if(kind!=='file'&&kind!=='folder'){if(kind)ideSetStatus('Enter "file" or "folder".');return;}
+  const name=(prompt('Name for the new '+kind+' in '+_ide.path)||'').trim();if(!name)return;
+  const path=ideJoinPath(_ide.path,name);const result=await ideRunFilesystem(kind==='file'?'create_file':'create_dir',path);if(!result)return;
+  _ide.selectedPath=result.path||path;await ideRefreshFiles();if(kind==='file')await ideOpenFile(_ide.selectedPath);
+}
+async function ideRenameSelected(){
+  const source=_ide.selectedPath;if(!source){ideSetStatus('Select a remote file or folder first.');return;}
+  const target=(prompt('New name or path for '+ideFilename(source),ideFilename(source))||'').trim();if(!target)return;
+  const destination=target.startsWith('/')||target.includes('/')?target:ideJoinPath(ideParentPath(source),target);if(destination===source)return;
+  const result=await ideRunFilesystem('rename',source,destination);if(!result)return;
+  const resolved=result.new_path||destination;_ide.tabs.forEach(tab=>{if(tab.path===source||tab.path.startsWith(source+'/')){tab.path=resolved+tab.path.slice(source.length);tab.key=_ide.connectionId+'|'+tab.path;}});_ide.selectedPath=resolved;ideRenderTabs();await ideRefreshFiles();ideRememberWorkspace();
+}
+async function ideDeleteSelected(){
+  const path=_ide.selectedPath;if(!path){ideSetStatus('Select a remote file or folder first.');return;}
+  if(!confirm('Delete '+path+'? Folders must be empty. This cannot be undone.'))return;
+  const result=await ideRunFilesystem('delete',path);if(!result)return;
+  for(const tab of _ide.tabs.filter(item=>item.path===path||item.path.startsWith(path+'/')))ideCloseTab(tab.key);
+  _ide.selectedPath='';await ideRefreshFiles();
+}
+async function ideOpenFile(path){
+  if(!_ide.connectionId)return;ideSetStatus('Opening '+path+'…');
+  try{
+    const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/file?path='+encodeURIComponent(path)));
+    const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not open remote file');
+    const key=_ide.connectionId+'|'+data.path;let tab=_ide.tabs.find(item=>item.key===key);
+    const monaco=await ideEnsureEditor();if(!monaco)return;
+    if(!tab){
+      const model=monaco.editor.createModel(data.content||'',ideLanguage(data.path));
+      tab={key,path:data.path,content:data.content||'',saved:data.content||'',dirty:false,model};
+      model.onDidChangeContent(()=>{tab.content=model.getValue();tab.dirty=tab.content!==tab.saved;if(_ide.active===tab.key)ideSetStatus(tab.dirty?'Unsaved changes':'Saved',tab.path);ideRenderTabs();});
+      _ide.tabs.push(tab);
+    }
+    await ideSelectTab(tab.key);
+    ideRememberWorkspace();
+  }catch(error){ideSetStatus(error.message||'Could not open remote file');}
+}
+async function ideSaveActive(){
+  const tab=ideActiveTab();if(!tab||!_ide.connectionId)return;tab.content=tab.model?tab.model.getValue():tab.content;ideSetStatus('Saving '+ideFilename(tab.path)+'…',tab.path);
+  try{
+    const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/file'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:tab.path,content:tab.content})});
+    const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not save remote file');
+    tab.saved=tab.content;tab.dirty=false;ideRenderTabs();ideSetStatus('Saved '+ideFilename(tab.path),tab.path);
+  }catch(error){ideSetStatus(error.message||'Could not save remote file',tab.path);}
+}
+function ideShowConnectionForm(){document.getElementById('ide-connection-dialog').classList.add('active');document.getElementById('ide-conn-host').focus()}
+function ideHideConnectionForm(){document.getElementById('ide-connection-dialog').classList.remove('active')}
+function ideAuthModeChanged(){const password=document.getElementById('ide-conn-auth').value==='password';document.getElementById('ide-conn-key-wrap').style.display=password?'none':'';document.getElementById('ide-conn-password-wrap').style.display=password?'':'none'}
+async function ideSaveConnection(){
+  const body={label:document.getElementById('ide-conn-label').value,host:document.getElementById('ide-conn-host').value,username:document.getElementById('ide-conn-user').value,port:Number(document.getElementById('ide-conn-port').value||22),identity_file:document.getElementById('ide-conn-key').value,auth_mode:document.getElementById('ide-conn-auth').value,password:document.getElementById('ide-conn-password').value,workspace_root:document.getElementById('ide-conn-workspace').value,max_file_bytes:Number(document.getElementById('ide-conn-max-file-kb').value||1000)*1000};
+  try{const response=await fetch(ideApi('/ssh-connections'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not save SSH connection');_ide.password=body.password||'';document.getElementById('ide-conn-password').value='';_ide.connectionId=data.connection.id;ideHideConnectionForm();await ideLoadConnections();await ideConnectActive();}
+  catch(error){ideSetStatus(error.message||'Could not save SSH connection');}
+}
+async function ideConnectActive(){
+  if(!_ide.connectionId)return;const connection=ideActiveConnection()||{};ideSetConnectionState('connecting','● Connecting…');ideSetStatus('Connecting '+(connection.label||'SSH workspace')+'…');
+  const password=connection.auth_mode==='password'?(_ide.password||prompt('SSH password for '+(connection.username||'')+'@'+(connection.host||''))) : '';
+  if(connection.auth_mode==='password'&&password===null){ideSetStatus('SSH connection cancelled');return;}
+  try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/connect'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not establish session SSH connection');_ide.password='';ideSetConnectionState('connected','● Connected');ideSetStatus('Connected · '+(connection.label||'SSH workspace'),'SSH terminal: '+(data.window_name||'open'));await ideRestoreWorkspace();}
+  catch(error){ideSetConnectionState('error','● Connection error');ideSetStatus(error.message||'Could not establish session SSH connection');}
+}
+async function ideFocusTerminal(){
+  if(!_ide.connectionId)return;try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/focus-terminal'),{method:'POST'});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not select SSH terminal');ideSetStatus('SSH terminal '+(data.window_name||'selected')+' selected. Close the IDE to view it.');}catch(error){ideSetStatus(error.message||'Could not select SSH terminal');}}
+async function ideDeleteConnection(){
+  const connection=ideActiveConnection();if(!connection)return;
+  if(!confirm('Remove SSH connection "'+connection.label+'"? This does not change the remote server.'))return;
+  try{const workspaceKey=ideWorkspaceKey();const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(connection.id)),{method:'DELETE'});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not remove SSH connection');try{localStorage.removeItem(workspaceKey)}catch(error){}await ideSelectConnection('');await ideLoadConnections();}
+  catch(error){ideSetStatus(error.message||'Could not remove SSH connection');}
+}
+function idePrettyChat(text){return String(text||'').replace(/^\[Remote SSH IDE context\][\s\S]*?\n\n/,'')}
+function ideRenderChat(){
+  if(!_ide.open)return;const root=document.getElementById('ide-chat-messages');if(!root)return;const messages=chatMessages[_ide.session]||[];const pinned=root.scrollHeight-root.scrollTop-root.clientHeight<50;root.innerHTML='';
+  if(!messages.length){root.innerHTML='<div class="ide-chat-empty">Use this panel to ask the selected Codex session about the remote workspace. The active file path is included with each request.</div>';return}
+  messages.slice(-80).forEach(message=>{const bubble=document.createElement('div');bubble.className='ide-chat-msg '+(message.role==='assistant'?'assistant':'user');bubble.textContent=idePrettyChat(message.full||message.text);root.appendChild(bubble)});if(pinned)root.scrollTop=root.scrollHeight;
+}
+async function ideSetSession(name){
+  const next=name||'';if(next===_ide.session){ideRenderChat();return;}
+  _ide.session=next;await ideSelectConnection('');ideRenderChat();if(_ide.session)await ideLoadConnections();
+}
+function ideChatKey(event){if(_composerEnterSends(event)){event.preventDefault();ideSendChat()}}
+async function ideSendChat(){
+  const input=document.getElementById('ide-chat-input');const question=(input&&input.value||'').trim();if(!question||!_ide.session)return;
+  const connection=ideActiveConnection()||{};const tab=ideActiveTab();const activeContent=tab?(tab.model?tab.model.getValue():tab.content||''):'';const fileContext=tab?'\nActive file contents (first 12,000 characters):\n'+activeContent.slice(0,12000):'';const prompt='[Remote SSH IDE context]\nSSH target: '+(connection.username||'?')+'@'+(connection.host||'?')+'\nRemote path: '+(tab?tab.path:_ide.path||'.')+fileContext+'\n\n'+question;
+  input.disabled=true;try{const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(_ide.session)+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:prompt})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not send to Codex');appendChatBubble(_ide.session,'user',prompt,Date.now()/1000);setOptimisticBusy(_ide.session);input.value='';ideRenderChat();scheduleBusyVerification(_ide.session);}catch(error){ideSetStatus(error.message||'Could not send to Codex');}finally{input.disabled=false;input.focus();}}
+function ideToggleMobileChat(){document.getElementById('ide-overlay').classList.toggle('chat-open')}
+async function openRemoteIde(sessionName){
+  _ide.open=true;_ide.session=sessionName||selectedSession||'';const overlay=document.getElementById('ide-overlay');overlay.classList.add('active');overlay.classList.remove('chat-open');
+  const select=document.getElementById('ide-session-select');select.innerHTML='';sessions.forEach(session=>{const option=document.createElement('option');option.value=session.name;option.textContent=session.name;option.selected=session.name===_ide.session;select.appendChild(option)});
+  ideRenderChat();if(_ide.chatTimer)clearInterval(_ide.chatTimer);_ide.chatTimer=setInterval(ideRenderChat,3000);ideEnsureEditor();await ideLoadConnections();
+}
+function closeRemoteIde(){const overlay=document.getElementById('ide-overlay');overlay.classList.remove('active','chat-open');_ide.open=false;if(_ide.chatTimer){clearInterval(_ide.chatTimer);_ide.chatTimer=null}ideHideConnectionForm();ideHideQuickOpen();ideHideGit();ideHideCommandPalette()}
+document.addEventListener('keydown',event=>{if(!_ide.open)return;const modifier=event.ctrlKey||event.metaKey;const key=event.key.toLowerCase();const textControl=event.target.matches&&event.target.matches('input,textarea,select')&&!event.target.closest('.monaco-editor');if(modifier&&key==='s'){event.preventDefault();ideSaveActive()}else if(!textControl&&modifier&&event.shiftKey&&key==='p'){event.preventDefault();ideShowCommandPalette()}else if(!textControl&&modifier&&key==='p'){event.preventDefault();ideShowQuickOpen()}else if(!textControl&&modifier&&key==='f'){event.preventDefault();ideRunCommand('find')}else if(!textControl&&modifier&&key==='h'){event.preventDefault();ideRunCommand('replace')}else if(!textControl&&modifier&&key==='g'){event.preventDefault();ideRunCommand('goto')}else if(event.key==='Escape'){if(document.getElementById('ide-command-dialog').classList.contains('active'))ideHideCommandPalette();else if(document.getElementById('ide-quick-open-dialog').classList.contains('active'))ideHideQuickOpen();else if(document.getElementById('ide-git-dialog').classList.contains('active'))ideHideGit();else if(!document.getElementById('ide-connection-dialog').classList.contains('active'))closeRemoteIde()}});
 
 // ── Session MEMORY.md Editor (project auto-memory) ──
 let _sessMem = {sessionName:'', path:'', dir:'', cwd:'', content:'', exists:false};
