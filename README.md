@@ -60,6 +60,57 @@ All persistent data is stored in `~/.tmux-dashboard/` (permissions: `700`):
 | `notes.json` | AI-extracted session notes |
 | `anthropic_api_key` | Encrypted-at-rest API key (chmod 600) |
 
+## Running with Docker
+
+```bash
+cp .env.example .env      # then set TMUX_DASH_PASS and TMUX_DASH_SECRET
+make docker-up            # http://127.0.0.1:8501/codex/
+```
+
+The image builds the Svelte IDE bundle in a Node stage, so the runtime image
+needs no Node toolchain. It runs as a non-root user and ships `tmux`, the
+OpenSSH **client**, and `git` — all hard runtime dependencies.
+
+### Volumes
+
+| Volume | Mount | Why |
+|---|---|---|
+| `dashboard-state` | `/home/app/.tmux-dashboard` | Messages, connection metadata, SSH credential ciphertext. |
+| `dashboard-ssh` | `/home/app/.ssh` | **Must be writable**: OpenSSH records trusted hosts in `known_hosts`, and with strict host-key checking a read-only mount makes every SSH connection fail. |
+| `SSH_KEYS_DIR` | `/mnt/ssh-keys` (read-only) | Your own keys. The entrypoint copies them into `~/.ssh` and fixes their modes, so the host copies are never modified. |
+
+### Host keys
+
+Strict host-key checking stays on. Set `SSH_KNOWN_HOSTS` to a space-separated
+list of `host` or `host:port` entries to trust at startup, so the first
+connection is not rejected:
+
+```
+SSH_KNOWN_HOSTS=git.example.com deploy.example.com:2222
+```
+
+### Credential key
+
+Set `TMUX_DASH_SSH_KEY` (base64 of 32 bytes) to keep the SSH credential
+encryption key **out of the state volume**. Leave it blank and the app
+generates a keyfile inside the volume instead — convenient, but then a copied
+volume is enough to decrypt stored SSH passwords.
+
+```bash
+python3 -c "import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())"
+```
+
+### Testing against a real SSH server
+
+```bash
+make test-ssh    # disposable sshd on 127.0.0.1:2222 (devuser/devpass)
+```
+
+Test-only, behind the `testing` compose profile so a plain `up` never starts a
+container with a known password. It ships `python3` and a small git workspace at
+`/home/devuser/workspace`, which is what the Remote IDE's file and git helpers
+need.
+
 ## Running via Supervisor
 
 Example `/etc/supervisor/conf.d/tmux-dashboard.conf`:

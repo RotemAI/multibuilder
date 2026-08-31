@@ -74,6 +74,7 @@ codex-config.tmp.toml
 # Environment / secrets
 .env
 .env.*
+!.env.example
 node_modules
 
 # Node / Svelte IDE build

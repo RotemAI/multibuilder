@@ -1,0 +1,25 @@
+.git
+.gitignore
+.venv
+.venv-test
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+htmlcov
+.coverage
+
+# Built by the image's own node stage; never copy a host build in.
+static/
+ide-ui/node_modules
+ide-ui/.vite
+
+# Docs and local artifacts that do not belong in the build context.
+*.md
+!README.md
+screenshots/
+pipelinesdocs/
+pipelinesdocsv2/
+*.bak-*
+.env
+.env.*

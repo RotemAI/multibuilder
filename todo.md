@@ -72,8 +72,11 @@
 ## Security and verification
 
 - [x] Replace the admin-only gate with per-owner ownership: creator + admins may use a connection; others get 404 so existence is not disclosed.
-- [ ] Document key-management guidance for `TMUX_DASH_SSH_KEY` in the deployment runbook.
+- [x] Document key-management guidance for `TMUX_DASH_SSH_KEY` (README, Docker section).
 - [x] Add private, credential-free audit events for connect/reconnect, remote list/read/write, filesystem changes, and terminal launch/focus.
 - [x] Add a configurable workspace root and 1 KB–1 MB file limit per connection; accept only relative paths and enforce the root locally and after remote symlink resolution.
-- [ ] Test against a disposable SSH server for password, agent/key, reconnect, and failed-host-key cases.
+- [x] Test against a disposable SSH server (`make test-ssh`) — verified against
+      a real sshd: password auth, control-master reuse, remote list/read/write,
+      git, reconnect after the master dies, wrong-password rejection, remote
+      path-traversal refusal, and untrusted-host-key refusal.
 - [ ] Add browser tests for Monaco tabs, saves, reconnect UI, and AI context forwarding.
