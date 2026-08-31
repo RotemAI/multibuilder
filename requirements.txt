@@ -8,4 +8,5 @@ pydantic==2.12.5          # updated 2026-04-03 (was 2.10.3)
 httpx==0.28.1             # browser/noVNC reverse proxy
 websockets==15.0.1        # browser WebSocket reverse proxy
 google-auth[requests]==2.56.2  # Workspace domain-wide delegation preflight
+cryptography==50.0.1      # AES-256-GCM at-rest encryption for stored SSH credentials
 tomli==2.4.1; python_version < "3.11"  # stdlib tomllib compatibility

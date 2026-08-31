@@ -14,8 +14,8 @@ Status: the Remote IDE UI and direct SSH file operations are implemented. The
 next implementation step is to bind SSH transport to the selected real tmux
 session.
 
-- Remote SSH connection profiles can be created, listed, and removed by dashboard administrators.
-- Profiles persist only connection metadata in the dashboard state directory; passwords and private-key contents are never accepted or stored.
+- Remote SSH connection profiles can be created, listed, and removed. Each profile is owned by its creator; the owner and dashboard admins may use it, and other members receive 404 so a connection's existence is not disclosed.
+- Profiles persist connection metadata **and credentials**, so a workspace can resume after a dashboard restart. Passwords are sealed with AES-256-GCM, bound to the connection id as AAD, and never returned by any API. Private-key contents are still never accepted.
 - The dashboard currently uses the host's OpenSSH client in non-interactive mode, with strict host-key checking, no forwarding, and a short connection timeout.
 - An optional identity file must already exist below the dashboard host's `~/.ssh`; otherwise SSH agent identities are used.
 - Remote browsing, UTF-8 text-file viewing, and atomic saves are supported. Files over 1 MB are intentionally rejected.
@@ -42,15 +42,27 @@ dashboard session.
 
 ## Authentication and security boundary
 
-The SSH IDE is administrator-only until session-owned credentials and auditing
-are implemented. The dashboard process may have access to the host user's SSH
-agent and `~/.ssh`; allowing member accounts to use that identity would violate
-tenant isolation.
+Connections are per-owner. The creating user and dashboard admins may use a
+stored connection; nobody else can see that it exists. Members still never
+borrow the dashboard host's SSH agent identity: a member connection
+authenticates only with the credential stored against that connection.
+
+### What at-rest encryption does and does not protect
+
+Credentials are encrypted with AES-256-GCM. The data key comes from
+`TMUX_DASH_SSH_KEY` or, failing that, a `0600` keyfile generated beside the
+ciphertext in the state directory. **An attacker who reads the dashboard
+host's disk as the dashboard user therefore recovers both the ciphertext and
+the key.** Encryption here defends against stolen backups, copied state
+directories, and casual file reads -- not against compromise of the dashboard
+account itself. Set `TMUX_DASH_SSH_KEY` from outside the state directory to
+raise that bar.
 
 Authentication modes for the session bridge:
 
-- Password: supplied when connecting, used only to establish the live SSH
-  connection, and never written to a profile or disk.
+- Password: stored encrypted against the connection so a resumed session
+  reconnects without prompting. A password supplied on a later connect
+  replaces the stored one only after it successfully authenticates.
 - SSH key: use an SSH agent or an existing key path. A later improvement may
   allow a pasted private key only as a short-lived temporary file while the
   connection is established; it must never be persisted.
@@ -107,6 +119,9 @@ Operational requirements:
 
 ## Verification
 
-- Focused SSH IDE and security tests: 42 passing.
+- Full suite: 464 passing. The one remaining failure,
+  `TestAwayWaitForIdle::test_phase_b_resets_idle_count_and_times_out`, is
+  pre-existing and unrelated (it fails identically on the previous commit).
+- Credential vault: 14 tests covering round-trip, AAD binding, tamper
+  rejection, keyfile permissions, restart survival, and no-plaintext-on-disk.
 - Python compilation and rendered browser JavaScript syntax checks: passing.
-- Existing project lint has two unrelated `B007` warnings in `app.py` for unused loop variables.

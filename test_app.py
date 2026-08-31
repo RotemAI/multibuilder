@@ -1,8 +1,10 @@
 """Tests for tmux Dashboard app.py — utility functions and API logic."""
+import base64
 import hashlib
 import hmac
 import json
 import os
+import stat
 import time
 
 import pytest
@@ -1101,7 +1103,6 @@ class TestSshIdeSafety:
 
     def test_terminal_audit_is_private_and_credential_free(self, tmp_path, monkeypatch):
         import app as app_module
-
         from app import _append_ssh_ide_audit
 
         audit_file = tmp_path / "ssh-ide-audit.jsonl"
@@ -1230,3 +1231,122 @@ class TestSshIdeSafety:
 
         assert window_name == "ssh:Production-API"
         assert run.call_args.args[0] == ["tmux", "select-window", "-t", "test-session:ssh:Production-API"]
+
+
+class TestSshCredentialVault:
+    """Credentials are stored now, so these guard the at-rest boundary."""
+
+    def _isolate(self, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_VAULT_KEY_FILE", tmp_path / "ssh-vault.key")
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "_ssh_vault_key_cache", None)
+        monkeypatch.delenv("TMUX_DASH_SSH_KEY", raising=False)
+        return app_module
+
+    def test_roundtrip_recovers_the_secret(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        sealed = app_module._ssh_vault_encrypt("hunter2", "conn-1")
+        assert app_module._ssh_vault_decrypt(sealed, "conn-1") == "hunter2"
+
+    def test_ciphertext_does_not_contain_the_plaintext(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        sealed = app_module._ssh_vault_encrypt("correct-horse-battery", "conn-1")
+        assert "correct-horse-battery" not in sealed
+        assert b"correct-horse-battery" not in base64.b64decode(sealed)
+
+    def test_nonce_is_fresh_so_equal_secrets_differ(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        assert app_module._ssh_vault_encrypt("same", "conn-1") != app_module._ssh_vault_encrypt(
+            "same", "conn-1"
+        )
+
+    def test_ciphertext_is_bound_to_its_connection_id(self, tmp_path, monkeypatch):
+        """A blob copied onto another connection record must not decrypt."""
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        sealed = app_module._ssh_vault_encrypt("hunter2", "conn-1")
+        with pytest.raises(RuntimeError):
+            app_module._ssh_vault_decrypt(sealed, "conn-2")
+
+    def test_tampered_ciphertext_is_rejected(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        raw = bytearray(base64.b64decode(app_module._ssh_vault_encrypt("hunter2", "conn-1")))
+        raw[-1] ^= 0x01
+        with pytest.raises(RuntimeError):
+            app_module._ssh_vault_decrypt(base64.b64encode(bytes(raw)).decode(), "conn-1")
+
+    def test_keyfile_is_created_private(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        app_module._ssh_vault_encrypt("hunter2", "conn-1")
+        keyfile = tmp_path / "ssh-vault.key"
+        assert keyfile.is_file()
+        assert stat.S_IMODE(keyfile.stat().st_mode) == 0o600
+
+    def test_key_survives_restart_so_sessions_resume(self, tmp_path, monkeypatch):
+        """The whole point of storing credentials: a restart must still decrypt."""
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        sealed = app_module._ssh_vault_encrypt("hunter2", "conn-1")
+        monkeypatch.setattr(app_module, "_ssh_vault_key_cache", None)  # simulate restart
+        assert app_module._ssh_vault_decrypt(sealed, "conn-1") == "hunter2"
+
+    def test_env_key_takes_precedence_and_writes_no_keyfile(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+        monkeypatch.setenv("TMUX_DASH_SSH_KEY", base64.b64encode(b"k" * 32).decode())
+
+        assert app_module._ssh_vault_key() == b"k" * 32
+        assert not (tmp_path / "ssh-vault.key").exists()
+
+    @pytest.mark.parametrize("bad", ["not-base64!!", base64.b64encode(b"short").decode()])
+    def test_malformed_env_key_is_rejected(self, tmp_path, monkeypatch, bad):
+        app_module = self._isolate(tmp_path, monkeypatch)
+        monkeypatch.setenv("TMUX_DASH_SSH_KEY", bad)
+
+        with pytest.raises(RuntimeError):
+            app_module._ssh_vault_key()
+
+    def test_empty_secret_stays_empty(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        assert app_module._ssh_vault_encrypt("", "conn-1") == ""
+        assert app_module._ssh_vault_decrypt("", "conn-1") == ""
+
+    def test_public_profile_never_exposes_credentials(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        public = app_module._ssh_public_profile({
+            "id": "conn-1",
+            "label": "Prod",
+            "host": "example.com",
+            "username": "deploy",
+            "password_enc": app_module._ssh_vault_encrypt("hunter2", "conn-1"),
+            "owner_id": "alice",
+        })
+
+        assert "hunter2" not in json.dumps(public)
+        assert not any(field in public for field in app_module._SSH_SECRET_FIELDS)
+        assert public["has_password"] is True
+
+    def test_ownership_allows_owner_and_admin_only(self, tmp_path, monkeypatch):
+        app_module = self._isolate(tmp_path, monkeypatch)
+        profile = {"id": "conn-1", "owner_id": "alice"}
+
+        assert app_module._ssh_user_may_use_profile({"id": "alice", "role": "member"}, profile)
+        assert app_module._ssh_user_may_use_profile({"id": "root", "role": "admin"}, profile)
+        assert not app_module._ssh_user_may_use_profile({"id": "bob", "role": "member"}, profile)
+        assert not app_module._ssh_user_may_use_profile(None, profile)
+
+    def test_unowned_legacy_profile_is_not_claimed_by_members(self, tmp_path, monkeypatch):
+        """A pre-existing profile with no owner must not become everyone's."""
+        app_module = self._isolate(tmp_path, monkeypatch)
+
+        assert not app_module._ssh_user_may_use_profile(
+            {"id": "bob", "role": "member"}, {"id": "conn-1"}
+        )

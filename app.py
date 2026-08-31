@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import hmac
 import ipaddress
@@ -38,6 +39,8 @@ import httpx
 import openai
 import uvicorn
 import websockets
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -10476,13 +10479,20 @@ async def api_save_session_project_file(session_name: str, body: ProjectFileBody
 
 # --- Remote SSH IDE ---------------------------------------------------------
 #
-# This workspace is deliberately admin-only.  The dashboard process runs as one
-# OS account and therefore sees that account's SSH agent and ~/.ssh directory;
-# exposing those identities to a dashboard member would pierce tenant isolation.
-# Profiles contain only connection metadata.  Passwords and private-key contents
-# are never stored or accepted here. Pasted private keys are deliberately out of
-# scope: use a pre-existing ~/.ssh key or SSH agent instead.
+# Connections are per-owner: the creating user and dashboard admins may use one,
+# and nobody else can see that it exists.  Because operators need a session to
+# survive a dashboard restart, credentials ARE stored here -- encrypted at rest
+# with AES-256-GCM and never returned by any API.
+#
+# Threat model, stated plainly: the data key lives in TMUX_DASH_SSH_KEY or in a
+# 0600 keyfile beside the ciphertext, so an attacker who can read the dashboard
+# host's disk AS THE DASHBOARD USER recovers the credentials.  Encryption here
+# defends against stolen backups, cloned state directories, and casual file
+# reads -- not against full compromise of the dashboard account.  Protect that
+# account accordingly.
 SSH_CONNECTIONS_FILE = MESSAGES_DIR / "ssh-connections.json"
+SSH_VAULT_KEY_FILE = MESSAGES_DIR / "ssh-vault.key"
+SSH_IDE_STATE_FILE = MESSAGES_DIR / "ssh-ide-state.json"
 SSH_IDE_AUDIT_FILE = MESSAGES_DIR / "ssh-ide-audit.jsonl"
 _ssh_ide_audit_lock = threading.Lock()
 # Keep UNIX-domain socket paths short enough for OpenSSH on macOS and Linux.
@@ -10490,8 +10500,103 @@ _ssh_ide_audit_lock = threading.Lock()
 # name, host, nor credential material.
 SSH_CONTROL_DIR = Path("/tmp") / f"nssh-{os.getuid()}"
 SSH_MAX_FILE_BYTES = 1_000_000
+# Unsaved buffers are convenience state, not storage: cap what one workspace
+# may park in the dashboard state directory.
+SSH_MAX_UNSAVED_STATE_BYTES = 2_000_000
 _SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 _SSH_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+
+
+def _harden_ssh_state_file(path: Path) -> None:
+    """Keep SSH ciphertext and resume state readable only by the dashboard user."""
+    try:
+        path.chmod(0o600)
+    except OSError:
+        logger.debug("chmod 600 on %s failed", path, exc_info=True)
+
+
+_ssh_vault_key_lock = threading.Lock()
+_ssh_vault_key_cache: bytes | None = None
+
+
+def _ssh_vault_key() -> bytes:
+    """Return the AES-256 data key, generating a 0600 keyfile on first use.
+
+    TMUX_DASH_SSH_KEY (base64, 32 bytes) wins when set, so a deployment can keep
+    the key out of the state directory entirely. Otherwise the key is generated
+    once and stored beside the ciphertext -- see the module header for exactly
+    what that does and does not protect against.
+    """
+    global _ssh_vault_key_cache
+    with _ssh_vault_key_lock:
+        if _ssh_vault_key_cache is not None:
+            return _ssh_vault_key_cache
+        env_key = os.environ.get("TMUX_DASH_SSH_KEY", "").strip()
+        if env_key:
+            try:
+                key = base64.b64decode(env_key, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise RuntimeError("TMUX_DASH_SSH_KEY must be base64-encoded") from exc
+            if len(key) != 32:
+                raise RuntimeError("TMUX_DASH_SSH_KEY must decode to exactly 32 bytes")
+            _ssh_vault_key_cache = key
+            return key
+        try:
+            key = base64.b64decode(SSH_VAULT_KEY_FILE.read_text().strip(), validate=True)
+            if len(key) == 32:
+                _ssh_vault_key_cache = key
+                return key
+            logger.error("SSH vault keyfile is malformed; refusing to overwrite it")
+            raise RuntimeError("SSH vault keyfile is malformed")
+        except FileNotFoundError:
+            pass
+        except (ValueError, binascii.Error) as exc:
+            raise RuntimeError("SSH vault keyfile is not valid base64") from exc
+        key = secrets.token_bytes(32)
+        SSH_VAULT_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL so two workers racing at first boot cannot clobber each other's
+        # key and silently strand every previously stored credential.
+        try:
+            fd = os.open(SSH_VAULT_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            existing = base64.b64decode(SSH_VAULT_KEY_FILE.read_text().strip(), validate=True)
+            _ssh_vault_key_cache = existing
+            return existing
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, base64.b64encode(key) + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _ssh_vault_key_cache = key
+        return key
+
+
+def _ssh_vault_encrypt(secret: str, connection_id: str) -> str:
+    """Encrypt one credential, bound to its connection id via AES-GCM AAD.
+
+    The AAD binding means a ciphertext copied onto a different connection record
+    fails to decrypt rather than silently authenticating somewhere unintended.
+    """
+    if not secret:
+        return ""
+    nonce = secrets.token_bytes(12)
+    sealed = AESGCM(_ssh_vault_key()).encrypt(
+        nonce, secret.encode("utf-8"), connection_id.encode("utf-8")
+    )
+    return base64.b64encode(nonce + sealed).decode("ascii")
+
+
+def _ssh_vault_decrypt(blob: str, connection_id: str) -> str:
+    if not blob:
+        return ""
+    try:
+        raw = base64.b64decode(blob, validate=True)
+        return AESGCM(_ssh_vault_key()).decrypt(
+            raw[:12], raw[12:], connection_id.encode("utf-8")
+        ).decode("utf-8")
+    except (ValueError, binascii.Error, InvalidTag) as exc:
+        raise RuntimeError("Stored SSH credential could not be decrypted") from exc
 
 
 def _append_ssh_ide_audit(user: dict, session_name: str, profile: dict, action: str) -> dict:
@@ -10572,8 +10677,16 @@ def _normalized_ssh_identity_file(value: str) -> str | None:
     return str(candidate)
 
 
+_SSH_SECRET_FIELDS = ("password_enc", "passphrase_enc")
+
+
 def _ssh_public_profile(profile: dict) -> dict:
-    """Return connection metadata suitable for the browser; no credentials exist."""
+    """Return connection metadata for the browser.
+
+    Credentials are stored, so this allow-list is the boundary that keeps them
+    off the wire: it names every field that may be published and never reads the
+    encrypted ones. `has_password` reports only that a secret exists.
+    """
     return {
         "id": str(profile.get("id") or ""),
         "label": str(profile.get("label") or ""),
@@ -10584,24 +10697,96 @@ def _ssh_public_profile(profile: dict) -> dict:
         "auth_mode": str(profile.get("auth_mode") or "agent"),
         "workspace_root": str(profile.get("workspace_root") or "."),
         "max_file_bytes": int(profile.get("max_file_bytes") or SSH_MAX_FILE_BYTES),
+        "owner_id": str(profile.get("owner_id") or ""),
+        "owner_username": str(profile.get("owner_username") or ""),
+        "has_password": bool(profile.get("password_enc")),
+        "last_directory": str(profile.get("last_directory") or "."),
     }
 
 
-def _ssh_profiles(session_name: str) -> list[dict]:
+def _ssh_user_may_use_profile(user: dict | None, profile: dict) -> bool:
+    """A stored connection belongs to its creator; admins retain oversight."""
+    if not user or not profile:
+        return False
+    if _is_admin(user):
+        return True
+    owner_id = str(profile.get("owner_id") or "")
+    return bool(owner_id) and owner_id == str(user.get("id") or "")
+
+
+def _ssh_profiles(session_name: str, user: dict | None = None) -> list[dict]:
+    """List stored connections for a session, filtered to what `user` may use.
+
+    Passing user=None returns every profile and is for internal callers only;
+    request paths must pass the caller so ownership is enforced at the source
+    rather than depending on each route to re-filter.
+    """
     data = _ssh_connections_store().read()
     profiles = data.get("connections") if isinstance(data, dict) else []
     return [
         dict(profile)
         for profile in profiles
-        if isinstance(profile, dict) and profile.get("session_name") == session_name
+        if isinstance(profile, dict)
+        and profile.get("session_name") == session_name
+        and (user is None or _ssh_user_may_use_profile(user, profile))
     ]
 
 
-def _ssh_profile(session_name: str, connection_id: str) -> dict | None:
+def _ssh_profile(session_name: str, connection_id: str, user: dict | None = None) -> dict | None:
     return next(
-        (profile for profile in _ssh_profiles(session_name) if profile.get("id") == connection_id),
+        (
+            profile
+            for profile in _ssh_profiles(session_name, user)
+            if profile.get("id") == connection_id
+        ),
         None,
     )
+
+
+def _ssh_update_profile(session_name: str, connection_id: str, changes: dict) -> None:
+    """Merge fields into one stored connection under the store's lock."""
+
+    def mutate(data: dict) -> bool:
+        for item in data.setdefault("connections", []):
+            if item.get("id") == connection_id and item.get("session_name") == session_name:
+                item.update(changes)
+                return True
+        return False
+
+    _ssh_connections_store().update(mutate)
+    _harden_ssh_state_file(SSH_CONNECTIONS_FILE)
+
+
+def _ssh_ide_state_store() -> LockedJsonStore:
+    return LockedJsonStore(SSH_IDE_STATE_FILE, lambda: {"version": 1, "workspaces": {}})
+
+
+def _ssh_ide_state_key(session_name: str, connection_id: str) -> str:
+    return f"{session_name}\x00{connection_id}"
+
+
+def _ssh_read_ide_state(session_name: str, connection_id: str) -> dict:
+    data = _ssh_ide_state_store().read()
+    workspaces = data.get("workspaces") if isinstance(data, dict) else {}
+    entry = workspaces.get(_ssh_ide_state_key(session_name, connection_id)) if isinstance(workspaces, dict) else None
+    if not isinstance(entry, dict):
+        return {"tabs": [], "active_path": "", "last_directory": ".", "buffers": {}}
+    return {
+        "tabs": entry.get("tabs") or [],
+        "active_path": str(entry.get("active_path") or ""),
+        "last_directory": str(entry.get("last_directory") or "."),
+        "buffers": entry.get("buffers") or {},
+        "updated_at": entry.get("updated_at"),
+    }
+
+
+def _ssh_write_ide_state(session_name: str, connection_id: str, state: dict) -> None:
+    def mutate(data: dict) -> None:
+        workspaces = data.setdefault("workspaces", {})
+        workspaces[_ssh_ide_state_key(session_name, connection_id)] = state
+
+    _ssh_ide_state_store().update(mutate)
+    _harden_ssh_state_file(SSH_IDE_STATE_FILE)
 
 
 def _normalized_remote_path(value: str) -> str | None:
@@ -11058,9 +11243,10 @@ class SSHGitBody(BaseModel):
 
 
 def _ssh_ide_denied(request: Request) -> JSONResponse | None:
-    if _require_ssh_ide_admin(request):
+    """Any signed-in user may reach the IDE; per-connection ownership gates use."""
+    if _current_user(request):
         return None
-    return JSONResponse({"error": "SSH IDE is restricted to dashboard administrators"}, status_code=403)
+    return JSONResponse({"error": "Sign in to use the Remote SSH IDE"}, status_code=403)
 
 
 def _ssh_ide_session_or_response(
@@ -11081,7 +11267,8 @@ async def api_list_ssh_connections(request: Request, session_name: str):
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    return JSONResponse({"connections": [_ssh_public_profile(item) for item in _ssh_profiles(session_name)]})
+    profiles = _ssh_profiles(session_name, _current_user(request))
+    return JSONResponse({"connections": [_ssh_public_profile(item) for item in profiles]})
 
 
 @app.post("/api/sessions/{session_name}/ide/ssh-connections")
@@ -11113,8 +11300,15 @@ async def api_create_ssh_connection(request: Request, session_name: str, body: S
         return JSONResponse({"error": "Enter a valid remote workspace root"}, status_code=400)
     if not 1_024 <= body.max_file_bytes <= SSH_MAX_FILE_BYTES:
         return JSONResponse({"error": "File limit must be between 1 KB and 1 MB"}, status_code=400)
+    user = _current_user(request)
+    # The id is the AES-GCM AAD, so it must exist before the secret is sealed.
+    connection_id = secrets.token_urlsafe(12)
+    try:
+        password_enc = _ssh_vault_encrypt(body.password, connection_id)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
     profile = {
-        "id": secrets.token_urlsafe(12),
+        "id": connection_id,
         "session_name": session_name,
         "label": label,
         "host": host,
@@ -11124,12 +11318,18 @@ async def api_create_ssh_connection(request: Request, session_name: str, body: S
         "auth_mode": auth_mode,
         "workspace_root": workspace_root,
         "max_file_bytes": body.max_file_bytes,
+        "owner_id": str((user or {}).get("id") or ""),
+        "owner_username": str((user or {}).get("username") or ""),
+        "password_enc": password_enc,
+        "last_directory": ".",
+        "created_at": time.time(),
     }
 
     def add(data: dict):
         data.setdefault("connections", []).append(profile)
 
     _ssh_connections_store().update(add)
+    _harden_ssh_state_file(SSH_CONNECTIONS_FILE)
     return JSONResponse({"ok": True, "connection": _ssh_public_profile(profile)}, status_code=201)
 
 
@@ -11139,19 +11339,32 @@ async def api_delete_ssh_connection(request: Request, session_name: str, connect
     if error:
         return error
 
+    user = _current_user(request)
+
     def remove(data: dict) -> bool:
         profiles = data.setdefault("connections", [])
-        before = len(profiles)
         data["connections"] = [
             item
             for item in profiles
-            if not (item.get("id") == connection_id and item.get("session_name") == session_name)
+            if not (
+                item.get("id") == connection_id
+                and item.get("session_name") == session_name
+                and _ssh_user_may_use_profile(user, item)
+            )
         ]
-        return len(data["connections"]) != before
+        return len(data["connections"]) != len(profiles)
 
     _data, removed = _ssh_connections_store().update(remove)
     if not removed:
         return JSONResponse({"error": "SSH connection not found"}, status_code=404)
+    _harden_ssh_state_file(SSH_CONNECTIONS_FILE)
+
+    # Deleting the connection must also drop its stored buffers; leaving them
+    # behind would outlive the credential that justified keeping them.
+    def drop_state(data: dict) -> None:
+        data.setdefault("workspaces", {}).pop(_ssh_ide_state_key(session_name, connection_id), None)
+
+    _ssh_ide_state_store().update(drop_state)
     return JSONResponse({"ok": True})
 
 
@@ -11165,31 +11378,151 @@ async def api_connect_ssh_connection(
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
+    # A password supplied in the request wins (rotation / first use); otherwise
+    # fall back to the stored credential so a resumed session reconnects without
+    # prompting anyone.
+    supplied = (body.password if body else "") or ""
     try:
-        await asyncio.to_thread(_ssh_start_control_master, profile, session_name, password=(body.password if body else ""))
+        stored = _ssh_vault_decrypt(
+            str(profile.get("password_enc") or ""), str(profile.get("id") or "")
+        )
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    password = supplied or stored
+    try:
+        await asyncio.to_thread(_ssh_start_control_master, profile, session_name, password=password)
         await _record_ssh_ide_audit(request, session_name, profile, "connect_requested")
         window_name = await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name)
-        return JSONResponse({"ok": True, "connected": True, "window_name": window_name})
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
+    # Persist a freshly supplied password only after it actually authenticated,
+    # so a typo never overwrites a working stored credential.
+    if supplied and supplied != stored:
+        _ssh_update_profile(
+            session_name,
+            connection_id,
+            {"password_enc": _ssh_vault_encrypt(supplied, connection_id)},
+        )
+    return JSONResponse({"ok": True, "connected": True, "window_name": window_name})
 
 
 @app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/status")
-async def api_ssh_connection_status(request: Request, session_name: str, connection_id: str):
+async def api_ssh_connection_status(
+    request: Request, session_name: str, connection_id: str, reconnect: bool = False
+):
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     try:
         connected = await asyncio.to_thread(_ssh_control_is_alive, profile, session_name)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
-    return JSONResponse({"connected": connected, "window_name": _ssh_tmux_window_name(profile) if connected else ""})
+    # Auto-reconnect: a stored credential lets a dropped control master come back
+    # without user action. Failure is reported as "needs reconnect", not a 502,
+    # because the IDE polls this and a dead host should not surface as an error.
+    reconnected = False
+    if not connected and reconnect and str(profile.get("password_enc") or ""):
+        try:
+            password = _ssh_vault_decrypt(
+                str(profile.get("password_enc") or ""), str(profile.get("id") or "")
+            )
+            await asyncio.to_thread(
+                _ssh_start_control_master, profile, session_name, password=password
+            )
+            await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name)
+            await _record_ssh_ide_audit(request, session_name, profile, "auto_reconnected")
+            connected = reconnected = True
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            logger.info("Auto-reconnect failed for SSH connection %s", connection_id, exc_info=True)
+    return JSONResponse({
+        "connected": connected,
+        "reconnected": reconnected,
+        "window_name": _ssh_tmux_window_name(profile) if connected else "",
+    })
+
+
+class SSHWorkspaceStateBody(BaseModel):
+    tabs: list[str] = []
+    active_path: str = ""
+    last_directory: str = "."
+    buffers: dict[str, str] = {}
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/workspace")
+async def api_get_ssh_workspace_state(request: Request, session_name: str, connection_id: str):
+    """Return everything needed to resume this workspace where it was left."""
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    state = _ssh_read_ide_state(session_name, connection_id)
+    return JSONResponse({
+        "connection": _ssh_public_profile(profile),
+        "tabs": state.get("tabs") or [],
+        "active_path": state.get("active_path") or "",
+        "last_directory": state.get("last_directory") or str(profile.get("last_directory") or "."),
+        "buffers": state.get("buffers") or {},
+    })
+
+
+@app.put("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/workspace")
+async def api_save_ssh_workspace_state(
+    request: Request, session_name: str, connection_id: str, body: SSHWorkspaceStateBody
+):
+    """Persist tabs, focus, directory, and unsaved buffers for later resume."""
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    if len(body.tabs) > 50:
+        return JSONResponse({"error": "Too many open tabs to persist"}, status_code=400)
+    tabs: list[str] = []
+    for tab in body.tabs:
+        normalized = _normalized_workspace_path(profile, tab)
+        if normalized is None:
+            return JSONResponse({"error": "Invalid tab path"}, status_code=400)
+        if normalized not in tabs:
+            tabs.append(normalized)
+    active_path = ""
+    if body.active_path:
+        active_path = _normalized_workspace_path(profile, body.active_path) or ""
+    last_directory = _normalized_workspace_path(profile, body.last_directory)
+    if last_directory is None:
+        return JSONResponse({"error": "Invalid last directory"}, status_code=400)
+    # Unsaved buffers hold real remote file content, so they are bounded here and
+    # written to a 0600 file rather than kept unlimited.
+    buffers: dict[str, str] = {}
+    total = 0
+    for raw_path, content in list(body.buffers.items())[:50]:
+        normalized = _normalized_workspace_path(profile, raw_path)
+        if normalized is None:
+            return JSONResponse({"error": "Invalid buffer path"}, status_code=400)
+        text = content or ""
+        total += len(text.encode("utf-8"))
+        if total > SSH_MAX_UNSAVED_STATE_BYTES:
+            return JSONResponse(
+                {"error": "Unsaved editor content is too large to preserve"}, status_code=413
+            )
+        buffers[normalized] = text
+    _ssh_write_ide_state(session_name, connection_id, {
+        "tabs": tabs,
+        "active_path": active_path,
+        "last_directory": last_directory,
+        "buffers": buffers,
+        "updated_at": time.time(),
+    })
+    _ssh_update_profile(session_name, connection_id, {"last_directory": last_directory})
+    return JSONResponse({"ok": True, "tabs": tabs, "active_path": active_path, "last_directory": last_directory})
 
 
 @app.post("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/focus-terminal")
@@ -11197,7 +11530,7 @@ async def api_focus_ssh_terminal(request: Request, session_name: str, connection
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     try:
@@ -11211,9 +11544,14 @@ async def api_focus_ssh_terminal(request: Request, session_name: str, connection
 
 
 def _ssh_profile_or_response(
-    session_name: str, connection_id: str
+    request: Request, session_name: str, connection_id: str
 ) -> tuple[dict | None, JSONResponse | None]:
-    profile = _ssh_profile(session_name, connection_id)
+    """Resolve a connection the caller owns.
+
+    A connection belonging to someone else returns 404, not 403, so the response
+    does not confirm that another user's connection id exists.
+    """
+    profile = _ssh_profile(session_name, connection_id, _current_user(request))
     if not profile:
         return None, JSONResponse({"error": "SSH connection not found"}, status_code=404)
     return profile, None
@@ -11226,7 +11564,7 @@ async def api_search_ssh_files(
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     remote_path = _normalized_workspace_path(profile, path)
@@ -11255,7 +11593,7 @@ async def api_ssh_lsp_status(request: Request, session_name: str, connection_id:
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     try:
@@ -11272,7 +11610,7 @@ async def api_list_ssh_files(request: Request, session_name: str, connection_id:
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     remote_path = _normalized_workspace_path(profile, path)
@@ -11293,7 +11631,7 @@ async def api_get_ssh_file(request: Request, session_name: str, connection_id: s
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     remote_path = _normalized_workspace_path(profile, path)
@@ -11316,7 +11654,7 @@ async def api_save_ssh_file(
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     remote_path = _normalized_workspace_path(profile, body.path)
@@ -11349,7 +11687,7 @@ async def api_manage_ssh_filesystem(
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     if body.action not in {"create_file", "create_dir", "rename", "delete"}:
@@ -11387,7 +11725,7 @@ async def api_manage_ssh_git(
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
-    profile, error = _ssh_profile_or_response(session_name, connection_id)
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
     if body.action not in {"status", "diff", "stage", "unstage", "commit", "switch", "create_branch"}:
@@ -20114,9 +20452,9 @@ body.member-simple .hide-in-simple{display:none!important}
       <label>Label</label><input id="ide-conn-label" maxlength="80" placeholder="Production API">
       <div class="ide-dialog-grid"><div><label>Host</label><input id="ide-conn-host" required placeholder="server.example.com"></div><div><label>Port</label><input id="ide-conn-port" type="number" min="1" max="65535" value="22"></div></div>
       <label>Username</label><input id="ide-conn-user" required placeholder="deploy">
-      <label>Authentication</label><select id="ide-conn-auth" onchange="ideAuthModeChanged()"><option value="agent">SSH agent</option><option value="key">Existing SSH key</option><option value="password">Password (session only)</option></select>
+      <label>Authentication</label><select id="ide-conn-auth" onchange="ideAuthModeChanged()"><option value="agent">SSH agent</option><option value="key">Existing SSH key</option><option value="password">Password (saved, encrypted)</option></select>
       <div id="ide-conn-key-wrap"><label>Identity file (for key authentication)</label><input id="ide-conn-key" placeholder="~/.ssh/id_ed25519"></div>
-      <div id="ide-conn-password-wrap" style="display:none"><label>Password (not saved)</label><input id="ide-conn-password" type="password" autocomplete="new-password"></div>
+      <div id="ide-conn-password-wrap" style="display:none"><label>Password (stored encrypted for resume)</label><input id="ide-conn-password" type="password" autocomplete="new-password"></div>
       <label>Workspace root</label><input id="ide-conn-workspace" value="." placeholder="/srv/app">
       <label>Maximum file size (KB)</label><input id="ide-conn-max-file-kb" type="number" min="1" max="1000" value="1000">
       <div class="ide-dialog-note">Uses an SSH agent, a key already under <code>~/.ssh</code>, or a password held only while the session connection is established. Pasted private keys are not accepted. The host must already be trusted in <code>known_hosts</code>.</div>
@@ -25870,6 +26208,10 @@ function ideSavedWorkspace(){try{const raw=localStorage.getItem(ideWorkspaceKey(
 function ideRememberWorkspace(){
   const key=ideWorkspaceKey();if(!key)return;const active=ideActiveTab();
   try{localStorage.setItem(key,JSON.stringify({path:_ide.path||'.',tabs:_ide.tabs.map(tab=>tab.path).slice(0,12),active:active?active.path:''}));}catch(error){}
+  // Mirror to the server, debounced: this can carry unsaved buffers, so it must
+  // not fire on every keystroke.
+  if(_ide.persistTimer)clearTimeout(_ide.persistTimer);
+  _ide.persistTimer=setTimeout(()=>{idePersistWorkspace();},1500);
 }
 function ideActiveConnection(){return _ide.connections.find(c=>c.id===_ide.connectionId)||null}
 function ideActiveTab(){return _ide.tabs.find(tab=>tab.key===_ide.active)||null}
@@ -26001,16 +26343,45 @@ async function ideSelectConnection(connectionId){
   _ide.connectionId=connectionId||'';_ide.path='.';_ide.root='';_ide.selectedPath='';_ide.tree={};_ide.expanded={};_ide.treeLoading={};_ide.tabs.forEach(tab=>{if(tab.model)tab.model.dispose()});_ide.tabs=[];_ide.active='';ideRenderTabs();
   if(_ide.connectionId)await ideRefreshConnectionStatus();else{ideRenderFiles([]);ideSetStatus('No SSH connection selected','No file open');ideSetConnectionState('','No SSH connection');}
 }
+async function ideServerWorkspace(){
+  // Server state is authoritative so a resumed session survives a browser change
+  // or a dashboard restart; localStorage is only a fast local fallback.
+  if(!_ide.connectionId)return null;
+  try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/workspace'));
+    if(!response.ok)return null;return await response.json();}catch(error){return null}
+}
+async function idePersistWorkspace(){
+  if(!_ide.connectionId)return;
+  const buffers={};
+  for(const tab of _ide.tabs){if(tab&&tab.dirty&&tab.model)buffers[tab.path]=tab.model.getValue();}
+  const active=_ide.tabs.find(item=>item.key===_ide.activeKey);
+  try{await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/workspace'),{
+    method:'PUT',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({tabs:_ide.tabs.map(item=>item.path).slice(0,50),active_path:(active&&active.path)||'',last_directory:_ide.path||'.',buffers})});
+  }catch(error){/* resume state is best-effort; never block the editor */}
+}
 async function ideRestoreWorkspace(){
-  const key=ideWorkspaceKey();if(!key)return;const saved=ideSavedWorkspace();
+  const key=ideWorkspaceKey();if(!key)return;
+  const remote=await ideServerWorkspace();const local=ideSavedWorkspace();
+  const saved=remote?{path:remote.last_directory,tabs:remote.tabs,active:remote.active_path}:local;
+  const buffers=(remote&&remote.buffers)||{};
   if(_ide.restoredKey===key){await ideRefreshFiles((saved&&saved.path)||'.');return;}
   _ide.restoredKey=key;await ideRefreshFiles((saved&&saved.path)||'.');
-  for(const path of ((saved&&Array.isArray(saved.tabs)&&saved.tabs)||[]).slice(0,12))await ideOpenFile(path);
+  for(const path of ((saved&&Array.isArray(saved.tabs)&&saved.tabs)||[]).slice(0,12)){
+    await ideOpenFile(path);
+    // Reapply an unsaved buffer over the freshly read remote file, and keep the
+    // tab marked dirty so the user still sees there is work to save.
+    if(Object.prototype.hasOwnProperty.call(buffers,path)){
+      const tab=_ide.tabs.find(item=>item.path===path);
+      if(tab&&tab.model&&buffers[path]!==tab.model.getValue()){tab.model.setValue(buffers[path]);tab.dirty=true;}
+    }
+  }
+  ideRenderTabs();
   const active=(saved&&saved.active)||'';const tab=_ide.tabs.find(item=>item.path===active);if(tab)await ideSelectTab(tab.key);
 }
 async function ideRefreshConnectionStatus(){
   if(!_ide.connectionId)return;const connection=ideActiveConnection()||{};
-  try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/status'));const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not check SSH connection');if(data.connected){ideSetConnectionState('connected','● Connected');ideSetStatus('Connected · '+(connection.label||'SSH workspace'),'SSH terminal: '+(data.window_name||'open'));await ideRefreshLspStatus();await ideRestoreWorkspace();}else{ideSetConnectionState('reconnect','● Reconnect required');ideSetLspStatus('Language services: reconnect required');ideRenderFiles([]);ideSetStatus('Reconnect required · '+(connection.label||'SSH workspace'),'Select Connect to reopen SSH');}}
+  try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/status?reconnect=1'));const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not check SSH connection');if(data.connected){ideSetConnectionState('connected','● Connected');ideSetStatus('Connected · '+(connection.label||'SSH workspace'),'SSH terminal: '+(data.window_name||'open'));await ideRefreshLspStatus();await ideRestoreWorkspace();}else{ideSetConnectionState('reconnect','● Reconnect required');ideSetLspStatus('Language services: reconnect required');ideRenderFiles([]);ideSetStatus('Reconnect required · '+(connection.label||'SSH workspace'),(connection.has_password?'Auto-reconnect failed — select Connect to retry':'Select Connect to reopen SSH'));}}
   catch(error){ideSetConnectionState('error','● Connection error');ideRenderFiles([]);ideSetStatus(error.message||'Could not check SSH connection');}
 }
 async function ideRefreshLspStatus(){
@@ -26111,7 +26482,7 @@ async function ideOpenFile(path){
     if(!tab){
       const model=monaco.editor.createModel(data.content||'',ideLanguage(data.path));
       tab={key,path:data.path,content:data.content||'',saved:data.content||'',dirty:false,model};
-      model.onDidChangeContent(()=>{tab.content=model.getValue();tab.dirty=tab.content!==tab.saved;if(_ide.active===tab.key)ideSetStatus(tab.dirty?'Unsaved changes':'Saved',tab.path);ideRenderTabs();});
+      model.onDidChangeContent(()=>{tab.content=model.getValue();tab.dirty=tab.content!==tab.saved;if(_ide.active===tab.key)ideSetStatus(tab.dirty?'Unsaved changes':'Saved',tab.path);ideRenderTabs();ideRememberWorkspace();});
       _ide.tabs.push(tab);
     }
     await ideSelectTab(tab.key);

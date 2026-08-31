@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import stat
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1253,14 +1254,226 @@ class TestSshIdeEndpoints:
         assert "editor.action.startFindReplaceAction" in html
         assert "editor.action.gotoLine" in html
 
-    def test_routes_are_admin_only(self, authed_client):
+    def test_members_never_see_another_users_connection(self, authed_client, tmp_path, monkeypatch):
+        """Connections are per-owner: a member sees only their own, and a
+        connection owned by someone else is 404 (not 403) so the response never
+        confirms that another user's connection id exists."""
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "SSH_VAULT_KEY_FILE", tmp_path / "ssh-vault.key")
+        monkeypatch.setattr(app_module, "_ssh_vault_key_cache", None)
+        monkeypatch.setattr(
+            app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}]
+        )
+
+        app_module._ssh_connections_store().update(
+            lambda data: data.setdefault("connections", []).extend([
+                {"id": "owned-by-alice", "session_name": "test-session", "label": "Alice box",
+                 "host": "a.example.com", "username": "alice", "port": 22, "owner_id": "alice"},
+                {"id": "owned-by-bob", "session_name": "test-session", "label": "Bob box",
+                 "host": "b.example.com", "username": "bob", "port": 22, "owner_id": "bob"},
+            ])
+        )
+
         with (
-            patch("app._current_user", return_value={"id": "member", "role": "member"}),
+            patch("app._current_user", return_value={"id": "bob", "role": "member"}),
             patch("app._user_can_access_session", return_value=True),
         ):
-            response = authed_client.get("/api/sessions/test-session/ide/ssh-connections")
+            listed = authed_client.get("/api/sessions/test-session/ide/ssh-connections")
+            other = authed_client.get(
+                "/api/sessions/test-session/ide/ssh-connections/owned-by-alice/workspace"
+            )
+            deleted = authed_client.delete(
+                "/api/sessions/test-session/ide/ssh-connections/owned-by-alice"
+            )
 
-        assert response.status_code == 403
+        assert listed.status_code == 200
+        ids = [item["id"] for item in listed.json()["connections"]]
+        assert ids == ["owned-by-bob"]
+        assert other.status_code == 404
+        assert deleted.status_code == 404
+
+    def _ssh_env(self, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(app_module, "SSH_IDE_STATE_FILE", tmp_path / "ssh-ide-state.json")
+        monkeypatch.setattr(app_module, "SSH_VAULT_KEY_FILE", tmp_path / "ssh-vault.key")
+        monkeypatch.setattr(app_module, "_ssh_vault_key_cache", None)
+        monkeypatch.delenv("TMUX_DASH_SSH_KEY", raising=False)
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        return app_module
+
+    def test_stored_password_is_encrypted_on_disk_and_never_returned(
+        self, authed_client, tmp_path, monkeypatch
+    ):
+        """Credentials persist for resume, but only as ciphertext, and no API
+        response or state file may contain the plaintext."""
+        app_module = self._ssh_env(tmp_path, monkeypatch)
+
+        created = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={
+                "label": "Prod", "host": "example.com", "username": "deploy",
+                "port": 22, "auth_mode": "password", "password": "s3cr3t-p@ss",
+            },
+        )
+        assert created.status_code == 201
+        assert "s3cr3t-p@ss" not in created.text
+        assert created.json()["connection"]["has_password"] is True
+
+        listed = authed_client.get("/api/sessions/test-session/ide/ssh-connections")
+        assert "s3cr3t-p@ss" not in listed.text
+        for field in app_module._SSH_SECRET_FIELDS:
+            assert field not in listed.text
+
+        raw = (tmp_path / "ssh-connections.json").read_text()
+        assert "s3cr3t-p@ss" not in raw
+        assert "password_enc" in raw
+
+        stored = json.loads(raw)["connections"][0]
+        assert app_module._ssh_vault_decrypt(stored["password_enc"], stored["id"]) == "s3cr3t-p@ss"
+
+    def test_connection_state_file_is_private(self, authed_client, tmp_path, monkeypatch):
+        self._ssh_env(tmp_path, monkeypatch)
+
+        authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"label": "Prod", "host": "example.com", "username": "deploy",
+                  "port": 22, "auth_mode": "password", "password": "s3cr3t"},
+        )
+
+        mode = stat.S_IMODE((tmp_path / "ssh-connections.json").stat().st_mode)
+        assert mode == 0o600
+
+    def test_workspace_state_round_trips_for_resume(self, authed_client, tmp_path, monkeypatch):
+        """Tabs, focus, directory, and unsaved buffers survive so a session resumes."""
+        self._ssh_env(tmp_path, monkeypatch)
+
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"label": "Prod", "host": "example.com", "username": "deploy", "port": 22},
+        ).json()["connection"]["id"]
+        base = f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/workspace"
+
+        saved = authed_client.put(base, json={
+            "tabs": ["src/main.py", "README.md"],
+            "active_path": "src/main.py",
+            "last_directory": "src",
+            "buffers": {"src/main.py": "print('unsaved work')"},
+        })
+        assert saved.status_code == 200
+
+        restored = authed_client.get(base).json()
+        assert restored["tabs"] == ["src/main.py", "README.md"]
+        assert restored["active_path"] == "src/main.py"
+        assert restored["last_directory"] == "src"
+        assert restored["buffers"]["src/main.py"] == "print('unsaved work')"
+
+    def test_workspace_state_rejects_paths_outside_the_root(
+        self, authed_client, tmp_path, monkeypatch
+    ):
+        self._ssh_env(tmp_path, monkeypatch)
+
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"label": "Prod", "host": "example.com", "username": "deploy", "port": 22},
+        ).json()["connection"]["id"]
+        base = f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/workspace"
+
+        for payload in (
+            {"tabs": ["../../etc/passwd"]},
+            {"tabs": [], "last_directory": "../.."},
+            {"tabs": [], "buffers": {"/etc/passwd": "x"}},
+        ):
+            assert authed_client.put(base, json=payload).status_code == 400
+
+    def test_oversized_unsaved_buffers_are_refused(self, authed_client, tmp_path, monkeypatch):
+        self._ssh_env(tmp_path, monkeypatch)
+
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"label": "Prod", "host": "example.com", "username": "deploy", "port": 22},
+        ).json()["connection"]["id"]
+
+        response = authed_client.put(
+            f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/workspace",
+            json={"tabs": [], "buffers": {"big.txt": "x" * 3_000_000}},
+        )
+        assert response.status_code == 413
+
+    def test_deleting_a_connection_purges_its_stored_buffers(
+        self, authed_client, tmp_path, monkeypatch
+    ):
+        """Stored remote content must not outlive the connection it came from."""
+        self._ssh_env(tmp_path, monkeypatch)
+
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"label": "Prod", "host": "example.com", "username": "deploy", "port": 22},
+        ).json()["connection"]["id"]
+        authed_client.put(
+            f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/workspace",
+            json={"tabs": ["secret.txt"], "buffers": {"secret.txt": "confidential-content"}},
+        )
+        assert "confidential-content" in (tmp_path / "ssh-ide-state.json").read_text()
+
+        authed_client.delete(f"/api/sessions/test-session/ide/ssh-connections/{connection_id}")
+        assert "confidential-content" not in (tmp_path / "ssh-ide-state.json").read_text()
+
+    def test_reconnect_uses_the_stored_credential_without_a_prompt(
+        self, authed_client, tmp_path, monkeypatch
+    ):
+        """Resume works with no password in the request: the stored one is used."""
+        app_module = self._ssh_env(tmp_path, monkeypatch)
+
+        connection_id = authed_client.post(
+            "/api/sessions/test-session/ide/ssh-connections",
+            json={"label": "Prod", "host": "example.com", "username": "deploy",
+                  "port": 22, "auth_mode": "password", "password": "stored-pass"},
+        ).json()["connection"]["id"]
+
+        seen = {}
+
+        def fake_master(profile, session_name, *, password=""):
+            seen["password"] = password
+            return tmp_path / "sock"
+
+        monkeypatch.setattr(app_module, "_ssh_start_control_master", fake_master)
+        monkeypatch.setattr(app_module, "_ssh_open_tmux_window", lambda *a, **k: "ssh:Prod")
+
+        response = authed_client.post(
+            f"/api/sessions/test-session/ide/ssh-connections/{connection_id}/connect",
+            json={},
+        )
+
+        assert response.status_code == 200
+        assert seen["password"] == "stored-pass"
+        assert "stored-pass" not in response.text
+
+    def test_admin_retains_access_to_member_connections(self, authed_client, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_CONNECTIONS_FILE", tmp_path / "ssh-connections.json")
+        monkeypatch.setattr(
+            app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}]
+        )
+        app_module._ssh_connections_store().update(
+            lambda data: data.setdefault("connections", []).append(
+                {"id": "owned-by-alice", "session_name": "test-session", "label": "Alice box",
+                 "host": "a.example.com", "username": "alice", "port": 22, "owner_id": "alice"}
+            )
+        )
+
+        with (
+            patch("app._current_user", return_value={"id": "admin", "role": "admin"}),
+            patch("app._user_can_access_session", return_value=True),
+        ):
+            listed = authed_client.get("/api/sessions/test-session/ide/ssh-connections")
+
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()["connections"]] == ["owned-by-alice"]
 
     def test_create_list_and_delete_connection_metadata(self, authed_client, tmp_path, monkeypatch):
         import app as app_module
@@ -1350,7 +1563,7 @@ class TestSshIdeEndpoints:
             )
 
         assert status.status_code == 200
-        assert status.json() == {"connected": False, "window_name": ""}
+        assert status.json() == {"connected": False, "reconnected": False, "window_name": ""}
 
     def test_focus_terminal_selects_session_ssh_window(self, authed_client, tmp_path, monkeypatch):
         import app as app_module

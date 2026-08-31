@@ -19,10 +19,18 @@
 ## Authentication
 
 - [x] Add an authentication-mode selector: password, SSH agent, or existing key path.
-- [x] Pass a password only while establishing the connection; never persist it in profiles, logs, commands, or environment files.
+- [x] Keep passwords out of logs, command lines, and environment files; the only persisted copy is the AES-256-GCM ciphertext in the connection store.
 - [x] Support existing keys from `~/.ssh` and SSH agent identities.
 - [x] Do not support pasted private keys; use an SSH agent or an existing key under `~/.ssh` so browser-submitted private-key material is never accepted.
-- [x] Add tests proving credential fields are absent from persisted profile data and API responses.
+- [x] Store passwords encrypted at rest (AES-256-GCM, AAD-bound to the connection id) so a workspace resumes after a restart.
+- [x] Add tests proving plaintext credentials never reach API responses or the state file.
+
+## Session resume
+
+- [x] Persist last directory, open tabs, and active file server-side so a resume survives a browser change or restart.
+- [x] Persist unsaved editor buffers (bounded, 0600) and restore them as dirty tabs.
+- [x] Auto-reconnect a dead control master on open using the stored credential.
+- [x] Purge stored buffers when a connection is deleted.
 
 ## Remote IDE UX
 
@@ -41,7 +49,8 @@
 
 ## Security and verification
 
-- [ ] Keep the connector admin-only until session-specific credential ownership and sharing rules exist.
+- [x] Replace the admin-only gate with per-owner ownership: creator + admins may use a connection; others get 404 so existence is not disclosed.
+- [ ] Document key-management guidance for `TMUX_DASH_SSH_KEY` in the deployment runbook.
 - [x] Add private, credential-free audit events for connect/reconnect, remote list/read/write, filesystem changes, and terminal launch/focus.
 - [x] Add a configurable workspace root and 1 KB–1 MB file limit per connection; accept only relative paths and enforce the root locally and after remote symlink resolution.
 - [ ] Test against a disposable SSH server for password, agent/key, reconnect, and failed-host-key cases.
