@@ -117,12 +117,18 @@ Operational requirements:
 
 ### P3 — Developer tooling
 
-Still missing, in rough priority order: an interactive browser terminal
-(today's "Terminal" only runs `tmux select-window` on the dashboard host, so
-a remote user sees nothing happen -- a real one needs a WebSocket PTY
-bridge), the command palette and Monaco find/replace, a rendered diff view,
-file upload/download, and content search (today's search matches filenames
-only).
+The browser terminal is implemented: `/ws/sessions/{session}/ide/terminal/
+{connection}` attaches a PTY to the session's existing `ssh:<host>` tmux
+window, so the browser view and the tmux window are the same shell over the
+same authenticated control master -- not a second SSH login. Keystrokes are
+binary frames and resizes are JSON text frames, so typed input can never be
+parsed as a control message. Resizing sends SIGWINCH as well as TIOCSWINSZ,
+because the tmux client only re-reads its size on that signal. Detaching
+terminates only the tmux client, never the window.
+
+Still missing, in rough priority order: the command palette and Monaco
+find/replace, a rendered diff view, file upload/download, and content search
+(today's search matches filenames only).
 
 - Add a constrained remote terminal with a visible command audit trail.
 - Add Git status, diff, stage, commit, and branch views.

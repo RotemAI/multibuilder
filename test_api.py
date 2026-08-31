@@ -3,6 +3,7 @@ import json
 import os
 import re
 import stat
+import struct
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +16,7 @@ os.environ.setdefault("TMUX_DASH_USER", "admin")
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-not-real")
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app import AUTH_COOKIE, AUTH_PASS, AUTH_USER, _make_token, app
 
@@ -1373,6 +1375,83 @@ class TestSshIdeEndpoints:
         monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
 
         assert authed_client.get("/api/sessions/other-session/ide/chat").status_code == 404
+
+    def test_terminal_websocket_rejects_unowned_connection(self, authed_client, monkeypatch):
+        """The PTY bridge is the most powerful IDE route, so it must refuse a
+        connection the caller does not own -- and refuse it without revealing
+        whether that connection exists."""
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        monkeypatch.setattr(app_module, "_user_can_access_session", lambda user, name: True)
+        # Ownership filtering makes another user's connection invisible.
+        monkeypatch.setattr(app_module, "_ssh_profile", lambda s, c, user=None: None)
+
+        with pytest.raises(WebSocketDisconnect):
+            with authed_client.websocket_connect(
+                "/ws/sessions/test-session/ide/terminal/someone-elses"
+            ):
+                pass
+
+    def test_terminal_websocket_rejects_inaccessible_session(self, authed_client, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        monkeypatch.setattr(app_module, "_user_can_access_session", lambda user, name: False)
+
+        with pytest.raises(WebSocketDisconnect):
+            with authed_client.websocket_connect(
+                "/ws/sessions/test-session/ide/terminal/conn-1"
+            ):
+                pass
+
+    def test_terminal_websocket_refuses_a_dead_control_master(self, authed_client, monkeypatch):
+        """Attaching to a window whose SSH transport is gone would hand the user
+        a dead shell, so the socket closes instead."""
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        monkeypatch.setattr(app_module, "_user_can_access_session", lambda user, name: True)
+        monkeypatch.setattr(
+            app_module, "_ssh_profile", lambda s, c, user=None: {"id": c, "label": "Demo"}
+        )
+        monkeypatch.setattr(app_module, "_ssh_control_is_alive", lambda p, s: False)
+
+        with pytest.raises(WebSocketDisconnect):
+            with authed_client.websocket_connect(
+                "/ws/sessions/test-session/ide/terminal/conn-1"
+            ):
+                pass
+
+    def test_terminal_attach_is_audited_as_a_browser_pty(self, tmp_path, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "SSH_IDE_AUDIT_FILE", tmp_path / "audit.jsonl")
+        entry = app_module._append_ssh_ide_audit(
+            {"id": "u1", "username": "alice"},
+            "test-session",
+            {"id": "c1", "label": "Prod"},
+            "terminal_attached",
+        )
+
+        assert entry["terminal_mode"] == "browser_pty_attach"
+        assert "password" not in json.dumps(entry).lower()
+
+    def test_pty_size_is_clamped_to_a_sane_range(self):
+        """A browser can report any size; the ioctl must not receive a value
+        that overflows the struct or collapses the view."""
+        import app as app_module
+
+        captured = []
+        with patch("app.fcntl.ioctl", side_effect=lambda fd, op, arg: captured.append(arg)):
+            app_module._ssh_set_pty_size(0, 99999, 99999)
+            app_module._ssh_set_pty_size(0, 0, 0)
+            app_module._ssh_set_pty_size(0, -5, -5)
+
+        sizes = [struct.unpack("HHHH", value)[:2] for value in captured]
+        assert sizes[0] == (200, 500)
+        assert sizes[1] == (24, 80)
+        assert sizes[2] == (5, 20)
 
     def _ssh_env(self, tmp_path, monkeypatch):
         import app as app_module

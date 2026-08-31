@@ -8,14 +8,17 @@
   import Tabs from './Tabs.svelte'
   import Chat from './Chat.svelte'
   import QuickOpen from './QuickOpen.svelte'
+  import Terminal from './Terminal.svelte'
   import {
-    Plus, Trash2, SquareTerminal, Circle, CircleDot, CircleCheck, CircleAlert, Files, GitBranch,
+    Plus, Trash2, SquareTerminal, ExternalLink, Circle, CircleDot, CircleCheck, CircleAlert,
+    Files, GitBranch,
   } from 'lucide-svelte'
 
   let { sessions = [], session = '', rootPath = '' } = $props()
 
   let sidebar = $state('files') // files | git
   let quickOpen = $state(false)
+  let showTerminal = $state(false)
   let showConnectionForm = $state(false)
   let password = $state('')
   let form = $state({
@@ -145,8 +148,15 @@
       {/if}
       <button class="primary" onclick={() => ide.connect(password)}>Connect</button>
     {:else}
-      <button onclick={focusTerminal} title="Focus the tmux SSH window">
+      <button
+        onclick={() => (showTerminal = !showTerminal)}
+        title="Open the SSH terminal in this browser"
+        class:active={showTerminal}
+      >
         <SquareTerminal size={14} /> Terminal
+      </button>
+      <button onclick={focusTerminal} title="Focus the tmux SSH window on the dashboard host">
+        <ExternalLink size={14} />
       </button>
     {/if}
   </header>
@@ -194,6 +204,13 @@
     <section class="code">
       <Tabs />
       <div class="editor-wrap"><Editor /></div>
+      {#if showTerminal && ide.connectionState === 'connected'}
+        <div class="terminal-wrap">
+          {#key ide.connectionId}
+            <Terminal {rootPath} {session} />
+          {/key}
+        </div>
+      {/if}
     </section>
 
     <aside class="chat-pane">
@@ -252,6 +269,8 @@
   .switch button.active { box-shadow: inset 0 -2px 0 var(--ide-accent); color: var(--ide-accent); }
   .code { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .editor-wrap { flex: 1; min-height: 0; }
+  .terminal-wrap { height: 38%; min-height: 120px; border-top: 1px solid var(--ide-border); }
+  button.active { border-color: var(--ide-accent); color: var(--ide-accent); }
   .chat-pane { min-width: 0; background: var(--ide-panel); border-left: 1px solid var(--ide-border); }
   .statusbar { display: flex; gap: 12px; align-items: center; padding: 4px 10px; background: var(--ide-panel); border-top: 1px solid var(--ide-border); font-size: 11px; color: var(--ide-muted); }
   .statusbar .detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

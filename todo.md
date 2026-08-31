@@ -62,6 +62,9 @@
 ## Developer tooling
 
 - [x] Add a constrained terminal launcher that focuses the session-owned tmux SSH window and records credential-free audit events.
+- [x] Add a real in-browser terminal: a WebSocket PTY bridge that attaches to
+      the session's existing SSH tmux window, with xterm.js, live resize, and
+      `browser_pty_attach` audit events.
 - [x] Add fixed-command Git status, diff, stage/unstage, commit, and branch switch/create controls over the session SSH bridge.
 - [x] Add Monaco search/replace, go-to-line, and Ctrl/Cmd+Shift+P command-palette shortcuts.
 - [ ] Evaluate remote language-server support and connect Monaco models where available.

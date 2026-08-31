@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import fcntl
 import hashlib
 import hmac
 import html
@@ -11,15 +12,18 @@ import json
 import logging
 import mimetypes
 import os
+import pty
 import re
 import secrets
 import select
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -10620,7 +10624,10 @@ def _append_ssh_ide_audit(user: dict, session_name: str, profile: dict, action: 
         "session_name": session_name,
         "connection_id": str(profile.get("id") or ""),
         "connection_label": str(profile.get("label") or ""),
-        "terminal_mode": "focus_existing_tmux_window" if action == "terminal_focus_requested" else "open_tmux_window",
+        "terminal_mode": {
+            "terminal_focus_requested": "focus_existing_tmux_window",
+            "terminal_attached": "browser_pty_attach",
+        }.get(action, "open_tmux_window"),
     }
     encoded = (json.dumps(entry, separators=(",", ":")) + "\n").encode("utf-8")
     with _ssh_ide_audit_lock:
@@ -11217,6 +11224,66 @@ print(json.dumps({'available': available, 'bridge': 'not-configured'}))
 """
 
 
+def _ssh_terminal_argv(profile: dict, session_name: str) -> list[str]:
+    """Attach a PTY to the session's existing SSH tmux window.
+
+    Attaching to the window the connect step already opened means the browser
+    terminal and the tmux window are the same shell, over the same authenticated
+    control master -- rather than a second SSH login with its own credentials.
+    `-r` is deliberately omitted: this view is interactive.
+    """
+    window_name = _ssh_tmux_window_name(profile)
+    return [
+        "tmux",
+        "attach-session",
+        "-t", f"{session_name}:{window_name}",
+    ]
+
+
+async def _ssh_terminal_pty(profile: dict, session_name: str, cols: int, rows: int):
+    """Spawn the tmux client on a PTY sized to the browser's terminal."""
+    primary, secondary = pty.openpty()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *_ssh_terminal_argv(profile, session_name),
+            stdin=secondary,
+            stdout=secondary,
+            stderr=secondary,
+            start_new_session=True,
+            env={**os.environ, "TERM": "xterm-256color"},
+        )
+    except BaseException:
+        os.close(primary)
+        os.close(secondary)
+        raise
+    # The child owns the secondary end; keeping it open here would stop us from
+    # ever seeing EOF when the shell exits.
+    os.close(secondary)
+    _ssh_set_pty_size(primary, cols, rows, process.pid)
+    return process, primary
+
+
+def _ssh_set_pty_size(fd: int, cols: int, rows: int, pid: int | None = None) -> None:
+    """Resize the PTY so full-screen remote programs render correctly.
+
+    Setting the window size alone is not enough: the tmux client only re-reads
+    it on SIGWINCH, so without the signal the remote view stays at whatever size
+    it had when it attached.
+    """
+    safe_cols = max(20, min(int(cols or 80), 500))
+    safe_rows = max(5, min(int(rows or 24), 200))
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", safe_rows, safe_cols, 0, 0))
+    except OSError:
+        logger.debug("Could not set SSH terminal PTY size", exc_info=True)
+        return
+    if pid:
+        try:
+            os.kill(pid, signal.SIGWINCH)
+        except (ProcessLookupError, PermissionError):
+            logger.debug("Could not signal SSH terminal resize", exc_info=True)
+
+
 class SSHConnectionBody(BaseModel):
     label: str = ""
     host: str
@@ -11304,6 +11371,113 @@ async def remote_ide_page(request: Request, session_name: str):
         f"<script type=\"module\" src=\"{ROOT_PATH}/static/ide/ide.js\"></script>"
         "</body></html>"
     )
+
+
+@app.websocket("/ws/sessions/{session_name}/ide/terminal/{connection_id}")
+async def ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: str):
+    """Bidirectional PTY bridge to the session's SSH tmux window.
+
+    Authorization mirrors the HTTP IDE routes: a valid token, access to the
+    session, and ownership of the connection. A connection the caller does not
+    own is closed as if it did not exist.
+    """
+    if AUTH_PASS and not _check_token(ws.cookies.get(AUTH_COOKIE)):
+        await ws.close(code=1008)
+        return
+    user = _current_user(ws)
+    if not user or not _user_can_access_session(user, session_name):
+        await ws.close(code=1008)
+        return
+    profile = _ssh_profile(session_name, connection_id, user)
+    if not profile:
+        await ws.close(code=1008)
+        return
+    if not await asyncio.to_thread(_ssh_control_is_alive, profile, session_name):
+        await ws.close(code=1011)
+        return
+
+    await ws.accept()
+    process = master_fd = None
+    loop = asyncio.get_running_loop()
+    try:
+        # The user is already resolved above; log directly rather than
+        # re-deriving it from a WebSocket via the HTTP-shaped helper.
+        try:
+            await asyncio.to_thread(
+                _append_ssh_ide_audit, user, session_name, profile, "terminal_attached"
+            )
+        except OSError:
+            logger.exception("Could not append SSH IDE terminal audit event")
+        process, master_fd = await _ssh_terminal_pty(profile, session_name, 80, 24)
+
+        async def pump_output():
+            """Forward PTY bytes to the browser without blocking the loop."""
+            reader = asyncio.StreamReader()
+            transport, _protocol = await loop.connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(reader), os.fdopen(master_fd, "rb", 0)
+            )
+            try:
+                while True:
+                    chunk = await reader.read(4096)
+                    if not chunk:
+                        return
+                    await ws.send_bytes(chunk)
+            finally:
+                transport.close()
+
+        async def pump_input():
+            """Forward keystrokes, and resize requests, from the browser."""
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    return
+                data = message.get("bytes")
+                if data:
+                    os.write(master_fd, data)
+                    continue
+                text = message.get("text")
+                if not text:
+                    continue
+                # Text frames carry control messages only; keystrokes are binary,
+                # so a resize can never be mistaken for typed input.
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    continue
+                if payload.get("type") == "resize":
+                    _ssh_set_pty_size(
+                        master_fd,
+                        payload.get("cols", 80),
+                        payload.get("rows", 24),
+                        process.pid,
+                    )
+
+        tasks = {asyncio.create_task(pump_output()), asyncio.create_task(pump_input())}
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning(
+            "SSH IDE terminal ended for '%s': %s: %s", session_name, type(exc).__name__, exc
+        )
+    finally:
+        # Detaching must not kill the tmux window: the same shell is still the
+        # user's SSH session, and other views may be attached to it.
+        if process and process.returncode is None:
+            try:
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                pass
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
 @app.get("/api/sessions/{session_name}/ide/chat")
