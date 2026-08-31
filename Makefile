@@ -1,4 +1,4 @@
-.PHONY: test test-fast coverage check lint lint-fix run run-dev backup backup-data restore-check install help
+.PHONY: test test-fast coverage check lint lint-fix run run-dev backup backup-data restore-check install ide ide-dev help
 
 PORT ?= 8501
 
@@ -17,6 +17,8 @@ help:
 	@echo "  make backup-data   Backup persistent data in ~/.tmux-dashboard/"
 	@echo "  make restore-check Verify persistent data files are readable JSON"
 	@echo "  make install       Install Python dependencies"
+	@echo "  make ide           Build the Svelte Remote IDE bundle"
+	@echo "  make ide-dev       Rebuild the IDE bundle on change"
 	@echo ""
 	@echo "Environment variables:"
 	@echo "  PORT               Server port (default: 8501)"
@@ -79,3 +81,11 @@ restore-check:
 
 install:
 	pip3 install -r requirements.txt
+
+# The Remote IDE is a Svelte app compiled into static/ide/. Deploying a
+# change to it needs this build step before restarting the service.
+ide:
+	cd ide-ui && npm ci && npm run build
+
+ide-dev:
+	cd ide-ui && npm run dev

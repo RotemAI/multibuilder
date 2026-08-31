@@ -1294,6 +1294,39 @@ class TestSshIdeEndpoints:
         assert other.status_code == 404
         assert deleted.status_code == 404
 
+    def test_ide_page_requires_an_owned_session(self, authed_client, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+
+        assert authed_client.get("/ide/test-session").status_code == 200
+        assert authed_client.get("/ide/not-a-session").status_code == 404
+
+    def test_ide_page_mounts_the_svelte_bundle(self, authed_client, monkeypatch):
+        """The shell must hand the bundle its session identity, not let the
+        browser choose one."""
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+
+        body = authed_client.get("/ide/test-session").text
+
+        assert 'id="ide-root"' in body
+        assert "__IDE_BOOTSTRAP__" in body
+        assert f'src="{app_module.ROOT_PATH}/static/ide/ide.js"' in body
+        assert f'href="{app_module.ROOT_PATH}/static/ide/ide.css"' in body
+        assert '"session": "test-session"' in body
+
+    def test_ide_page_escapes_the_session_name_in_the_title(self, authed_client, monkeypatch):
+        import app as app_module
+
+        hostile = 'x</title><script>alert(1)</script>'
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": hostile}])
+
+        body = authed_client.get(f"/ide/{hostile}").text
+
+        assert "<script>alert(1)</script>" not in body
+
     def _ssh_env(self, tmp_path, monkeypatch):
         import app as app_module
 

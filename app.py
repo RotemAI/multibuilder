@@ -5,6 +5,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import html
 import ipaddress
 import json
 import logging
@@ -44,6 +45,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import google_policy
@@ -1039,6 +1041,14 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
+
+# The Svelte Remote IDE bundle is built by `make ide` into static/ide/. Mounted
+# only when present so a checkout without a build still starts; the IDE route
+# reports the missing build rather than serving a blank page.
+IDE_BUNDLE_DIR = Path(__file__).resolve().parent / "static" / "ide"
+IDE_BUNDLE_ENTRY = IDE_BUNDLE_DIR / "ide.js"
+if IDE_BUNDLE_DIR.is_dir():
+    app.mount("/static/ide", StaticFiles(directory=str(IDE_BUNDLE_DIR)), name="ide-bundle")
 
 
 @app.exception_handler(RequestValidationError)
@@ -11260,6 +11270,40 @@ def _ssh_ide_session_or_response(
     if not session:
         return None, JSONResponse({"error": "Session not found"}, status_code=404)
     return session, None
+
+
+@app.get("/ide/{session_name}", response_class=HTMLResponse)
+async def remote_ide_page(request: Request, session_name: str):
+    """Serve the Svelte Remote IDE shell for one owned session."""
+    denied = _ssh_ide_denied(request)
+    if denied:
+        return HTMLResponse("<h1>Sign in to use the Remote SSH IDE</h1>", status_code=403)
+    _sessions, session = _find_session_for_user(session_name, _current_user(request))
+    if not session:
+        return HTMLResponse("<h1>Session not found</h1>", status_code=404)
+    if not IDE_BUNDLE_ENTRY.is_file():
+        return HTMLResponse(
+            "<h1>Remote IDE bundle is not built</h1>"
+            "<p>Run <code>make ide</code> on the dashboard host, then reload.</p>",
+            status_code=503,
+        )
+    names = [str(item.get("name") or "") for item in (_sessions or []) if item.get("name")]
+    bootstrap = json.dumps({
+        "session": session_name,
+        "sessions": names,
+        "rootPath": ROOT_PATH,
+    })
+    return HTMLResponse(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<title>Remote IDE · {html.escape(session_name)}</title>"
+        "<style>html,body{margin:0;height:100%;background:#272822}#ide-root{height:100vh}</style>"
+        f"<link rel=\"stylesheet\" href=\"{ROOT_PATH}/static/ide/ide.css\">"
+        "</head><body><div id=\"ide-root\"></div>"
+        f"<script>window.__IDE_BOOTSTRAP__={bootstrap};</script>"
+        f"<script type=\"module\" src=\"{ROOT_PATH}/static/ide/ide.js\"></script>"
+        "</body></html>"
+    )
 
 
 @app.get("/api/sessions/{session_name}/ide/ssh-connections")

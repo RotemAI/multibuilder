@@ -40,6 +40,17 @@
 - [x] Add create, rename, move, and delete file/folder actions with confirmation dialogs; folders can only be deleted when empty.
 - [x] Add a loaded-file filter, Ctrl/Cmd+P Quick Open, and a lazy recursive tree view.
 
+## Frontend
+
+- [x] Rebuild the IDE as a Svelte 5 app in `ide-ui/`, compiled to `static/ide/`.
+- [x] Replace the mutable `_ide` object with a reactive store.
+- [x] Bundle Monaco locally with the Monokai theme; code-split languages.
+- [x] Three-panel shell: explorer + git, editor tabs, AI chat, status bar.
+- [x] Target a Codex or Claude agent session from the chat panel.
+- [ ] Port quick-open and the command palette to the Svelte shell.
+- [ ] Retire the legacy inline IDE JavaScript in `app.py` once the Svelte
+      shell has full parity.
+
 ## Developer tooling
 
 - [x] Add a constrained terminal launcher that focuses the session-owned tmux SSH window and records credential-free audit events.

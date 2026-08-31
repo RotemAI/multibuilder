@@ -4,9 +4,9 @@
 
 Provide a safe, browser-based remote development workspace inside the dashboard with a VS Code-style layout:
 
-- Left: SSH file explorer.
-- Center: Monaco code editor with multiple open tabs.
-- Right: Codex AI chat for the selected dashboard session.
+- Left: SSH file explorer and Git panel.
+- Center: Monaco code editor (Monokai) with multiple open tabs.
+- Right: AI chat, targeting either a Codex or a Claude agent session.
 
 ## Current implementation
 
@@ -21,7 +21,19 @@ session.
 - Remote browsing, UTF-8 text-file viewing, and atomic saves are supported. Files over 1 MB are intentionally rejected.
 - The full-screen IDE has a remote file explorer, Monaco editor, multi-tabs, syntax-language detection, dirty-state indicators, and Ctrl/Cmd+S save.
 - The AI panel sends requests to the selected existing Codex session, including the active remote path and up to 12,000 characters from the active editor buffer.
-- Monaco is loaded from the pinned jsDelivr version `0.52.0`; CSP permits only that CDN plus blob workers.
+- The IDE frontend is a **Svelte 5 application** in `ide-ui/`, compiled by Vite
+  into `static/ide/` and mounted by FastAPI at `<ROOT_PATH>/static/ide/`.
+  Reactive runes replace the previous hand-rolled `_ide` mutable object and
+  manual DOM updates, which is what made the growing state unmanageable.
+- Monaco ships **in the bundle** rather than from a CDN, with only the
+  languages `languageFor()` can return; it is code-split so the entry chunk
+  stays ~72 kB (26 kB gzipped) and language chunks load on demand.
+- Existing CSP already permits this: `script-src 'self'`, `font-src 'self'`,
+  and `worker-src 'self' blob:` cover the local bundle and Monaco's workers,
+  so no policy change was needed.
+- The AI chat's provider switch is a **target-session selector**: Codex and
+  Claude both run as agents inside tmux sessions, so choosing the session is
+  what chooses the assistant. There is no separate Claude API call here.
 
 ## Target session bridge
 
@@ -117,6 +129,13 @@ Operational requirements:
 - Add a review mode that lets Codex propose patches and requires the user to approve each remote write.
 - Add integration tests against a disposable local SSH server and browser-level tests for the Monaco workspace.
 
+## Building the IDE
+
+`static/ide/` is committed so the Linux deployment needs no Node toolchain:
+`git pull && sudo supervisorctl restart tmux-dashboard` remains sufficient.
+After changing anything under `ide-ui/`, run `make ide` and commit the
+rebuilt bundle; `make ide-dev` rebuilds on change while developing.
+
 ## Verification
 
 - Full suite: 464 passing. The one remaining failure,
@@ -125,3 +144,7 @@ Operational requirements:
 - Credential vault: 14 tests covering round-trip, AAD binding, tamper
   rejection, keyfile permissions, restart survival, and no-plaintext-on-disk.
 - Python compilation and rendered browser JavaScript syntax checks: passing.
+- The Svelte IDE was driven in a real browser: the shell mounts, Monaco
+  renders at Monokai's `#272822`, sidebar/git/chat panels and the connection
+  form all work, and creating a password connection through the UI wrote
+  ciphertext (no plaintext) to a `0600` state file.
