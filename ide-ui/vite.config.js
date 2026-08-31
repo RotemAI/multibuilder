@@ -1,11 +1,12 @@
 import { defineConfig } from 'vite'
 import { svelte } from '@sveltejs/vite-plugin-svelte'
+import tailwindcss from '@tailwindcss/vite'
 import { resolve } from 'node:path'
 
 // Build a single self-contained bundle into ../static/ide/, which FastAPI
 // mounts. Hashless filenames keep app.py's <script src> stable across builds.
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [tailwindcss(), svelte()],
   // Assets are served under the dashboard's ROOT_PATH, and Monaco lazily
   // fetches its own CSS chunks at runtime. A relative base makes those
   // resolve against the script's own URL instead of the site root.

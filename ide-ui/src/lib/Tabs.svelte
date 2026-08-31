@@ -1,38 +1,43 @@
 <script>
   import { ide } from './store.svelte.js'
-  import { X, Dot } from 'lucide-svelte'
+  import { X, File } from 'lucide-svelte'
   const filename = (path) => path.split('/').pop()
 </script>
 
-<div class="tabs" role="tablist">
+<div class="flex min-h-[35px] items-stretch overflow-x-auto bg-vs-tabinactive" role="tablist">
   {#each ide.tabs as tab (tab.key)}
-    <div class="tab" class:active={tab.key === ide.activeKey}>
+    <div
+      class="group flex items-center border-r border-vs-bg text-[13px]"
+      class:bg-vs-tabactive={tab.key === ide.activeKey}
+      class:text-vs-bright={tab.key === ide.activeKey}
+      class:text-vs-muted={tab.key !== ide.activeKey}
+    >
       <button
-        class="label"
+        class="flex items-center gap-1.5 py-2 pr-1 pl-3"
         role="tab"
         aria-selected={tab.key === ide.activeKey}
         title={tab.path}
         onclick={() => (ide.activeKey = tab.key)}
       >
-        {#if tab.dirty}<span class="dot" title="Unsaved changes"><Dot size={16} /></span>{/if}
-        {filename(tab.path)}
+        <File size={14} class="shrink-0 text-vs-blue" />
+        <span class="whitespace-nowrap">{filename(tab.path)}</span>
       </button>
-      <button class="close" title="Close" aria-label="Close {filename(tab.path)}" onclick={() => ide.closeTab(tab.key)}>
-        <X size={13} />
+      <button
+        class="mr-1.5 flex h-5 w-5 items-center justify-center rounded-sm hover:bg-vs-line"
+        title={tab.dirty ? 'Unsaved changes — close' : 'Close'}
+        aria-label="Close {filename(tab.path)}"
+        onclick={() => ide.closeTab(tab.key)}
+      >
+        {#if tab.dirty}
+          <!-- VS Code shows a dot instead of the × until you hover. -->
+          <span class="h-2 w-2 rounded-full bg-vs-fg group-hover:hidden"></span>
+          <X size={14} class="hidden group-hover:block" />
+        {:else}
+          <X size={14} class="opacity-0 group-hover:opacity-100" />
+        {/if}
       </button>
     </div>
   {:else}
-    <div class="hint">Open a file from the explorer</div>
+    <div class="px-3 py-2 text-xs text-vs-muted">Open a file from the Explorer</div>
   {/each}
 </div>
-
-<style>
-  .tabs { display: flex; align-items: stretch; overflow-x: auto; background: var(--ide-panel); border-bottom: 1px solid var(--ide-border); min-height: 30px; }
-  .tab { display: flex; align-items: center; border-right: 1px solid var(--ide-border); }
-  .tab.active { background: var(--ide-bg); box-shadow: inset 0 -2px 0 var(--ide-accent); }
-  .label { display: inline-flex; align-items: center; gap: 2px; background: transparent; border: 0; color: var(--ide-fg); cursor: pointer; padding: 5px 8px; font-size: 12px; white-space: nowrap; }
-  .close { display: flex; align-items: center; background: transparent; border: 0; color: var(--ide-muted); cursor: pointer; padding: 0 6px 0 0; }
-  .close:hover { color: var(--ide-fg); }
-  .dot { display: flex; align-items: center; color: var(--ide-accent); margin-right: -2px; }
-  .hint { padding: 6px 10px; font-size: 12px; color: var(--ide-muted); }
-</style>

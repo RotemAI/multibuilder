@@ -30,6 +30,17 @@ export const api = {
     return data
   },
 
+  // Folder picker for "Open Folder". Not session-scoped: it browses the
+  // dashboard host itself, gated server-side by the caller's own role.
+  browse: async (path = '') => {
+    const { rootPath = '' } = base()
+    const url = `${rootPath}/api/ide/browse?path=${encodeURIComponent(path)}`
+    const response = await fetch(url)
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data.error || 'Could not browse folders')
+    return data
+  },
+
   listConnections: () => request('/ssh-connections'),
 
   createConnection: (body) =>

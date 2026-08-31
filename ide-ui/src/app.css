@@ -1,0 +1,57 @@
+@import 'tailwindcss';
+
+/* VS Code Dark+ palette, exposed as Tailwind theme colors so components use
+   `bg-vs-panel` / `text-vs-fg` instead of repeating hex values. Values are the
+   real Dark+ token colors, not approximations. */
+@theme {
+  --color-vs-bg: #1e1e1e;          /* editor background */
+  --color-vs-panel: #252526;       /* side bar / panels */
+  --color-vs-activity: #333333;    /* activity bar */
+  --color-vs-titlebar: #3c3c3c;    /* title bar */
+  --color-vs-status: #007acc;      /* status bar (blue) */
+  --color-vs-border: #2b2b2b;
+  --color-vs-line: #3c3c3c;        /* stronger dividers */
+  --color-vs-input: #3c3c3c;
+  --color-vs-fg: #cccccc;
+  --color-vs-bright: #ffffff;
+  --color-vs-muted: #8a8a8a;
+  --color-vs-accent: #007fd4;      /* focus border / selection */
+  --color-vs-hover: #2a2d2e;       /* list hover */
+  --color-vs-active: #094771;      /* list active selection */
+  --color-vs-tabactive: #1e1e1e;
+  --color-vs-tabinactive: #2d2d2d;
+  --color-vs-blue: #569cd6;
+  --color-vs-green: #4ec9b0;
+  --color-vs-yellow: #dcdcaa;
+  --color-vs-orange: #ce9178;
+  --color-vs-red: #f48771;
+}
+
+/* The IDE owns the whole viewport; the shell scrolls its own panes. */
+html, body { height: 100%; margin: 0; }
+#ide-root { height: 100vh; }
+
+/* Native controls (scrollbars, select popups) follow the dark chrome. */
+:root { color-scheme: dark; }
+
+/* VS Code's thin scrollbars, applied to every pane that scrolls. */
+* { scrollbar-width: thin; scrollbar-color: #4f4f4f transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #4f4f4f; border-radius: 0; }
+*::-webkit-scrollbar-thumb:hover { background: #6b6b6b; }
+
+/* Components not yet converted to utilities (Chat, GitPanel, QuickOpen,
+   Terminal) still reference the original --ide-* variables in their scoped
+   <style> blocks. Map them onto the VS Code palette so they match the new
+   chrome, instead of rewriting four files that already work. */
+#ide-root {
+  --ide-bg: var(--color-vs-bg);
+  --ide-panel: var(--color-vs-panel);
+  --ide-input: var(--color-vs-input);
+  --ide-border: var(--color-vs-border);
+  --ide-hover: var(--color-vs-hover);
+  --ide-fg: var(--color-vs-fg);
+  --ide-muted: var(--color-vs-muted);
+  --ide-accent: var(--color-vs-blue);
+}

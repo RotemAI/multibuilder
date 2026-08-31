@@ -9,22 +9,29 @@
   import Chat from './Chat.svelte'
   import QuickOpen from './QuickOpen.svelte'
   import Terminal from './Terminal.svelte'
+  import OpenFolderDialog from './OpenFolderDialog.svelte'
   import {
-    Plus, Trash2, SquareTerminal, ExternalLink, Circle, CircleDot, CircleCheck, CircleAlert,
-    Files, GitBranch,
+    Files, GitBranch, MessageSquare, Server, Plus, Trash2, SquareTerminal,
+    ExternalLink, FolderOpen, FileCode2, X, PanelBottom, Circle, CircleDot,
+    CircleCheck, CircleAlert,
   } from 'lucide-svelte'
 
   let { sessions = [], session = '', rootPath = '' } = $props()
 
-  let sidebar = $state('files') // files | git
+  let view = $state('files')          // files | git | remote
+  // Chat lives in its own right-hand pane (like VS Code's secondary side bar)
+  // rather than replacing the Explorer, so you can read files while asking.
+  let showChat = $state(true)
+  let sidebarOpen = $state(true)
   let quickOpen = $state(false)
   let showTerminal = $state(false)
   let showConnectionForm = $state(false)
+  let showOpenFolder = $state(false)
   let password = $state('')
   let form = $state({
-    label: '', host: '', username: '', port: 22,
+    kind: 'local', label: '', host: '', username: '', port: 22,
     auth_mode: 'agent', identity_file: '', password: '',
-    workspace_root: '.', max_file_bytes: 1000000,
+    workspace_root: '', max_file_bytes: 1000000,
   })
 
   const STATE_META = {
@@ -35,11 +42,24 @@
     error: { icon: CircleAlert, label: 'Error' },
   }
   const StateIcon = $derived(STATE_META[ide.connectionState].icon)
+  const isLocal = $derived(ide.connection?.kind === 'local')
+
+  const ACTIVITY = [
+    { id: 'files', icon: Files, label: 'Explorer' },
+    { id: 'git', icon: GitBranch, label: 'Source Control' },
+    { id: 'remote', icon: Server, label: 'Workspaces' },
+  ]
 
   onMount(async () => {
     await ide.loadConnections()
     if (ide.connectionId) await ide.refreshStatus()
   })
+
+  function pickView(id) {
+    // Clicking the active icon collapses the side bar, exactly like VS Code.
+    if (view === id && sidebarOpen) sidebarOpen = false
+    else { view = id; sidebarOpen = true }
+  }
 
   async function onConnectionChange(event) {
     ide.connectionId = event.currentTarget.value
@@ -47,6 +67,27 @@
     ide.activeKey = ''
     ide.restoredKey = ''
     await ide.refreshStatus()
+  }
+
+  /** Open a folder picked from the browser as a local workspace, then connect. */
+  async function openFolder(path) {
+    showOpenFolder = false
+    try {
+      const label = path.split('/').filter(Boolean).pop() || path
+      const data = await api.createConnection({
+        kind: 'local', label, workspace_root: path, max_file_bytes: 1000000,
+      })
+      await ide.loadConnections()
+      ide.connectionId = data.connection.id
+      ide.tabs = []
+      ide.activeKey = ''
+      ide.restoredKey = ''
+      await ide.connect('')
+      view = 'files'
+      sidebarOpen = true
+    } catch (error) {
+      ide.setStatus(error.message || 'Could not open folder')
+    }
   }
 
   async function createConnection(event) {
@@ -66,21 +107,22 @@
   async function removeConnection() {
     const current = ide.connection
     if (!current) return
-    if (!confirm(`Delete connection "${current.label}"? Stored credentials and saved tabs are removed.`)) return
+    const what = current.kind === 'local' ? 'workspace' : 'connection'
+    if (!confirm(`Remove ${what} "${current.label}"? Saved tabs are cleared; files are untouched.`)) return
     try {
       await api.deleteConnection(current.id)
       ide.connectionId = ''
       ide.tabs = []
       await ide.loadConnections()
     } catch (error) {
-      ide.setStatus(error.message || 'Could not delete connection')
+      ide.setStatus(error.message || 'Could not delete')
     }
   }
 
   async function focusTerminal() {
     try {
       const data = await api.focusTerminal(ide.connectionId)
-      ide.setStatus(`Focused ${data.window_name}`, 'tmux SSH window selected')
+      ide.setStatus(`Focused ${data.window_name}`, 'tmux window selected')
     } catch (error) {
       ide.setStatus(error.message || 'Could not focus terminal')
     }
@@ -89,9 +131,6 @@
   function onKeydown(event) {
     const mod = event.ctrlKey || event.metaKey
     const key = event.key.toLowerCase()
-    // Let the shortcut through when the user is typing in a form control, so
-    // Ctrl+P in the chat box does not steal focus into Quick Open. Monaco is
-    // exempt: its own widgets live inside .monaco-editor.
     const inField =
       event.target?.matches?.('input, textarea, select') &&
       !event.target.closest?.('.monaco-editor')
@@ -102,6 +141,15 @@
     } else if (mod && key === 'p' && !inField) {
       event.preventDefault()
       if (ide.connectionId) quickOpen = true
+    } else if (mod && event.shiftKey && key === 'o') {
+      event.preventDefault()
+      showOpenFolder = true
+    } else if (mod && key === 'b' && !inField) {
+      event.preventDefault()
+      sidebarOpen = !sidebarOpen
+    } else if (mod && key === '`') {
+      event.preventDefault()
+      if (ide.connectionState === 'connected') showTerminal = !showTerminal
     } else if (event.key === 'Escape' && quickOpen) {
       event.preventDefault()
       quickOpen = false
@@ -111,172 +159,238 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<div class="ide">
-  <header class="topbar">
-    <span class="brand">Remote SSH IDE</span>
-
-    <select value={ide.connectionId} onchange={onConnectionChange} title="SSH connection">
-      <option value="">— select connection —</option>
-      {#each ide.connections as item (item.id)}
-        <option value={item.id}>{item.label}</option>
-      {/each}
-    </select>
-
-    <button onclick={() => (showConnectionForm = !showConnectionForm)}>
-      <Plus size={14} /> Add
+<div class="flex h-full flex-col overflow-hidden bg-vs-bg font-sans text-vs-fg">
+  <!-- Title bar -->
+  <header class="flex items-center gap-2 border-b border-vs-border bg-vs-titlebar px-3 py-1 text-xs">
+    <FileCode2 size={15} class="shrink-0 text-vs-blue" />
+    <button
+      class="rounded-sm px-2 py-0.5 hover:bg-vs-hover"
+      onclick={() => (showOpenFolder = true)}
+      title="Open a folder on this server (Ctrl+Shift+O)"
+    >
+      Open Folder…
     </button>
-    {#if ide.connection}
-      <button onclick={removeConnection} title="Delete connection" aria-label="Delete connection">
-        <Trash2 size={14} />
-      </button>
-    {/if}
-
-    <span class="state {ide.connectionState}">
-      <StateIcon size={13} />
+    <button
+      class="rounded-sm px-2 py-0.5 hover:bg-vs-hover disabled:opacity-40"
+      onclick={() => (quickOpen = true)}
+      disabled={!ide.connectionId}
+      title="Open a file (Ctrl+P)"
+    >
+      Open File…
+    </button>
+    <span class="mx-auto truncate text-vs-muted" title={ide.connection?.workspace_root}>
+      {ide.connection ? `${ide.connection.label} — Multibuilder IDE` : 'Multibuilder IDE'}
+    </span>
+    <span class="flex items-center gap-1 {ide.connectionState === 'connected' ? 'text-vs-green' : ide.connectionState === 'connecting' ? 'text-vs-yellow' : ide.connectionState === 'idle' ? 'text-vs-muted' : 'text-vs-red'}">
+      <StateIcon size={12} />
       {STATE_META[ide.connectionState].label}
     </span>
-
-    {#if ide.connectionState !== 'connected'}
-      {#if ide.connection && !ide.connection.has_password}
-        <input
-          class="pw"
-          type="password"
-          placeholder="Password (optional)"
-          bind:value={password}
-          autocomplete="new-password"
-        />
-      {/if}
-      <button class="primary" onclick={() => ide.connect(password)}>Connect</button>
-    {:else}
-      <button
-        onclick={() => (showTerminal = !showTerminal)}
-        title="Open the SSH terminal in this browser"
-        class:active={showTerminal}
-      >
-        <SquareTerminal size={14} /> Terminal
-      </button>
-      <button onclick={focusTerminal} title="Focus the tmux SSH window on the dashboard host">
-        <ExternalLink size={14} />
-      </button>
-    {/if}
   </header>
 
-  {#if showConnectionForm}
-    <form class="connform" onsubmit={createConnection}>
-      <input placeholder="Label" bind:value={form.label} />
-      <input placeholder="Host" bind:value={form.host} required />
-      <input placeholder="User" bind:value={form.username} required />
-      <input placeholder="Port" type="number" bind:value={form.port} min="1" max="65535" />
-      <select bind:value={form.auth_mode}>
-        <option value="agent">SSH agent</option>
-        <option value="key">Existing key</option>
-        <option value="password">Password (saved, encrypted)</option>
-      </select>
-      {#if form.auth_mode === 'key'}
-        <input placeholder="~/.ssh/id_ed25519" bind:value={form.identity_file} />
-      {/if}
-      {#if form.auth_mode === 'password'}
-        <input type="password" placeholder="Password" bind:value={form.password} autocomplete="new-password" />
-      {/if}
-      <input placeholder="Workspace root" bind:value={form.workspace_root} />
-      <button class="primary" type="submit">Create</button>
-      <button type="button" onclick={() => (showConnectionForm = false)}>Cancel</button>
-    </form>
-  {/if}
-
-  <div class="main">
-    <aside class="sidebar">
-      <div class="switch">
-        <button class:active={sidebar === 'files'} onclick={() => (sidebar = 'files')}>
-          <Files size={13} /> Files
+  <div class="flex min-h-0 flex-1">
+    <!-- Activity bar -->
+    <nav class="flex w-12 shrink-0 flex-col items-center bg-vs-activity py-1">
+      {#each ACTIVITY as item (item.id)}
+        <button
+          class="relative flex h-12 w-12 items-center justify-center {view === item.id && sidebarOpen ? 'text-vs-bright' : 'text-vs-muted hover:text-vs-fg'}"
+          title={item.label}
+          aria-label={item.label}
+          onclick={() => pickView(item.id)}
+        >
+          {#if view === item.id && sidebarOpen}
+            <span class="absolute top-0 bottom-0 left-0 w-0.5 bg-vs-bright"></span>
+          {/if}
+          <item.icon size={22} strokeWidth={1.5} />
         </button>
-        <button class:active={sidebar === 'git'} onclick={() => (sidebar = 'git')}>
-          <GitBranch size={13} /> Git
-        </button>
-      </div>
-      {#if sidebar === 'files'}
-        <Explorer />
-      {:else}
-        <GitPanel />
-      {/if}
-    </aside>
+      {/each}
+    </nav>
 
-    <section class="code">
-      <Tabs />
-      <div class="editor-wrap"><Editor /></div>
-      {#if showTerminal && ide.connectionState === 'connected'}
-        <div class="terminal-wrap">
-          {#key ide.connectionId}
-            <Terminal {rootPath} {session} />
-          {/key}
+    <!-- Side bar -->
+    {#if sidebarOpen}
+      <aside class="flex w-60 shrink-0 flex-col overflow-hidden border-r border-vs-border bg-vs-panel">
+        {#if view === 'files'}
+          <Explorer />
+        {:else if view === 'git'}
+          <GitPanel />
+        {:else}
+          <!-- Workspaces: pick, add, connect or remove -->
+          <div class="px-4 py-1.5 text-[11px] font-semibold tracking-wide uppercase">Workspaces</div>
+          <div class="flex flex-col gap-2 px-3 pt-1">
+            <select
+              class="w-full rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+              value={ide.connectionId}
+              onchange={onConnectionChange}
+              aria-label="Workspace"
+            >
+              <option value="">— select workspace —</option>
+              {#each ide.connections as item (item.id)}
+                <option value={item.id}>{item.kind === 'local' ? '🖿 ' : '⇅ '}{item.label}</option>
+              {/each}
+            </select>
+
+            <div class="flex gap-1">
+              <button class="flex flex-1 items-center justify-center gap-1 rounded-sm bg-vs-status px-2 py-1 text-xs text-white hover:brightness-110"
+                onclick={() => (showOpenFolder = true)}>
+                <FolderOpen size={13} /> Open Folder
+              </button>
+              <button class="rounded-sm border border-vs-line px-2 py-1 text-xs hover:bg-vs-hover"
+                title="Add a workspace or SSH connection" aria-label="Add workspace"
+                onclick={() => (showConnectionForm = !showConnectionForm)}>
+                <Plus size={13} />
+              </button>
+              {#if ide.connection}
+                <button class="rounded-sm border border-vs-line px-2 py-1 text-xs hover:bg-vs-hover hover:text-vs-red"
+                  title="Remove workspace" aria-label="Remove workspace" onclick={removeConnection}>
+                  <Trash2 size={13} />
+                </button>
+              {/if}
+            </div>
+
+            {#if ide.connection && ide.connectionState !== 'connected'}
+              {#if !isLocal && !ide.connection.has_password}
+                <input class="w-full rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+                  type="password" placeholder="Password (optional)" bind:value={password} autocomplete="new-password" />
+              {/if}
+              <button class="w-full rounded-sm bg-vs-status px-2 py-1 text-xs text-white hover:brightness-110"
+                onclick={() => ide.connect(password)}>
+                {isLocal ? 'Open workspace' : 'Connect'}
+              </button>
+            {/if}
+
+            {#if ide.connection}
+              <p class="mt-1 font-mono text-[11px] break-all text-vs-muted">{ide.connection.workspace_root}</p>
+            {/if}
+          </div>
+
+          {#if showConnectionForm}
+            <form class="mt-2 flex flex-col gap-1.5 border-t border-vs-line px-3 pt-2" onsubmit={createConnection}>
+              <select class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" bind:value={form.kind}>
+                <option value="local">This server (local folder)</option>
+                <option value="ssh">Remote host over SSH</option>
+              </select>
+              <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" placeholder="Label" bind:value={form.label} />
+              {#if form.kind === 'ssh'}
+                <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" placeholder="Host" bind:value={form.host} required />
+                <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" placeholder="User" bind:value={form.username} required />
+                <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" placeholder="Port" type="number" bind:value={form.port} min="1" max="65535" />
+                <select class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" bind:value={form.auth_mode}>
+                  <option value="agent">SSH agent</option>
+                  <option value="key">Existing key</option>
+                  <option value="password">Password (saved, encrypted)</option>
+                </select>
+                {#if form.auth_mode === 'key'}
+                  <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" placeholder="~/.ssh/id_ed25519" bind:value={form.identity_file} />
+                {/if}
+                {#if form.auth_mode === 'password'}
+                  <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" type="password" placeholder="Password" bind:value={form.password} autocomplete="new-password" />
+                {/if}
+              {/if}
+              <input
+                class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs"
+                placeholder={form.kind === 'local' ? '/var/www/app' : 'Workspace root'}
+                bind:value={form.workspace_root}
+                required={form.kind === 'local'}
+              />
+              <div class="flex gap-1 pb-2">
+                <button class="flex-1 rounded-sm bg-vs-status px-2 py-1 text-xs text-white hover:brightness-110" type="submit">Create</button>
+                <button class="rounded-sm border border-vs-line px-2 py-1 text-xs hover:bg-vs-hover" type="button" onclick={() => (showConnectionForm = false)}>Cancel</button>
+              </div>
+            </form>
+          {/if}
+        {/if}
+      </aside>
+    {/if}
+
+    <!-- Editor area -->
+    <section class="flex min-h-0 min-w-0 flex-1 flex-col">
+      {#if !ide.connectionId}
+        <!-- Welcome screen, shown until a folder is open. -->
+        <div class="flex flex-1 flex-col items-center justify-center gap-6 px-6 text-center">
+          <FileCode2 size={64} strokeWidth={1} class="text-vs-line" />
+          <div>
+            <h1 class="text-2xl font-light text-vs-fg">Multibuilder IDE</h1>
+            <p class="mt-1 text-sm text-vs-muted">Edit files on this server or on a remote host over SSH.</p>
+          </div>
+          <div class="flex flex-col gap-2 text-sm">
+            <button class="flex items-center gap-2 text-vs-blue hover:underline" onclick={() => (showOpenFolder = true)}>
+              <FolderOpen size={16} /> Open Folder…
+              <kbd class="ml-2 rounded-sm border border-vs-line px-1.5 py-0.5 text-[10px] text-vs-muted">Ctrl+Shift+O</kbd>
+            </button>
+            <button class="flex items-center gap-2 text-vs-blue hover:underline" onclick={() => { view = 'remote'; sidebarOpen = true; showConnectionForm = true }}>
+              <Server size={16} /> Connect to a host over SSH…
+            </button>
+          </div>
         </div>
+      {:else}
+        <Tabs />
+        <div class="min-h-0 flex-1"><Editor /></div>
+        {#if showTerminal && ide.connectionState === 'connected'}
+          <div class="flex h-[35%] min-h-[140px] flex-col border-t border-vs-line bg-vs-bg">
+            <div class="flex items-center gap-2 border-b border-vs-border px-3 py-1 text-[11px] tracking-wide uppercase">
+              <SquareTerminal size={13} /> Terminal
+              <button class="ml-auto rounded-sm p-0.5 hover:bg-vs-hover" title="Close panel" aria-label="Close terminal panel"
+                onclick={() => (showTerminal = false)}><X size={14} /></button>
+            </div>
+            <div class="min-h-0 flex-1">
+              {#key ide.connectionId}
+                <Terminal {rootPath} {session} />
+              {/key}
+            </div>
+          </div>
+        {/if}
       {/if}
     </section>
 
-    <aside class="chat-pane">
-      <Chat {sessions} {session} {rootPath} />
-    </aside>
+    <!-- Secondary side bar: AI chat -->
+    {#if showChat}
+      <aside class="flex w-80 shrink-0 flex-col overflow-hidden border-l border-vs-border bg-vs-panel">
+        <div class="flex items-center gap-2 border-b border-vs-border px-3 py-1.5">
+          <MessageSquare size={13} />
+          <span class="flex-1 text-[11px] font-semibold tracking-wide uppercase">Chat</span>
+          <button class="rounded-sm p-0.5 hover:bg-vs-hover" title="Hide chat" aria-label="Hide chat"
+            onclick={() => (showChat = false)}><X size={14} /></button>
+        </div>
+        <div class="min-h-0 flex-1"><Chat {sessions} {session} {rootPath} /></div>
+      </aside>
+    {/if}
   </div>
+
+  <!-- Status bar -->
+  <footer class="flex shrink-0 items-center gap-3 bg-vs-status px-3 py-0.5 text-[12px] text-white">
+    {#if ide.connection}
+      <span class="flex items-center gap-1" title={ide.connection.workspace_root}>
+        {#if isLocal}<FolderOpen size={12} />{:else}<Server size={12} />{/if}
+        {ide.connection.label}
+      </span>
+    {/if}
+    {#if ide.gitBranch}
+      <span class="flex items-center gap-1"><GitBranch size={12} /> {ide.gitBranch}</span>
+    {/if}
+    <span class="truncate">{ide.statusText}</span>
+    <span class="ml-auto flex items-center gap-3">
+      {#if ide.dirtyCount}<span>{ide.dirtyCount} unsaved</span>{/if}
+      <span class="max-w-[40vw] truncate opacity-80">{ide.detailText}</span>
+      {#if ide.connectionState === 'connected'}
+        <button class="flex items-center gap-1 rounded-sm px-1 hover:bg-white/20" title="Toggle terminal (Ctrl+`)"
+          onclick={() => (showTerminal = !showTerminal)}>
+          <PanelBottom size={12} /> Terminal
+        </button>
+        <button class="flex items-center gap-1 rounded-sm px-1 hover:bg-white/20" title="Focus the tmux window on the host"
+          onclick={focusTerminal}><ExternalLink size={12} /></button>
+      {/if}
+      {#if true}
+        <button class="flex items-center gap-1 rounded-sm px-1 hover:bg-white/20"
+          title="Toggle chat panel" onclick={() => (showChat = !showChat)}>
+          <MessageSquare size={12} /> Chat
+        </button>
+      {/if}
+    </span>
+  </footer>
 
   {#if quickOpen}
     <QuickOpen onclose={() => (quickOpen = false)} />
   {/if}
-
-  <footer class="statusbar">
-    <span>{ide.statusText}</span>
-    <span class="detail">{ide.detailText}</span>
-    {#if ide.dirtyCount}<span class="dirty">{ide.dirtyCount} unsaved</span>{/if}
-  </footer>
+  {#if showOpenFolder}
+    <OpenFolderDialog onopen={openFolder} onclose={() => (showOpenFolder = false)} />
+  {/if}
 </div>
-
-<style>
-  .ide {
-    --ide-bg: #272822;
-    --ide-panel: #1e1f1c;
-    --ide-input: #171815;
-    --ide-border: #3e3d32;
-    --ide-hover: #3e3d32;
-    --ide-fg: #f8f8f2;
-    --ide-muted: #90908a;
-    --ide-accent: #a6e22e;
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    min-height: 0;
-    background: var(--ide-bg);
-    color: var(--ide-fg);
-    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-    /* Render native form controls (select dropdowns, scrollbars) dark so
-       they match the Monokai chrome instead of the OS light default. */
-    color-scheme: dark;
-  }
-  .topbar, .connform { display: flex; align-items: center; gap: 6px; padding: 7px 9px; background: var(--ide-panel); border-bottom: 1px solid var(--ide-border); flex-wrap: wrap; }
-  .brand { font-size: 12px; font-weight: 700; letter-spacing: .04em; color: var(--ide-accent); }
-  select, input { background: var(--ide-input); border: 1px solid var(--ide-border); color: var(--ide-fg); border-radius: 3px; padding: 4px 6px; font-size: 12px; }
-  .connform input, .connform select { min-width: 110px; }
-  button { display: inline-flex; align-items: center; gap: 5px; background: var(--ide-panel); border: 1px solid var(--ide-border); color: var(--ide-fg); border-radius: 3px; cursor: pointer; padding: 4px 9px; font-size: 12px; }
-  button:hover { background: var(--ide-hover); }
-  button.primary { background: var(--ide-accent); border-color: var(--ide-accent); color: #272822; font-weight: 600; }
-  .state { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; margin-left: auto; }
-  .state.connected { color: var(--ide-accent); }
-  .state.reconnect, .state.error { color: #f92672; }
-  .state.connecting { color: #e6db74; }
-  .pw { width: 150px; }
-  .main { display: grid; grid-template-columns: minmax(190px, 250px) minmax(320px, 1fr) minmax(250px, 330px); flex: 1; min-height: 0; }
-  .sidebar { display: flex; flex-direction: column; min-width: 0; background: var(--ide-panel); border-right: 1px solid var(--ide-border); }
-  .switch { display: flex; border-bottom: 1px solid var(--ide-border); }
-  .switch button { flex: 1; justify-content: center; border: 0; border-radius: 0; background: transparent; padding: 6px; }
-  .switch button.active { box-shadow: inset 0 -2px 0 var(--ide-accent); color: var(--ide-accent); }
-  .code { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-  .editor-wrap { flex: 1; min-height: 0; }
-  .terminal-wrap { height: 38%; min-height: 120px; border-top: 1px solid var(--ide-border); }
-  button.active { border-color: var(--ide-accent); color: var(--ide-accent); }
-  .chat-pane { min-width: 0; background: var(--ide-panel); border-left: 1px solid var(--ide-border); }
-  .statusbar { display: flex; gap: 12px; align-items: center; padding: 4px 10px; background: var(--ide-panel); border-top: 1px solid var(--ide-border); font-size: 11px; color: var(--ide-muted); }
-  .statusbar .detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .statusbar .dirty { margin-left: auto; color: var(--ide-accent); }
-  @media (max-width: 900px) {
-    .main { grid-template-columns: 170px 1fr; }
-    .chat-pane { display: none; }
-  }
-</style>

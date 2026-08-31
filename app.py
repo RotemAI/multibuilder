@@ -7445,6 +7445,27 @@ def _is_pane_residue(s: str) -> bool:
     return bool(s) and bool(_PANE_RESIDUE_RE.search(s))
 
 
+# Agent CLIs draw their prompt and message bullets with different glyphs across
+# versions: Codex used '❯'/'●' and now uses '›'/'•'. Matching only the old pair
+# made every pane scrape return nothing after a CLI upgrade, which silently
+# stopped chat replies. Match the known set instead of a single character.
+_AGENT_PROMPT_GLYPHS = ("\u276f", "\u203a", ">")
+_AGENT_TEXT_GLYPHS = ("\u25cf", "\u2022")
+
+# Placeholders the composer shows when nothing has been typed. Treating one as a
+# submitted prompt would split the pane below the agent's reply and lose it.
+_AGENT_INPUT_PLACEHOLDERS = (
+    "ask codex to do anything",
+    "ask claude to do anything",
+)
+
+
+def _is_agent_input_placeholder(text: str) -> bool:
+    """True for the agent composer's own placeholder rather than a real prompt."""
+    probe = (text or "").strip().lower().rstrip(".\u2026")
+    return not probe or probe in _AGENT_INPUT_PLACEHOLDERS
+
+
 def _extract_codex_text(terminal_output: str) -> str:
     """Extract Codex's human-readable text from terminal output.
 
@@ -7473,7 +7494,7 @@ def _extract_codex_text(terminal_output: str) -> str:
     for line in lines:
         stripped = line.strip()
         # Detect start of a Codex text block (● followed by text, not a tool)
-        if stripped.startswith("●"):
+        if stripped[:1] in _AGENT_TEXT_GLYPHS:
             content_after = stripped[1:].strip()
             # Check if this is a tool call
             is_tool = any(content_after.startswith(t) for t in tool_names) or _is_pane_residue(content_after)
@@ -7493,12 +7514,13 @@ def _extract_codex_text(terminal_output: str) -> str:
                 in_tool_block = False
                 if content_after:
                     current_block.append(content_after)
-        elif stripped.startswith("⎿") or stripped.startswith("⎿"):
-            # Tool output — skip
+        elif stripped[:1] in ("\u23bf", "\u2514"):
+            # Tool output — skip. '└' is what the current Codex CLI draws for a
+            # tool result ("└ Read SKILL.md"); '⎿' is the older/Claude form.
             in_text_block = False
             in_tool_block = True
-        elif stripped.startswith("✻") or stripped.startswith("❯"):
-            # Status line or user prompt — end block
+        elif stripped[:1] in ("\u273b", "\u25e6") or stripped[:1] in _AGENT_PROMPT_GLYPHS:
+            # Status/spinner line ('◦ Searching the web') or user prompt — end block
             if current_block:
                 text_blocks.append("\n".join(current_block))
                 current_block = []
@@ -7540,9 +7562,19 @@ def _extract_codex_response_since_last_user(terminal_output: str) -> str:
     last_prompt_idx = -1
     for i in range(len(lines) - 1, -1, -1):
         stripped = lines[i].strip()
-        if stripped.startswith("❯") and len(stripped) > 1:
-            last_prompt_idx = i
-            break
+        # Codex changed its prompt glyph between CLI versions ('❯' -> '›'), and
+        # Claude uses '>'. Accept all of them so a CLI upgrade cannot silently
+        # stop chat replies from being captured.
+        if stripped[:1] not in _AGENT_PROMPT_GLYPHS or len(stripped) <= 1:
+            continue
+        # The composer sits at the BOTTOM of an idle pane showing its
+        # placeholder ("Ask Codex to do anything"). Splitting there would throw
+        # away the reply printed above it, so skip the empty input box and keep
+        # looking for the prompt that carries real submitted text.
+        if _is_agent_input_placeholder(stripped[1:].strip()):
+            continue
+        last_prompt_idx = i
+        break
 
     # If no user prompt found, use all output
     if last_prompt_idx < 0:
@@ -8026,6 +8058,42 @@ async def _summarize_turn(text: str) -> str:
     # LLM unavailable/failed -> fall back to the assistant's own words (already
     # clean prose from the transcript), trimmed, rather than raw terminal output.
     return summary or _trim_plain(body, 600)
+
+
+async def _capture_agent_reply(session_name: str) -> bool:
+    """Record the agent's finished turn into the session's chat store.
+
+    Extracted so the IDE chat panel can pull replies without depending on the
+    dashboard being open in another tab. Mirrors the poll's gates: only when the
+    agent is idle, and only when the turn signature actually changed.
+    """
+    try:
+        entry = cache.setdefault(session_name, {})
+        if _activity_state.get(session_name, {}).get("status", "") == "busy":
+            # Note that a turn is in flight so the next idle poll captures it.
+            entry["_chat_was_busy"] = True
+            return False
+        last_user = next(
+            (m.get("text", "") for m in reversed(entry.get("messages", []) or [])
+             if m.get("role") == "user"),
+            "",
+        )
+        summary = await get_chat_summary(session_name, entry.get("chat_summary_sig", ""), last_user)
+        if not summary or not (summary.get("summary") or summary.get("full")):
+            return False
+        _append_assistant_msg(
+            entry, summary.get("summary", ""), time.time(),
+            full=summary.get("full", ""), links=summary.get("links") or [],
+        )
+        entry["chat_summary_sig"] = summary["sig"]
+        entry["chat_summary_at"] = time.time()
+        entry["_chat_was_busy"] = False
+        cache[session_name] = entry
+        _save_messages()
+        return True
+    except Exception:
+        logger.debug("IDE chat reply capture failed for %s", session_name, exc_info=True)
+        return False
 
 
 async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str = ""):
@@ -9117,10 +9185,109 @@ async def ws_session_raw(ws: WebSocket, session_name: str):
 
 class CreateSession(BaseModel):
     name: str = ""
+    # Optional workspace to attach to the new session. The agent always runs on
+    # the dashboard host (it needs CODEX_HOME, the advisor token and the owner's
+    # auth files); this only decides which folder the IDE opens and, for an SSH
+    # target, adds an interactive remote window to the session.
+    workspace: str = ""          # "" | "local" | "ssh"
+    workspace_root: str = ""
+    reuse_connection_id: str = ""
+    ssh_host: str = ""
+    ssh_username: str = ""
+    ssh_port: int = 22
+    ssh_auth_mode: str = "agent"
+    ssh_identity_file: str = ""
+    ssh_password: str = ""
+    workspace_label: str = ""
 
 
 def _is_valid_session_name(name: str) -> bool:
     return bool(name and len(name) <= 128 and re.fullmatch(r"[A-Za-z0-9_.-]+", name))
+
+
+async def _attach_session_workspace(
+    request: Request, session_name: str, body: CreateSession, user: dict | None
+) -> dict:
+    """Create the new session's IDE workspace, reusing a saved host when asked.
+
+    Returns a small report rather than raising: the tmux session already exists
+    by this point, so a bad host must not turn a successful session creation
+    into a failure. The caller surfaces `warning` instead.
+    """
+    kind = (body.workspace or "").strip().lower()
+    if kind not in {"local", "ssh"}:
+        return {}
+
+    payload = None
+    if body.reuse_connection_id:
+        # Reuse: clone one of this user's existing profiles onto the new session
+        # so a host is configured once. Stored secrets are NOT copied -- the
+        # ciphertext is bound to its original connection id by the GCM AAD, so a
+        # password target re-authenticates and re-seals under the new id.
+        source = next(
+            (
+                profile
+                for profile in (_ssh_connections_store().read() or {}).get("connections", [])
+                if isinstance(profile, dict)
+                and profile.get("id") == body.reuse_connection_id
+                and _ssh_user_may_use_profile(user, profile)
+            ),
+            None,
+        )
+        if not source:
+            return {"warning": "That saved connection is no longer available"}
+        payload = SSHConnectionBody(
+            kind=str(source.get("kind") or "ssh"),
+            label=str(source.get("label") or ""),
+            host=str(source.get("host") or ""),
+            username=str(source.get("username") or ""),
+            port=int(source.get("port") or 22),
+            identity_file=str(source.get("identity_file") or ""),
+            auth_mode=str(source.get("auth_mode") or "agent"),
+            password=body.ssh_password or "",
+            workspace_root=str(body.workspace_root or source.get("workspace_root") or "."),
+            max_file_bytes=int(source.get("max_file_bytes") or SSH_MAX_FILE_BYTES),
+        )
+    elif kind == "local":
+        payload = SSHConnectionBody(
+            kind="local",
+            label=body.workspace_label or "",
+            workspace_root=body.workspace_root or "",
+        )
+    else:
+        payload = SSHConnectionBody(
+            kind="ssh",
+            label=body.workspace_label or "",
+            host=body.ssh_host,
+            username=body.ssh_username,
+            port=body.ssh_port,
+            identity_file=body.ssh_identity_file,
+            auth_mode=body.ssh_auth_mode,
+            password=body.ssh_password,
+            workspace_root=body.workspace_root or ".",
+        )
+
+    response = await api_create_ssh_connection(request, session_name, payload)
+    created = json.loads(bytes(response.body).decode("utf-8") or "{}")
+    if response.status_code != 201:
+        return {"warning": created.get("error") or "Could not attach the workspace"}
+
+    connection = created.get("connection") or {}
+    connection_id = str(connection.get("id") or "")
+    result = {"connection": connection}
+    # Connecting is best-effort: an unreachable host still leaves a usable
+    # session and a saved workspace the user can retry from the IDE.
+    try:
+        connect = await api_connect_ssh_connection(
+            request, session_name, connection_id, SSHConnectBody(password=body.ssh_password or "")
+        )
+        if connect.status_code != 200:
+            detail = json.loads(bytes(connect.body).decode("utf-8") or "{}")
+            result["warning"] = detail.get("error") or "Workspace saved, but connecting failed"
+    except Exception as exc:  # noqa: BLE001 - never fail session creation
+        logger.info("Workspace attach could not connect for %s", session_name, exc_info=True)
+        result["warning"] = str(exc)[:200] or "Workspace saved, but connecting failed"
+    return result
 
 
 @app.post("/api/sessions/create")
@@ -9247,7 +9414,13 @@ async def api_create_session(request: Request, body: CreateSession):
                 capture_output=True, text=True, timeout=5
             )
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
-        return JSONResponse({"ok": True, "name": created})
+        payload = {"ok": True, "name": created}
+        attached = await _attach_session_workspace(request, created, body, user)
+        if attached.get("connection"):
+            payload["connection"] = attached["connection"]
+        if attached.get("warning"):
+            payload["warning"] = attached["warning"]
+        return JSONResponse(payload)
     except Exception as e:
         logger.error("Failed to create session '%s': %s", name, e)
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -10706,6 +10879,7 @@ def _ssh_public_profile(profile: dict) -> dict:
     """
     return {
         "id": str(profile.get("id") or ""),
+        "kind": str(profile.get("kind") or "ssh"),
         "label": str(profile.get("label") or ""),
         "host": str(profile.get("host") or ""),
         "username": str(profile.get("username") or ""),
@@ -10878,6 +11052,10 @@ def _ssh_argv(profile: dict, *, password_auth: bool = False) -> list[str]:
 
 def _ssh_control_is_alive(profile: dict, session_name: str) -> bool:
     """Ask OpenSSH whether this session/profile control master is still live."""
+    # A local workspace is reachable exactly while its folder is a directory,
+    # so it reports connected without any transport to check.
+    if _is_local_profile(profile):
+        return _normalized_local_root(str(profile.get("workspace_root") or "")) is not None
     socket_path = _ssh_control_socket(session_name, str(profile.get("id") or ""))
     if not socket_path.exists():
         return False
@@ -10951,12 +11129,16 @@ def _ssh_start_control_master(profile: dict, session_name: str, *, password: str
 
 
 def _ssh_tmux_window_name(profile: dict) -> str:
+    if _is_local_profile(profile):
+        return _local_tmux_window_name(profile)
     label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile.get("label") or "remote")).strip("-.")
     return f"ssh:{(label or 'remote')[:36]}"
 
 
 def _ssh_open_tmux_window(profile: dict, session_name: str) -> str:
     """Open an interactive view of the already-authenticated SSH control master."""
+    if _is_local_profile(profile):
+        return _local_open_tmux_window(profile, session_name)
     if not shutil.which("tmux"):
         raise RuntimeError("tmux is not installed on the dashboard host")
     socket_path = _ssh_control_socket(session_name, str(profile.get("id") or ""))
@@ -11005,12 +11187,138 @@ def _ssh_remote_command(script: str, path: str) -> str:
     return "python3 -c " + shlex.quote(script) + " -- " + shlex.quote(path)
 
 
+class _WorkspaceCommand(str):
+    """The remote shell command, carrying the parts the local transport needs.
+
+    It subclasses str so the SSH path keeps receiving exactly the string it
+    always did, while _ssh_run can recover (script, path) for a local workspace
+    without shell-parsing them back out of the quoted command.
+    """
+
+    script: str
+    path: str
+
+    def __new__(cls, command: str, script: str, path: str) -> _WorkspaceCommand:
+        obj = super().__new__(cls, command)
+        obj.script = script
+        obj.path = path
+        return obj
+
+
+def _local_command_parts(command: str) -> tuple[str, str]:
+    """Recover the (script, path) pair a local workspace should execute."""
+    if isinstance(command, _WorkspaceCommand):
+        return command.script, command.path
+    raise RuntimeError("Local workspaces cannot run this command")
+
+
 def _ssh_workspace_command(profile: dict, script: str, path: str) -> str:
     """Run a fixed script inside the configured remote root, without shell interpolation."""
     root = str(profile.get("workspace_root") or ".")
     if not root or len(root) > 4096 or "\x00" in root:
         raise RuntimeError("Configured remote workspace root is invalid")
-    return "cd -- " + shlex.quote(root) + " && " + _ssh_remote_command(script, path)
+    return _WorkspaceCommand(
+        "cd -- " + shlex.quote(root) + " && " + _ssh_remote_command(script, path),
+        script,
+        path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Local workspaces
+#
+# The IDE was built for SSH targets only. A "local" connection opens a folder on
+# the dashboard host itself, the way VS Code opens a local folder next to a
+# Remote-SSH window. It is modelled as a connection profile with
+# `kind == "local"` so every existing route, the stored workspace state and the
+# frontend keep working unchanged — only the transport differs.
+#
+# Both transports execute the SAME _SSH_*_SCRIPT payloads. Those scripts resolve
+# realpaths and refuse anything outside the workspace root, so a local workspace
+# inherits that confinement instead of re-implementing it.
+# ---------------------------------------------------------------------------
+LOCAL_CONNECTION_KIND = "local"
+
+
+def _is_local_profile(profile: dict) -> bool:
+    return str((profile or {}).get("kind") or "").lower() == LOCAL_CONNECTION_KIND
+
+
+def _normalized_local_root(value: str) -> str | None:
+    """Resolve a local workspace root, or None when it is not a usable directory.
+
+    Unlike the remote side there is no shell to quote against, but the path still
+    has to exist and be a real directory before a workspace is created — that is
+    what turns a typo into a clear 400 instead of a confusing failure later.
+    """
+    raw = (value or "").strip()
+    if not raw or len(raw) > 4096 or "\x00" in raw:
+        return None
+    try:
+        candidate = Path(raw).expanduser().resolve(strict=True)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return str(candidate) if candidate.is_dir() else None
+
+
+def _local_run(
+    profile: dict,
+    script: str,
+    path: str,
+    *,
+    input_data: bytes | None = None,
+    timeout: int = 30,
+) -> str:
+    """Run a workspace script on the dashboard host, mirroring _ssh_run's contract.
+
+    Same scripts, same argv shape and same RuntimeError-on-failure behaviour as
+    the SSH path, so callers do not care which transport they got.
+    """
+    root = _normalized_local_root(str(profile.get("workspace_root") or ""))
+    if root is None:
+        raise RuntimeError("Local workspace folder is missing or is not a directory")
+    result = subprocess.run(
+        [sys.executable, "-c", script, "--", path],
+        cwd=root,
+        input=input_data,
+        capture_output=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
+        raise RuntimeError((detail or "Local command failed")[:800])
+    return result.stdout.decode("utf-8", "replace")
+
+
+def _local_tmux_window_name(profile: dict) -> str:
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile.get("label") or "local")).strip("-.")
+    return f"local:{(label or 'local')[:36]}"
+
+
+def _local_open_tmux_window(profile: dict, session_name: str) -> str:
+    """Open a shell in the workspace folder, the local twin of the SSH window."""
+    if not shutil.which("tmux"):
+        raise RuntimeError("tmux is not installed on the dashboard host")
+    root = _normalized_local_root(str(profile.get("workspace_root") or ""))
+    if root is None:
+        raise RuntimeError("Local workspace folder is missing or is not a directory")
+    window_name = _local_tmux_window_name(profile)
+    existing = subprocess.run(
+        ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
+        capture_output=True,
+        timeout=8,
+    )
+    if window_name in existing.stdout.decode("utf-8", "replace").split():
+        return window_name
+    result = subprocess.run(
+        ["tmux", "new-window", "-d", "-t", session_name, "-n", window_name, "-c", root],
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
+        raise RuntimeError((detail or "Could not open local tmux window")[:800])
+    return window_name
 
 
 def _ssh_run(
@@ -11021,6 +11329,10 @@ def _ssh_run(
     input_data: bytes | None = None,
     timeout: int = 30,
 ) -> str:
+    # A local workspace has no control master; it runs the same script here.
+    if _is_local_profile(profile):
+        script, path = _local_command_parts(remote_command)
+        return _local_run(profile, script, path, input_data=input_data, timeout=timeout)
     if not _ssh_control_is_alive(profile, session_name):
         raise RuntimeError("SSH connection is not live; reconnect from the Remote IDE")
     argv = _ssh_argv(profile)
@@ -11285,9 +11597,12 @@ def _ssh_set_pty_size(fd: int, cols: int, rows: int, pid: int | None = None) -> 
 
 
 class SSHConnectionBody(BaseModel):
+    # kind="local" opens a folder on the dashboard host; host/username are then
+    # unused, so they carry defaults instead of being required.
+    kind: str = "ssh"
     label: str = ""
-    host: str
-    username: str
+    host: str = ""
+    username: str = ""
     port: int = 22
     identity_file: str = ""
     auth_mode: str = "agent"
@@ -11491,6 +11806,11 @@ async def api_ide_chat_messages(request: Request, session_name: str, limit: int 
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
+    # Assistant replies are only written when something captures the agent's
+    # finished turn. That used to happen exclusively in the dashboard's session
+    # poll, so an IDE used on its own showed the user's own messages and never
+    # an answer. Capture here too, on the same idle/signature gates.
+    await _capture_agent_reply(session_name)
     messages = await asyncio.to_thread(_load_session_messages, session_name)
     bounded = max(1, min(int(limit or 80), 200))
     return JSONResponse({"messages": messages[-bounded:]})
@@ -11505,11 +11825,167 @@ async def api_list_ssh_connections(request: Request, session_name: str):
     return JSONResponse({"connections": [_ssh_public_profile(item) for item in profiles]})
 
 
+def _browse_roots(user: dict | None) -> list[Path]:
+    """Directories this user may browse when picking a folder to open.
+
+    An admin manages the host, so the filesystem root is in scope. A member is
+    confined to their own project space -- the same boundary the rest of the
+    dashboard enforces -- so the folder picker can never be used to enumerate
+    another tenant's files.
+    """
+    if _is_admin(user):
+        return [Path("/")]
+    username = str((user or {}).get("username") or (user or {}).get("id") or "")
+    if not username:
+        return []
+    return [PROJECTS_ROOT / username]
+
+
+def _browse_path_allowed(candidate: Path, roots: list[Path]) -> bool:
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+@app.get("/api/ide/connections/saved")
+async def api_saved_connections(request: Request):
+    """Every connection this user owns, across all sessions.
+
+    The per-session lists power the IDE; this one powers "reuse a saved
+    connection" when creating a session, so a host is configured once rather
+    than re-entered for each new session.
+    """
+    denied = _ssh_ide_denied(request)
+    if denied:
+        return denied
+    user = _current_user(request)
+    data = _ssh_connections_store().read()
+    profiles = data.get("connections") if isinstance(data, dict) else []
+    seen: dict[str, dict] = {}
+    for profile in profiles:
+        if not isinstance(profile, dict) or not _ssh_user_may_use_profile(user, profile):
+            continue
+        public = _ssh_public_profile(profile)
+        # One host may be attached to several sessions; offer each target once,
+        # keyed by what actually identifies it.
+        key = "|".join([
+            str(public.get("kind") or "ssh"),
+            str(public.get("host") or ""),
+            str(public.get("username") or ""),
+            str(public.get("port") or 22),
+            str(public.get("workspace_root") or ""),
+        ])
+        if key not in seen:
+            seen[key] = public
+    items = sorted(seen.values(), key=lambda item: (item.get("kind") or "", (item.get("label") or "").lower()))
+    return JSONResponse({"connections": items})
+
+
+@app.get("/api/ide/browse")
+async def api_browse_directories(request: Request, path: str = ""):
+    """List sub-directories so the IDE can offer a VS Code style folder picker.
+
+    Directories only: this feeds "Open Folder", and never returns file contents.
+    """
+    denied = _ssh_ide_denied(request)
+    if denied:
+        return denied
+    user = _current_user(request)
+    roots = _browse_roots(user)
+    if not roots:
+        return JSONResponse({"error": "No browsable location for this account"}, status_code=403)
+    raw = (path or "").strip() or str(roots[0])
+    try:
+        target = Path(raw).expanduser().resolve(strict=True)
+    except (OSError, ValueError, RuntimeError):
+        return JSONResponse({"error": "Folder not found"}, status_code=404)
+    if not target.is_dir():
+        return JSONResponse({"error": "Not a folder"}, status_code=400)
+    if not _browse_path_allowed(target, roots):
+        return JSONResponse({"error": "Folder is outside your allowed area"}, status_code=403)
+    entries = []
+    try:
+        with os.scandir(target) as children:
+            for entry in children:
+                if not entry.name.startswith("."):
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            entries.append({"name": entry.name, "path": str(target / entry.name)})
+                    except OSError:
+                        continue
+    except PermissionError:
+        return JSONResponse({"error": "Permission denied for this folder"}, status_code=403)
+    except OSError as exc:
+        return JSONResponse({"error": str(exc)[:200]}, status_code=400)
+    entries.sort(key=lambda item: item["name"].lower())
+    parent = str(target.parent)
+    return JSONResponse({
+        "path": str(target),
+        # Withhold the parent at a boundary so the UI cannot offer a step up
+        # into a directory the next request would refuse anyway.
+        "parent": parent if (parent != str(target) and _browse_path_allowed(Path(parent), roots)) else "",
+        "entries": entries[:1000],
+        "is_git": (target / ".git").exists(),
+    })
+
+
+async def _create_local_workspace(request: Request, session_name: str, body: SSHConnectionBody):
+    """Register a folder on the dashboard host as an IDE workspace.
+
+    Stored in the same file and shape as an SSH connection so listing, deleting,
+    workspace-state resume and every file route treat both kinds identically.
+    """
+    root = _normalized_local_root(body.workspace_root)
+    if root is None:
+        return JSONResponse(
+            {"error": "Enter an existing folder path on this server"}, status_code=400
+        )
+    if not 1_024 <= body.max_file_bytes <= SSH_MAX_FILE_BYTES:
+        return JSONResponse({"error": "File limit must be between 1 KB and 1 MB"}, status_code=400)
+    label = (body.label.strip() or Path(root).name or root)[:80]
+    user = _current_user(request)
+    connection_id = secrets.token_urlsafe(12)
+    profile = {
+        "id": connection_id,
+        "kind": LOCAL_CONNECTION_KIND,
+        "session_name": session_name,
+        "label": label,
+        "host": "",
+        "username": "",
+        "port": 22,
+        "identity_file": "",
+        "auth_mode": "local",
+        "workspace_root": root,
+        "max_file_bytes": body.max_file_bytes,
+        "owner_id": str((user or {}).get("id") or ""),
+        "owner_username": str((user or {}).get("username") or ""),
+        "password_enc": "",
+        "last_directory": ".",
+        "created_at": time.time(),
+    }
+
+    def add(data: dict):
+        data.setdefault("connections", []).append(profile)
+
+    _ssh_connections_store().update(add)
+    _harden_ssh_state_file(SSH_CONNECTIONS_FILE)
+    return JSONResponse({"ok": True, "connection": _ssh_public_profile(profile)}, status_code=201)
+
+
 @app.post("/api/sessions/{session_name}/ide/ssh-connections")
 async def api_create_ssh_connection(request: Request, session_name: str, body: SSHConnectionBody):
     _session, error = _ssh_ide_session_or_response(request, session_name)
     if error:
         return error
+    kind = (body.kind or "ssh").strip().lower()
+    if kind not in {"ssh", LOCAL_CONNECTION_KIND}:
+        return JSONResponse({"error": "Connection kind must be 'ssh' or 'local'"}, status_code=400)
+    if kind == LOCAL_CONNECTION_KIND:
+        return await _create_local_workspace(request, session_name, body)
     host = body.host.strip()
     username = body.username.strip()
     label = (body.label.strip() or f"{username}@{host}")[:80]
@@ -11615,6 +12091,15 @@ async def api_connect_ssh_connection(
     profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
+    # A local workspace has nothing to authenticate: just make sure the folder is
+    # still there and give it the same interactive tmux window an SSH target gets.
+    if _is_local_profile(profile):
+        try:
+            window_name = await asyncio.to_thread(_local_open_tmux_window, profile, session_name)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        await _record_ssh_ide_audit(request, session_name, profile, "local_opened")
+        return JSONResponse({"ok": True, "connected": True, "window_name": window_name})
     # A password supplied in the request wins (rotation / first use); otherwise
     # fall back to the stored credential so a resumed session reconnects without
     # prompting anyone.
@@ -19736,6 +20221,8 @@ body.member-simple .nav-codex-alert{display:none !important}
 /* Tabs */
 .tab-bar{display:flex;border-bottom:1px solid #21262d}
 .tab{padding:10px 20px;font-size:.85rem;font-weight:500;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;transition:color .15s,border-color .15s;user-select:none}
+.tab-ide-btn{color:#58a6ff}
+.tab-ide-btn:hover{color:#79c0ff;border-bottom-color:#58a6ff}
 .tab:hover{color:#c9d1d9}
 .tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
 /* Tab-more dropdown (Chat/Skills/Info) */
@@ -20076,6 +20563,10 @@ body.member-simple .nav-codex-alert{display:none !important}
 .modal h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem}
 .modal p{color:#8b949e;font-size:.9rem;margin-bottom:16px;line-height:1.5}
 .modal-input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 12px;font-size:.9rem;margin-bottom:16px;outline:none}
+.ws-block{border-top:1px solid #21262d;padding-top:12px;margin-bottom:4px;text-align:left}
+.ws-label{display:block;font-size:.75rem;color:#8b949e;margin-bottom:6px}
+.ws-opt{color:#6e7681}
+.ws-block .modal-input{margin-bottom:8px}
 .modal-input:focus{border-color:#58a6ff}
 .modal-input::placeholder{color:#484f58}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end}
@@ -20682,16 +21173,24 @@ body.member-simple .hide-in-simple{display:none!important}
       </aside>
     </div>
     <div class="ide-dialog" id="ide-connection-dialog">
-      <h3>Add SSH connection</h3>
-      <label>Label</label><input id="ide-conn-label" maxlength="80" placeholder="Production API">
-      <div class="ide-dialog-grid"><div><label>Host</label><input id="ide-conn-host" required placeholder="server.example.com"></div><div><label>Port</label><input id="ide-conn-port" type="number" min="1" max="65535" value="22"></div></div>
-      <label>Username</label><input id="ide-conn-user" required placeholder="deploy">
-      <label>Authentication</label><select id="ide-conn-auth" onchange="ideAuthModeChanged()"><option value="agent">SSH agent</option><option value="key">Existing SSH key</option><option value="password">Password (saved, encrypted)</option></select>
-      <div id="ide-conn-key-wrap"><label>Identity file (for key authentication)</label><input id="ide-conn-key" placeholder="~/.ssh/id_ed25519"></div>
-      <div id="ide-conn-password-wrap" style="display:none"><label>Password (stored encrypted for resume)</label><input id="ide-conn-password" type="password" autocomplete="new-password"></div>
+      <h3 id="ide-conn-title">Open a folder</h3>
+      <label>Where</label>
+      <select id="ide-conn-kind" onchange="ideConnKindChanged()">
+        <option value="local">This server (local folder)</option>
+        <option value="ssh">Remote host over SSH</option>
+      </select>
+      <label>Label</label><input id="ide-conn-label" maxlength="80" placeholder="my-project">
+      <div id="ide-conn-ssh-fields" style="display:none">
+        <div class="ide-dialog-grid"><div><label>Host</label><input id="ide-conn-host" placeholder="server.example.com"></div><div><label>Port</label><input id="ide-conn-port" type="number" min="1" max="65535" value="22"></div></div>
+        <label>Username</label><input id="ide-conn-user" placeholder="deploy">
+        <label>Authentication</label><select id="ide-conn-auth" onchange="ideAuthModeChanged()"><option value="agent">SSH agent</option><option value="key">Existing SSH key</option><option value="password">Password (saved, encrypted)</option></select>
+        <div id="ide-conn-key-wrap"><label>Identity file (for key authentication)</label><input id="ide-conn-key" placeholder="~/.ssh/id_ed25519"></div>
+        <div id="ide-conn-password-wrap" style="display:none"><label>Password (stored encrypted for resume)</label><input id="ide-conn-password" type="password" autocomplete="new-password"></div>
+      </div>
       <label>Workspace root</label><input id="ide-conn-workspace" value="." placeholder="/srv/app">
       <label>Maximum file size (KB)</label><input id="ide-conn-max-file-kb" type="number" min="1" max="1000" value="1000">
-      <div class="ide-dialog-note">Uses an SSH agent, a key already under <code>~/.ssh</code>, or a password held only while the session connection is established. Pasted private keys are not accepted. The host must already be trusted in <code>known_hosts</code>.</div>
+      <div class="ide-dialog-note" id="ide-conn-note-local">Opens a folder that already exists on this dashboard server — no SSH, no credentials. Enter an absolute path such as <code>/var/www/multibuilder</code>.</div>
+      <div class="ide-dialog-note" id="ide-conn-note-ssh" style="display:none">Uses an SSH agent, a key already under <code>~/.ssh</code>, or a password held only while the session connection is established. Pasted private keys are not accepted. The host must already be trusted in <code>known_hosts</code>.</div>
       <div class="ide-dialog-actions"><button class="ide-btn" onclick="ideHideConnectionForm()">Cancel</button><button class="ide-btn primary" onclick="ideSaveConnection()">Save connection</button></div>
     </div>
     <div class="ide-dialog ide-quick-open-dialog" id="ide-quick-open-dialog">
@@ -22331,6 +22830,9 @@ function renderDetail(){
           <div class="tab-more-item ${tab==='chat'?'active':''}" data-tab="chat" onclick="switchTab('${s.name}','chat');closeViewMenu()">Chat <span class="tab-more-hint">replies in plain language</span></div>
         </div>
       </div>
+      <!-- The IDE was reachable only from the overflow menu, which hid the main
+           way people edit a session's files. It gets its own tab-bar button. -->
+      ${MEMBER_SIMPLE?'':`<div class="tab tab-ide-btn" onclick="openSvelteIde('${esc(s.name)}')" title="Open the IDE for this session (local folder or SSH)">IDE</div>`}
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
@@ -22357,8 +22859,8 @@ function renderDetail(){
           ${MEMBER_SIMPLE?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
-          <div class="tab-more-item" onclick="openSvelteIde('${esc(s.name)}');closeTabMore()">Remote SSH IDE</div>
-          <div class="tab-more-item" onclick="openRemoteIde('${esc(s.name)}');closeTabMore()">Remote SSH IDE (legacy)</div>
+          <div class="tab-more-item" onclick="openSvelteIde('${esc(s.name)}');closeTabMore()">IDE (new tab)</div>
+          <div class="tab-more-item" onclick="openRemoteIde('${esc(s.name)}');closeTabMore()">IDE (in this page)</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','AGENTS.md');closeTabMore()">Project AGENTS.md</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.codex/config.toml');closeTabMore()">Project config.toml</div>
@@ -23617,17 +24119,109 @@ function showCreateModal(){
     <input type="text" class="modal-input" id="new-session-name" value="${pre}"
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
+    ${MEMBER_SIMPLE?'':`
+    <!-- Optional workspace for the IDE. The agent always runs here on the
+         dashboard host; this only chooses the folder the IDE opens, and for an
+         SSH target also adds a remote shell window to the session. -->
+    <div class="ws-block">
+      <label class="ws-label" for="new-session-ws">Workspace for the IDE <span class="ws-opt">(optional)</span></label>
+      <select class="modal-input" id="new-session-ws" onchange="onNewSessionWorkspaceChange()">
+        <option value="">None — set it later in the IDE</option>
+        <option value="local">Folder on this server</option>
+        <option value="ssh">Remote host over SSH</option>
+      </select>
+      <div id="new-session-ws-saved" style="display:none">
+        <label class="ws-label" for="new-session-ws-reuse">Saved connection</label>
+        <select class="modal-input" id="new-session-ws-reuse" onchange="onNewSessionReuseChange()">
+          <option value="">— add a new one —</option>
+        </select>
+      </div>
+      <div id="new-session-ws-local" style="display:none">
+        <input type="text" class="modal-input" id="new-session-ws-root"
+          placeholder="/var/www/my-project" autocomplete="off" spellcheck="false">
+      </div>
+      <div id="new-session-ws-ssh" style="display:none">
+        <input type="text" class="modal-input" id="new-session-ws-host" placeholder="Host (server.example.com)" autocomplete="off" spellcheck="false">
+        <input type="text" class="modal-input" id="new-session-ws-user" placeholder="SSH username" autocomplete="off" spellcheck="false">
+        <select class="modal-input" id="new-session-ws-auth" onchange="onNewSessionAuthChange()">
+          <option value="agent">SSH agent</option>
+          <option value="key">Existing key under ~/.ssh</option>
+          <option value="password">Password (saved, encrypted)</option>
+        </select>
+        <input type="text" class="modal-input" id="new-session-ws-key" placeholder="~/.ssh/id_ed25519" style="display:none" autocomplete="off" spellcheck="false">
+        <input type="password" class="modal-input" id="new-session-ws-pass" placeholder="SSH password" style="display:none" autocomplete="new-password">
+        <input type="text" class="modal-input" id="new-session-ws-remote-root" placeholder="Remote folder (default: login directory)" autocomplete="off" spellcheck="false">
+      </div>
+    </div>`}
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
       <button class="modal-confirm-create" id="create-session-btn" onclick="createSession()">Create</button>
     </div>`;
   document.getElementById('modal-overlay').classList.add('active');
+  if(!MEMBER_SIMPLE)loadNewSessionConnections();
   setTimeout(()=>{const i=document.getElementById('new-session-name');if(i){i.focus();i.select();}},50);
+}
+
+// Saved connections offered by the new-session modal, kept so the reuse
+// dropdown can look one up by id without a second round trip.
+let _newSessionConnections=[];
+async function loadNewSessionConnections(){
+  try{
+    const resp=await fetch(BASE+'/api/ide/connections/saved');
+    if(!resp.ok)return;
+    const data=await resp.json();
+    _newSessionConnections=data.connections||[];
+  }catch(e){_newSessionConnections=[]}
+}
+function _wsEl(id){return document.getElementById(id)}
+function onNewSessionWorkspaceChange(){
+  const kind=(_wsEl('new-session-ws')||{}).value||'';
+  const saved=_newSessionConnections.filter(c=>(c.kind||'ssh')===(kind||'ssh'));
+  const savedWrap=_wsEl('new-session-ws-saved');
+  const reuse=_wsEl('new-session-ws-reuse');
+  if(reuse){
+    reuse.innerHTML='<option value="">— add a new one —</option>'+
+      saved.map(c=>`<option value="${esc(c.id)}">${esc(c.label)} · ${esc(c.kind==='local'?c.workspace_root:(c.username+'@'+c.host))}</option>`).join('');
+  }
+  if(savedWrap)savedWrap.style.display=(kind&&saved.length)?'':'none';
+  onNewSessionReuseChange();
+}
+function onNewSessionReuseChange(){
+  const kind=(_wsEl('new-session-ws')||{}).value||'';
+  const reusing=!!((_wsEl('new-session-ws-reuse')||{}).value);
+  // Reusing a saved host needs no host fields; only the folder is still useful.
+  const localWrap=_wsEl('new-session-ws-local');
+  const sshWrap=_wsEl('new-session-ws-ssh');
+  if(localWrap)localWrap.style.display=(kind==='local'&&!reusing)?'':'none';
+  if(sshWrap)sshWrap.style.display=(kind==='ssh'&&!reusing)?'':'none';
+}
+function onNewSessionAuthChange(){
+  const mode=(_wsEl('new-session-ws-auth')||{}).value||'agent';
+  const key=_wsEl('new-session-ws-key');const pass=_wsEl('new-session-ws-pass');
+  if(key)key.style.display=mode==='key'?'':'none';
+  if(pass)pass.style.display=mode==='password'?'':'none';
+}
+function _newSessionWorkspacePayload(){
+  const kind=(_wsEl('new-session-ws')||{}).value||'';
+  if(!kind)return {};
+  const reuse=(_wsEl('new-session-ws-reuse')||{}).value||'';
+  if(reuse)return {workspace:kind,reuse_connection_id:reuse};
+  if(kind==='local')return {workspace:'local',workspace_root:((_wsEl('new-session-ws-root')||{}).value||'').trim()};
+  return {
+    workspace:'ssh',
+    ssh_host:((_wsEl('new-session-ws-host')||{}).value||'').trim(),
+    ssh_username:((_wsEl('new-session-ws-user')||{}).value||'').trim(),
+    ssh_auth_mode:(_wsEl('new-session-ws-auth')||{}).value||'agent',
+    ssh_identity_file:((_wsEl('new-session-ws-key')||{}).value||'').trim(),
+    ssh_password:(_wsEl('new-session-ws-pass')||{}).value||'',
+    workspace_root:((_wsEl('new-session-ws-remote-root')||{}).value||'').trim()||'.',
+  };
 }
 
 async function createSession(){
   const input=document.getElementById('new-session-name');
   const name=input?input.value.trim():'';
+  const workspace=_newSessionWorkspacePayload();
   const modal=document.getElementById('modal-content');
   // Immediately show a loading state so it never looks frozen (the first session
   // for a member can take a few seconds to provision).
@@ -23639,7 +24233,7 @@ async function createSession(){
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name})
+      body:JSON.stringify({name,...workspace})
     });
     const data=await resp.json();
     if(!resp.ok){
@@ -23650,6 +24244,18 @@ async function createSession(){
       return;
     }
     selectedSession=data.name;
+    // The session exists even when the workspace could not connect. Report that
+    // in the modal that is already open rather than closing it silently and
+    // letting the IDE look broken later.
+    if(data.warning){
+      if(modal){modal.innerHTML=`<h3>Session created</h3>
+        <p class="conn-note">"${esc(data.name)}" is ready and the agent is running.</p>
+        <p class="conn-note">The workspace was saved but could not connect: ${esc(data.warning)}<br>
+        You can retry it from the IDE.</p>
+        <div class="modal-actions"><button class="modal-confirm-create" onclick="closeModal()">OK</button></div>`;}
+      await loadAll();
+      return;
+    }
     closeModal();
     await loadAll();
   }catch(e){
@@ -26732,19 +27338,42 @@ async function ideSaveActive(){
     tab.saved=tab.content;tab.dirty=false;ideRenderTabs();ideSetStatus('Saved '+ideFilename(tab.path),tab.path);
   }catch(error){ideSetStatus(error.message||'Could not save remote file',tab.path);}
 }
-function ideShowConnectionForm(){document.getElementById('ide-connection-dialog').classList.add('active');document.getElementById('ide-conn-host').focus()}
+function ideShowConnectionForm(){document.getElementById('ide-connection-dialog').classList.add('active');ideConnKindChanged();
+  // Focus whichever first field the chosen kind actually shows; the host input
+  // is hidden for a local folder, and focusing a hidden input does nothing.
+  const local=(document.getElementById('ide-conn-kind').value||'local')==='local';
+  document.getElementById(local?'ide-conn-workspace':'ide-conn-host').focus()}
 function ideHideConnectionForm(){document.getElementById('ide-connection-dialog').classList.remove('active')}
 function ideAuthModeChanged(){const password=document.getElementById('ide-conn-auth').value==='password';document.getElementById('ide-conn-key-wrap').style.display=password?'none':'';document.getElementById('ide-conn-password-wrap').style.display=password?'':'none'}
+function ideConnKindChanged(){
+  const local=(document.getElementById('ide-conn-kind').value||'local')==='local';
+  document.getElementById('ide-conn-ssh-fields').style.display=local?'none':'';
+  document.getElementById('ide-conn-note-local').style.display=local?'':'none';
+  document.getElementById('ide-conn-note-ssh').style.display=local?'none':'';
+  document.getElementById('ide-conn-title').textContent=local?'Open a folder':'Add SSH connection';
+  const workspace=document.getElementById('ide-conn-workspace');
+  // '.' means "the login directory" over SSH, but a local workspace needs a real
+  // folder, so seed an absolute placeholder instead of a meaningless default.
+  if(local&&workspace.value==='.')workspace.value='';
+  if(!local&&!workspace.value)workspace.value='.';
+  workspace.placeholder=local?'/var/www/my-project':'/srv/app';
+}
 async function ideSaveConnection(){
-  const body={label:document.getElementById('ide-conn-label').value,host:document.getElementById('ide-conn-host').value,username:document.getElementById('ide-conn-user').value,port:Number(document.getElementById('ide-conn-port').value||22),identity_file:document.getElementById('ide-conn-key').value,auth_mode:document.getElementById('ide-conn-auth').value,password:document.getElementById('ide-conn-password').value,workspace_root:document.getElementById('ide-conn-workspace').value,max_file_bytes:Number(document.getElementById('ide-conn-max-file-kb').value||1000)*1000};
-  try{const response=await fetch(ideApi('/ssh-connections'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not save SSH connection');_ide.password=body.password||'';document.getElementById('ide-conn-password').value='';_ide.connectionId=data.connection.id;ideHideConnectionForm();await ideLoadConnections();await ideConnectActive();}
-  catch(error){ideSetStatus(error.message||'Could not save SSH connection');}
+  const kind=document.getElementById('ide-conn-kind').value||'local';
+  const isLocal=kind==='local';
+  const body=isLocal
+    ?{kind:'local',label:document.getElementById('ide-conn-label').value,workspace_root:document.getElementById('ide-conn-workspace').value,max_file_bytes:Number(document.getElementById('ide-conn-max-file-kb').value||1000)*1000}
+    :{kind:'ssh',label:document.getElementById('ide-conn-label').value,host:document.getElementById('ide-conn-host').value,username:document.getElementById('ide-conn-user').value,port:Number(document.getElementById('ide-conn-port').value||22),identity_file:document.getElementById('ide-conn-key').value,auth_mode:document.getElementById('ide-conn-auth').value,password:document.getElementById('ide-conn-password').value,workspace_root:document.getElementById('ide-conn-workspace').value,max_file_bytes:Number(document.getElementById('ide-conn-max-file-kb').value||1000)*1000};
+  const failure=isLocal?'Could not open the local folder':'Could not save SSH connection';
+  try{const response=await fetch(ideApi('/ssh-connections'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||failure);_ide.password=body.password||'';document.getElementById('ide-conn-password').value='';_ide.connectionId=data.connection.id;ideHideConnectionForm();await ideLoadConnections();await ideConnectActive();}
+  catch(error){ideSetStatus(error.message||failure);}
 }
 async function ideConnectActive(){
-  if(!_ide.connectionId)return;const connection=ideActiveConnection()||{};ideSetConnectionState('connecting','● Connecting…');ideSetStatus('Connecting '+(connection.label||'SSH workspace')+'…');
-  const password=connection.auth_mode==='password'?(_ide.password||prompt('SSH password for '+(connection.username||'')+'@'+(connection.host||''))) : '';
+  if(!_ide.connectionId)return;const connection=ideActiveConnection()||{};const isLocal=connection.kind==='local';
+  ideSetConnectionState('connecting',isLocal?'● Opening…':'● Connecting…');ideSetStatus((isLocal?'Opening ':'Connecting ')+(connection.label||(isLocal?'local folder':'SSH workspace'))+'…');
+  const password=(!isLocal&&connection.auth_mode==='password')?(_ide.password||prompt('SSH password for '+(connection.username||'')+'@'+(connection.host||''))) : '';
   if(connection.auth_mode==='password'&&password===null){ideSetStatus('SSH connection cancelled');return;}
-  try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/connect'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not establish session SSH connection');_ide.password='';ideSetConnectionState('connected','● Connected');ideSetStatus('Connected · '+(connection.label||'SSH workspace'),'SSH terminal: '+(data.window_name||'open'));await ideRestoreWorkspace();}
+  try{const response=await fetch(ideApi('/ssh-connections/'+encodeURIComponent(_ide.connectionId)+'/connect'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||(isLocal?'Could not open the local folder':'Could not establish session SSH connection'));_ide.password='';ideSetConnectionState('connected',isLocal?'● Open':'● Connected');ideSetStatus((isLocal?'Open · ':'Connected · ')+(connection.label||(isLocal?'local folder':'SSH workspace')),'Terminal: '+(data.window_name||'open'));await ideRestoreWorkspace();}
   catch(error){ideSetConnectionState('error','● Connection error');ideSetStatus(error.message||'Could not establish session SSH connection');}
 }
 async function ideFocusTerminal(){

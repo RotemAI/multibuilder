@@ -1,4 +1,5 @@
 import { mount } from 'svelte'
+import './app.css'
 import Ide from './lib/Ide.svelte'
 
 // app.py renders <div id="ide-root"> plus a bootstrap object holding the
