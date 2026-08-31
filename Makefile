@@ -1,4 +1,4 @@
-.PHONY: test test-fast coverage check lint lint-fix run run-dev backup backup-data restore-check install ide ide-dev help
+.PHONY: test test-fast coverage check lint lint-fix run run-dev backup backup-data restore-check install ide ide-dev docker-build docker-up docker-down docker-logs test-ssh help
 
 PORT ?= 8501
 
@@ -19,6 +19,12 @@ help:
 	@echo "  make install       Install Python dependencies"
 	@echo "  make ide           Build the Svelte Remote IDE bundle"
 	@echo "  make ide-dev       Rebuild the IDE bundle on change"
+	@echo ""
+	@echo "  make docker-build  Build the container image"
+	@echo "  make docker-up     Start the stack (needs .env)"
+	@echo "  make docker-down   Stop the stack"
+	@echo "  make docker-logs   Follow dashboard logs"
+	@echo "  make test-ssh      Start a disposable sshd for Remote IDE testing"
 	@echo ""
 	@echo "Environment variables:"
 	@echo "  PORT               Server port (default: 8501)"
@@ -89,3 +95,24 @@ ide:
 
 ide-dev:
 	cd ide-ui && npm run dev
+
+# ── Docker ──────────────────────────────────────────────────────────────────
+docker-build:
+	docker compose build
+
+docker-up:
+	@test -f .env || { echo "Create .env first: cp .env.example .env"; exit 1; }
+	docker compose up -d
+	@echo "Dashboard on http://127.0.0.1:$${TMUX_DASH_PORT:-8501}$${TMUX_DASH_ROOT_PATH:-/codex}/"
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f dashboard
+
+# Disposable SSH target for exercising the Remote IDE against a real sshd.
+test-ssh:
+	docker compose --profile testing up -d sshd
+	@echo "sshd on 127.0.0.1:$${TEST_SSH_PORT:-2222} as $${TEST_SSH_USER:-devuser}/$${TEST_SSH_PASSWORD:-devpass}"
+	@echo "Workspace root: /home/$${TEST_SSH_USER:-devuser}/workspace"

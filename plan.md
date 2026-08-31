@@ -149,6 +149,22 @@ find/replace, a rendered diff view, file upload/download, and content search
 After changing anything under `ide-ui/`, run `make ide` and commit the
 rebuilt bundle; `make ide-dev` rebuilds on change while developing.
 
+## Deployment
+
+`docker compose up` runs the stack: a multi-stage image that builds the
+Svelte bundle in a Node stage and runs as a non-root user with `tmux`, the
+OpenSSH client, and `git`.
+
+Two container-specific constraints are load-bearing:
+
+- `~/.ssh` must be a **writable** volume. OpenSSH records trusted hosts in
+  `~/.ssh/known_hosts`, so mounting it read-only makes every connection fail
+  host-key verification. Operator keys are mounted read-only at
+  `/mnt/ssh-keys` and copied in by the entrypoint, which also fixes their
+  modes -- OpenSSH refuses a group-readable private key.
+- The healthcheck probes the dashboard root, not `/login`, which is
+  POST-only and would report a healthy container as unhealthy.
+
 ## Verification
 
 - Full suite: 464 passing. The one remaining failure,
@@ -157,6 +173,12 @@ rebuilt bundle; `make ide-dev` rebuilds on change while developing.
 - Credential vault: 14 tests covering round-trip, AAD binding, tamper
   rejection, keyfile permissions, restart survival, and no-plaintext-on-disk.
 - Python compilation and rendered browser JavaScript syntax checks: passing.
+- **Verified against a real sshd** (`make test-ssh`), no longer mocks alone:
+  password auth via the ephemeral askpass, control-master reuse, remote
+  list/read/atomic-write, git status, reconnect after the master is killed,
+  wrong-password rejection, remote refusal of `../../etc/passwd` and
+  `/etc/passwd` by the realpath check, and refusal of an untrusted host key
+  even with correct credentials.
 - The Svelte IDE was driven in a real browser: the shell mounts, Monaco
   renders at Monokai's `#272822`, sidebar/git/chat panels and the connection
   form all work, and creating a password connection through the UI wrote

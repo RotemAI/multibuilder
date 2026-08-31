@@ -1,0 +1,63 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tmux-dashboard:latest
+    container_name: tmux-dashboard
+    restart: unless-stopped
+    ports:
+      - "${TMUX_DASH_BIND:-127.0.0.1}:${TMUX_DASH_PORT:-8501}:8505"
+    environment:
+      # Required in any real deployment. Without TMUX_DASH_PASS the send and
+      # auto-respond endpoints will execute keystrokes for anyone who can reach
+      # the port, so compose refuses to start rather than defaulting it.
+      TMUX_DASH_PASS: ${TMUX_DASH_PASS:?set TMUX_DASH_PASS in .env}
+      TMUX_DASH_SECRET: ${TMUX_DASH_SECRET:?set TMUX_DASH_SECRET in .env}
+      TMUX_DASH_USER: ${TMUX_DASH_USER:-admin}
+      TMUX_DASH_ROOT_PATH: ${TMUX_DASH_ROOT_PATH:-/codex}
+      TMUX_DASH_PORT: 8505
+      # Keeps the SSH credential key out of the state directory, so a copied
+      # volume is not enough to decrypt stored passwords.
+      TMUX_DASH_SSH_KEY: ${TMUX_DASH_SSH_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      # Space-separated "host" or "host:port" entries to trust at startup.
+      # Strict host-key checking stays on; this only pre-seeds known_hosts.
+      SSH_KNOWN_HOSTS: ${SSH_KNOWN_HOSTS:-}
+    volumes:
+      # Persistent state: connection metadata, credential ciphertext, messages.
+      - dashboard-state:/home/app/.tmux-dashboard
+      # ~/.ssh must stay WRITABLE: OpenSSH records trusted hosts in
+      # ~/.ssh/known_hosts, and with StrictHostKeyChecking=yes a read-only
+      # mount makes every connection fail host-key verification.
+      - dashboard-ssh:/home/app/.ssh
+      # Your own keys are mounted read-only elsewhere and copied in at start,
+      # so the host copies are never modified.
+      - ${SSH_KEYS_DIR:-./docker/ssh-empty}:/mnt/ssh-keys:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('TMUX_DASH_PORT','8505')+os.environ.get('TMUX_DASH_ROOT_PATH','/codex')+'/',timeout=4).status<500 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  # Disposable SSH target for exercising the Remote IDE against a real sshd:
+  # password auth, reconnect, host-key handling, and remote file operations.
+  # Test-only — it is behind the `testing` profile so a plain `up` never starts
+  # a container with a known password.
+  sshd:
+    build:
+      context: ./docker/sshd
+    image: tmux-dashboard-sshd:latest
+    container_name: tmux-dashboard-sshd
+    profiles: ["testing"]
+    environment:
+      SSH_USER: ${TEST_SSH_USER:-devuser}
+      SSH_PASSWORD: ${TEST_SSH_PASSWORD:-devpass}
+    ports:
+      - "127.0.0.1:${TEST_SSH_PORT:-2222}:22"
+
+volumes:
+  dashboard-state:
+  dashboard-ssh:
