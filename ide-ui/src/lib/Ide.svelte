@@ -7,6 +7,9 @@
   import Editor from './Editor.svelte'
   import Tabs from './Tabs.svelte'
   import Chat from './Chat.svelte'
+  import {
+    Plus, Trash2, SquareTerminal, Circle, CircleDot, CircleCheck, CircleAlert, Files, GitBranch,
+  } from 'lucide-svelte'
 
   let { sessions = [], session = '', rootPath = '' } = $props()
 
@@ -19,13 +22,14 @@
     workspace_root: '.', max_file_bytes: 1000000,
   })
 
-  const STATE_LABEL = {
-    idle: '○ Not connected',
-    connecting: '◍ Connecting…',
-    connected: '● Connected',
-    reconnect: '● Reconnect required',
-    error: '● Error',
+  const STATE_META = {
+    idle: { icon: Circle, label: 'Not connected' },
+    connecting: { icon: CircleDot, label: 'Connecting…' },
+    connected: { icon: CircleCheck, label: 'Connected' },
+    reconnect: { icon: CircleAlert, label: 'Reconnect required' },
+    error: { icon: CircleAlert, label: 'Error' },
   }
+  const StateIcon = $derived(STATE_META[ide.connectionState].icon)
 
   onMount(async () => {
     await ide.loadConnections()
@@ -99,12 +103,19 @@
       {/each}
     </select>
 
-    <button onclick={() => (showConnectionForm = !showConnectionForm)}>＋ Add</button>
+    <button onclick={() => (showConnectionForm = !showConnectionForm)}>
+      <Plus size={14} /> Add
+    </button>
     {#if ide.connection}
-      <button onclick={removeConnection} title="Delete connection">🗑</button>
+      <button onclick={removeConnection} title="Delete connection" aria-label="Delete connection">
+        <Trash2 size={14} />
+      </button>
     {/if}
 
-    <span class="state {ide.connectionState}">{STATE_LABEL[ide.connectionState]}</span>
+    <span class="state {ide.connectionState}">
+      <StateIcon size={13} />
+      {STATE_META[ide.connectionState].label}
+    </span>
 
     {#if ide.connectionState !== 'connected'}
       {#if ide.connection && !ide.connection.has_password}
@@ -118,7 +129,9 @@
       {/if}
       <button class="primary" onclick={() => ide.connect(password)}>Connect</button>
     {:else}
-      <button onclick={focusTerminal} title="Focus the tmux SSH window">▣ Terminal</button>
+      <button onclick={focusTerminal} title="Focus the tmux SSH window">
+        <SquareTerminal size={14} /> Terminal
+      </button>
     {/if}
   </header>
 
@@ -148,8 +161,12 @@
   <div class="main">
     <aside class="sidebar">
       <div class="switch">
-        <button class:active={sidebar === 'files'} onclick={() => (sidebar = 'files')}>Files</button>
-        <button class:active={sidebar === 'git'} onclick={() => (sidebar = 'git')}>Git</button>
+        <button class:active={sidebar === 'files'} onclick={() => (sidebar = 'files')}>
+          <Files size={13} /> Files
+        </button>
+        <button class:active={sidebar === 'git'} onclick={() => (sidebar = 'git')}>
+          <GitBranch size={13} /> Git
+        </button>
       </div>
       {#if sidebar === 'files'}
         <Explorer />
@@ -200,10 +217,10 @@
   .brand { font-size: 12px; font-weight: 700; letter-spacing: .04em; color: var(--ide-accent); }
   select, input { background: var(--ide-input); border: 1px solid var(--ide-border); color: var(--ide-fg); border-radius: 3px; padding: 4px 6px; font-size: 12px; }
   .connform input, .connform select { min-width: 110px; }
-  button { background: var(--ide-panel); border: 1px solid var(--ide-border); color: var(--ide-fg); border-radius: 3px; cursor: pointer; padding: 4px 9px; font-size: 12px; }
+  button { display: inline-flex; align-items: center; gap: 5px; background: var(--ide-panel); border: 1px solid var(--ide-border); color: var(--ide-fg); border-radius: 3px; cursor: pointer; padding: 4px 9px; font-size: 12px; }
   button:hover { background: var(--ide-hover); }
   button.primary { background: var(--ide-accent); border-color: var(--ide-accent); color: #272822; font-weight: 600; }
-  .state { font-size: 11px; margin-left: auto; }
+  .state { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; margin-left: auto; }
   .state.connected { color: var(--ide-accent); }
   .state.reconnect, .state.error { color: #f92672; }
   .state.connecting { color: #e6db74; }
@@ -211,7 +228,7 @@
   .main { display: grid; grid-template-columns: minmax(190px, 250px) minmax(320px, 1fr) minmax(250px, 330px); flex: 1; min-height: 0; }
   .sidebar { display: flex; flex-direction: column; min-width: 0; background: var(--ide-panel); border-right: 1px solid var(--ide-border); }
   .switch { display: flex; border-bottom: 1px solid var(--ide-border); }
-  .switch button { flex: 1; border: 0; border-radius: 0; background: transparent; padding: 6px; }
+  .switch button { flex: 1; justify-content: center; border: 0; border-radius: 0; background: transparent; padding: 6px; }
   .switch button.active { box-shadow: inset 0 -2px 0 var(--ide-accent); color: var(--ide-accent); }
   .code { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .editor-wrap { flex: 1; min-height: 0; }

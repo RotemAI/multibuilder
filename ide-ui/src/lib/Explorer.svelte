@@ -1,6 +1,9 @@
 <script>
   import { ide } from './store.svelte.js'
   import { api } from './api.js'
+  import {
+    ArrowUp, FilePlus, FolderPlus, RefreshCw, Folder, File, Link2, Pencil, Trash2,
+  } from 'lucide-svelte'
 
   let creating = $state('')
   let newName = $state('')
@@ -56,11 +59,19 @@
 
 <div class="explorer">
   <div class="toolbar">
-    <button title="Up one folder" onclick={() => ide.refreshFiles(parentOf(ide.path))}>↑</button>
+    <button title="Up one folder" aria-label="Up one folder" onclick={() => ide.refreshFiles(parentOf(ide.path))}>
+      <ArrowUp size={14} />
+    </button>
     <span class="path" title={ide.path}>{ide.path}</span>
-    <button title="New file" onclick={() => { creating = 'file'; newName = '' }}>＋</button>
-    <button title="New folder" onclick={() => { creating = 'dir'; newName = '' }}>🗀</button>
-    <button title="Refresh" onclick={() => ide.refreshFiles()}>⟳</button>
+    <button title="New file" aria-label="New file" onclick={() => { creating = 'file'; newName = '' }}>
+      <FilePlus size={14} />
+    </button>
+    <button title="New folder" aria-label="New folder" onclick={() => { creating = 'dir'; newName = '' }}>
+      <FolderPlus size={14} />
+    </button>
+    <button title="Refresh" aria-label="Refresh" onclick={() => ide.refreshFiles()}>
+      <RefreshCw size={14} />
+    </button>
   </div>
 
   <input class="filter" placeholder="Filter files…" bind:value={ide.filter} />
@@ -85,12 +96,20 @@
           ondblclick={() => entry.is_dir && ide.refreshFiles(join(ide.path, entry.name))}
           onclick={() => !entry.is_dir && ide.openFile(join(ide.path, entry.name))}
         >
-          <span class="icon">{entry.is_dir ? '📁' : entry.is_symlink ? '🔗' : '📄'}</span>
+          <span class="icon">
+            {#if entry.is_dir}<Folder size={14} />
+            {:else if entry.is_symlink}<Link2 size={14} />
+            {:else}<File size={14} />{/if}
+          </span>
           <span class="name">{entry.name}</span>
         </button>
         <span class="actions">
-          <button title="Rename" onclick={() => rename(entry)}>✎</button>
-          <button title="Delete" onclick={() => remove(entry)}>🗑</button>
+          <button title="Rename" aria-label="Rename {entry.name}" onclick={() => rename(entry)}>
+            <Pencil size={13} />
+          </button>
+          <button title="Delete" aria-label="Delete {entry.name}" onclick={() => remove(entry)}>
+            <Trash2 size={13} />
+          </button>
         </span>
       </li>
     {:else}
@@ -115,6 +134,9 @@
   .entry { flex: 1; display: flex; gap: 6px; align-items: center; background: transparent; border: 0; color: var(--ide-fg); cursor: pointer; padding: 3px 8px; text-align: left; font-size: 12px; overflow: hidden; }
   .entry.dir .name { color: var(--ide-accent); }
   .entry .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .icon { display: flex; align-items: center; color: var(--ide-muted); }
+  .entry.dir .icon { color: var(--ide-accent); }
+  .toolbar button, .actions button { display: flex; align-items: center; justify-content: center; }
   .actions { display: none; padding-right: 4px; }
   .entries li:hover .actions { display: flex; }
   .empty { padding: 8px; color: var(--ide-muted); font-size: 12px; }
