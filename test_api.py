@@ -1327,6 +1327,53 @@ class TestSshIdeEndpoints:
 
         assert "<script>alert(1)</script>" not in body
 
+    def test_ide_chat_returns_agent_replies(self, authed_client, monkeypatch):
+        """The Svelte panel has no access to the global session poll, so it
+        reads assistant replies from this route."""
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        monkeypatch.setattr(
+            app_module,
+            "_load_session_messages",
+            lambda name: [
+                {"role": "user", "text": "hello", "ts": 1.0},
+                {"role": "assistant", "text": "hi there", "ts": 2.0},
+            ],
+        )
+
+        data = authed_client.get("/api/sessions/test-session/ide/chat").json()
+
+        assert [m["role"] for m in data["messages"]] == ["user", "assistant"]
+        assert data["messages"][1]["text"] == "hi there"
+
+    def test_ide_chat_is_bounded_and_returns_the_newest(self, authed_client, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+        monkeypatch.setattr(
+            app_module,
+            "_load_session_messages",
+            lambda name: [{"role": "user", "text": str(i), "ts": i} for i in range(500)],
+        )
+
+        default = authed_client.get("/api/sessions/test-session/ide/chat").json()["messages"]
+        assert len(default) == 80
+        assert default[-1]["text"] == "499"
+
+        # An oversized limit is clamped rather than honoured.
+        capped = authed_client.get(
+            "/api/sessions/test-session/ide/chat?limit=9999"
+        ).json()["messages"]
+        assert len(capped) == 200
+
+    def test_ide_chat_requires_an_owned_session(self, authed_client, monkeypatch):
+        import app as app_module
+
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": "test-session"}])
+
+        assert authed_client.get("/api/sessions/other-session/ide/chat").status_code == 404
+
     def _ssh_env(self, tmp_path, monkeypatch):
         import app as app_module
 

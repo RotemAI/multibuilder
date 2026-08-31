@@ -7,6 +7,7 @@
   import Editor from './Editor.svelte'
   import Tabs from './Tabs.svelte'
   import Chat from './Chat.svelte'
+  import QuickOpen from './QuickOpen.svelte'
   import {
     Plus, Trash2, SquareTerminal, Circle, CircleDot, CircleCheck, CircleAlert, Files, GitBranch,
   } from 'lucide-svelte'
@@ -14,6 +15,7 @@
   let { sessions = [], session = '', rootPath = '' } = $props()
 
   let sidebar = $state('files') // files | git
+  let quickOpen = $state(false)
   let showConnectionForm = $state(false)
   let password = $state('')
   let form = $state({
@@ -83,9 +85,23 @@
 
   function onKeydown(event) {
     const mod = event.ctrlKey || event.metaKey
-    if (mod && event.key.toLowerCase() === 's') {
+    const key = event.key.toLowerCase()
+    // Let the shortcut through when the user is typing in a form control, so
+    // Ctrl+P in the chat box does not steal focus into Quick Open. Monaco is
+    // exempt: its own widgets live inside .monaco-editor.
+    const inField =
+      event.target?.matches?.('input, textarea, select') &&
+      !event.target.closest?.('.monaco-editor')
+
+    if (mod && key === 's') {
       event.preventDefault()
       ide.saveActive()
+    } else if (mod && key === 'p' && !inField) {
+      event.preventDefault()
+      if (ide.connectionId) quickOpen = true
+    } else if (event.key === 'Escape' && quickOpen) {
+      event.preventDefault()
+      quickOpen = false
     }
   }
 </script>
@@ -184,6 +200,10 @@
       <Chat {sessions} {session} {rootPath} />
     </aside>
   </div>
+
+  {#if quickOpen}
+    <QuickOpen onclose={() => (quickOpen = false)} />
+  {/if}
 
   <footer class="statusbar">
     <span>{ide.statusText}</span>

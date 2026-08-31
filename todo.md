@@ -47,7 +47,15 @@
 - [x] Bundle Monaco locally with the Monokai theme; code-split languages.
 - [x] Three-panel shell: explorer + git, editor tabs, AI chat, status bar.
 - [x] Target a Codex or Claude agent session from the chat panel.
-- [ ] Port quick-open and the command palette to the Svelte shell.
+- [x] Open the Svelte IDE from **More → Remote SSH IDE**; the old overlay is
+      still reachable as "Remote SSH IDE (legacy)" until parity is reached.
+- [x] Show agent replies in the chat panel (`/ide/chat`, polled every 3s)
+      instead of echoing only what the user sent.
+- [x] Port Quick Open (Ctrl/Cmd+P) to the Svelte shell.
+- [x] Stage and unstage individual files from the Git panel.
+- [ ] Port the command palette and Monaco find/replace + go-to-line.
+- [ ] Surface remote LSP status in the Svelte shell.
+- [ ] Use the store's lazy `toggleDirectory` to render a recursive tree.
 - [ ] Retire the legacy inline IDE JavaScript in `app.py` once the Svelte
       shell has full parity.
 

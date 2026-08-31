@@ -19,12 +19,11 @@ class IdeStore {
   activeKey = $state('')
 
   gitOutput = $state('')
+  // Kept separate from gitOutput: every git action returns the current
+  // status, and the file list must survive a `diff` whose output is a patch.
+  gitStatus = $state('')
   gitBranches = $state([])
   gitBranch = $state('')
-
-  chatProvider = $state('codex')
-  chatMessages = $state([])
-  chatBusy = $state(false)
 
   restoredKey = ''
   persistTimer = null
@@ -248,6 +247,7 @@ class IdeStore {
     try {
       const data = await api.git(this.connectionId, { action, path: this.path || '.', ...extra })
       this.gitOutput = data.output || data.status || ''
+      this.gitStatus = data.status || ''
       this.gitBranches = data.branches || []
       this.gitBranch = data.current_branch || ''
       return data

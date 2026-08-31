@@ -11306,6 +11306,22 @@ async def remote_ide_page(request: Request, session_name: str):
     )
 
 
+@app.get("/api/sessions/{session_name}/ide/chat")
+async def api_ide_chat_messages(request: Request, session_name: str, limit: int = 80):
+    """Return recent agent chat for the IDE panel.
+
+    The Svelte IDE has no access to the dashboard's global session poll, so it
+    reads replies here. Ownership is enforced the same way as every other IDE
+    route, and messages come from the owner's store rather than the caller's.
+    """
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    messages = await asyncio.to_thread(_load_session_messages, session_name)
+    bounded = max(1, min(int(limit or 80), 200))
+    return JSONResponse({"messages": messages[-bounded:]})
+
+
 @app.get("/api/sessions/{session_name}/ide/ssh-connections")
 async def api_list_ssh_connections(request: Request, session_name: str):
     _session, error = _ssh_ide_session_or_response(request, session_name)
@@ -22167,7 +22183,8 @@ function renderDetail(){
           ${MEMBER_SIMPLE?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
-          <div class="tab-more-item" onclick="openRemoteIde('${esc(s.name)}');closeTabMore()">Remote SSH IDE</div>
+          <div class="tab-more-item" onclick="openSvelteIde('${esc(s.name)}');closeTabMore()">Remote SSH IDE</div>
+          <div class="tab-more-item" onclick="openRemoteIde('${esc(s.name)}');closeTabMore()">Remote SSH IDE (legacy)</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','AGENTS.md');closeTabMore()">Project AGENTS.md</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.codex/config.toml');closeTabMore()">Project config.toml</div>
@@ -26580,6 +26597,10 @@ async function ideSendChat(){
   const connection=ideActiveConnection()||{};const tab=ideActiveTab();const activeContent=tab?(tab.model?tab.model.getValue():tab.content||''):'';const fileContext=tab?'\nActive file contents (first 12,000 characters):\n'+activeContent.slice(0,12000):'';const prompt='[Remote SSH IDE context]\nSSH target: '+(connection.username||'?')+'@'+(connection.host||'?')+'\nRemote path: '+(tab?tab.path:_ide.path||'.')+fileContext+'\n\n'+question;
   input.disabled=true;try{const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(_ide.session)+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:prompt})});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||'Could not send to Codex');appendChatBubble(_ide.session,'user',prompt,Date.now()/1000);setOptimisticBusy(_ide.session);input.value='';ideRenderChat();scheduleBusyVerification(_ide.session);}catch(error){ideSetStatus(error.message||'Could not send to Codex');}finally{input.disabled=false;input.focus();}}
 function ideToggleMobileChat(){document.getElementById('ide-overlay').classList.toggle('chat-open')}
+function openSvelteIde(sessionName){
+  const name=sessionName||selectedSession||'';if(!name)return;
+  window.open(BASE+'/ide/'+encodeURIComponent(name),'_blank','noopener');
+}
 async function openRemoteIde(sessionName){
   _ide.open=true;_ide.session=sessionName||selectedSession||'';const overlay=document.getElementById('ide-overlay');overlay.classList.add('active');overlay.classList.remove('chat-open');
   const select=document.getElementById('ide-session-select');select.innerHTML='';sessions.forEach(session=>{const option=document.createElement('option');option.value=session.name;option.textContent=session.name;option.selected=session.name===_ide.session;select.appendChild(option)});

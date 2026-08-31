@@ -117,6 +117,13 @@ Operational requirements:
 
 ### P3 — Developer tooling
 
+Still missing, in rough priority order: an interactive browser terminal
+(today's "Terminal" only runs `tmux select-window` on the dashboard host, so
+a remote user sees nothing happen -- a real one needs a WebSocket PTY
+bridge), the command palette and Monaco find/replace, a rendered diff view,
+file upload/download, and content search (today's search matches filenames
+only).
+
 - Add a constrained remote terminal with a visible command audit trail.
 - Add Git status, diff, stage, commit, and branch views.
 - Add editor search/replace, go-to-line, and command palette shortcuts.

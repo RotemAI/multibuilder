@@ -18,6 +18,18 @@ async function request(path, options = {}) {
 const conn = (id, suffix) => `/ssh-connections/${encodeURIComponent(id)}${suffix}`
 
 export const api = {
+  // Agent replies land in the tmux pane, so the panel polls for them here
+  // rather than only echoing what the user sent. The target session may
+  // differ from the IDE's own, so this takes an explicit session name.
+  chat: async (sessionName, limit = 80) => {
+    const { rootPath = '' } = base()
+    const url = `${rootPath}/api/sessions/${encodeURIComponent(sessionName)}/ide/chat?limit=${limit}`
+    const response = await fetch(url)
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data.error || 'Could not load chat')
+    return data
+  },
+
   listConnections: () => request('/ssh-connections'),
 
   createConnection: (body) =>

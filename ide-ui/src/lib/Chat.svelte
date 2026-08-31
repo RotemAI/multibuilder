@@ -1,5 +1,8 @@
 <script>
+  import { onDestroy } from 'svelte'
   import { ide } from './store.svelte.js'
+  import { api } from './api.js'
+  import { Send, Loader } from 'lucide-svelte'
 
   // Codex and Claude are both agents running inside a tmux session, so the
   // "provider" is really which session the prompt is delivered to. There is no
@@ -8,12 +11,44 @@
   let { sessions = [], session = '', rootPath = '' } = $props()
 
   let question = $state('')
-  let target = $state(session)
+  let target = $state(session || sessions[0] || '')
   let sending = $state(false)
+  let messages = $state([])
+  let error = $state('')
+  let listEl = $state(null)
+  let timer = null
+
+  // Replies appear in the agent's pane, so the panel polls the session's
+  // message store instead of only showing what the user typed.
+  async function loadMessages() {
+    if (!target) return
+    try {
+      const data = await api.chat(target)
+      const next = data.messages || []
+      const grew = next.length !== messages.length
+      messages = next
+      error = ''
+      if (grew) queueMicrotask(scrollToEnd)
+    } catch (exc) {
+      error = exc.message || 'Could not load chat'
+    }
+  }
+
+  function scrollToEnd() {
+    if (listEl) listEl.scrollTop = listEl.scrollHeight
+  }
 
   $effect(() => {
-    if (!target && session) target = session
+    // Re-poll whenever the target session changes.
+    const current = target
+    messages = []
+    if (timer) clearInterval(timer)
+    if (!current) return
+    loadMessages()
+    timer = setInterval(loadMessages, 3000)
   })
+
+  onDestroy(() => { if (timer) clearInterval(timer) })
 
   function buildPrompt() {
     const c = ide.connection || {}
@@ -41,13 +76,14 @@
       )
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(data.error || 'Could not send')
-      ide.chatMessages = [
-        ...ide.chatMessages,
-        { role: 'user', text, target, at: Date.now() },
-      ]
       question = ''
-    } catch (error) {
-      ide.setStatus(error.message || 'Could not send prompt')
+      // Show the question immediately; the poll reconciles it with the
+      // server's own copy once the agent records it.
+      messages = [...messages, { role: 'user', text, ts: Date.now() / 1000, _local: true }]
+      queueMicrotask(scrollToEnd)
+      setTimeout(loadMessages, 1200)
+    } catch (exc) {
+      ide.setStatus(exc.message || 'Could not send prompt')
     } finally {
       sending = false
     }
@@ -58,6 +94,17 @@
       event.preventDefault()
       send()
     }
+  }
+
+  // Strip the IDE context preamble so the panel shows what was actually asked.
+  function displayText(message) {
+    const text = message.full || message.text || ''
+    const marker = '\n\n'
+    if (text.startsWith('[Remote SSH IDE context]')) {
+      const at = text.lastIndexOf(marker)
+      if (at !== -1) return text.slice(at + marker.length)
+    }
+    return text
   }
 </script>
 
@@ -71,18 +118,22 @@
     </select>
   </div>
 
-  <div class="messages">
-    {#each ide.chatMessages as message (message.at)}
-      <div class="msg user">
-        <div class="meta">→ {message.target}</div>
-        {message.text}
+  <div class="messages" bind:this={listEl}>
+    {#if error}
+      <p class="error">{error}</p>
+    {/if}
+    {#each messages as message, index (message.ts + ':' + index)}
+      <div class="msg {message.role === 'assistant' ? 'assistant' : 'user'}">
+        {displayText(message)}
       </div>
     {:else}
-      <p class="empty">
-        Ask about the active remote file. The prompt is delivered to the selected
-        agent session — pick a Codex session or a Claude session to choose which
-        assistant answers. Replies appear in that session's pane.
-      </p>
+      {#if !error}
+        <p class="empty">
+          Ask about the active remote file. The prompt is delivered to the selected
+          agent session — pick a Codex session or a Claude session to choose which
+          assistant answers, and replies appear here.
+        </p>
+      {/if}
     {/each}
   </div>
 
@@ -93,6 +144,7 @@
       placeholder="Ask about the active remote file… (⌘/Ctrl+Enter to send)"
     ></textarea>
     <button onclick={send} disabled={sending || !question.trim()}>
+      {#if sending}<Loader size={13} />{:else}<Send size={13} />{/if}
       {sending ? 'Sending…' : 'Send'}
     </button>
   </div>
@@ -105,11 +157,14 @@
   select, textarea { background: var(--ide-input); border: 1px solid var(--ide-border); color: var(--ide-fg); border-radius: 3px; font-size: 12px; }
   select { flex: 1; min-width: 0; padding: 3px 4px; }
   .messages { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
-  .msg { padding: 7px 9px; border-radius: 7px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--ide-panel); }
+  .msg { padding: 7px 9px; border-radius: 7px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 92%; }
+  .msg.user { background: #3e3d32; color: var(--ide-fg); align-self: flex-end; }
+  .msg.assistant { background: var(--ide-input); color: var(--ide-fg); align-self: flex-start; border: 1px solid var(--ide-border); }
+  .error { color: #f92672; font-size: 12px; padding: 4px; margin: 0; }
   .msg .meta { font-size: 10px; color: var(--ide-muted); margin-bottom: 3px; }
   .empty { color: var(--ide-muted); font-size: 12px; line-height: 1.5; padding: 4px; }
   .compose { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--ide-border); }
   .compose textarea { flex: 1; min-height: 54px; max-height: 160px; resize: vertical; padding: 6px; font: inherit; font-size: 12px; }
-  .compose button { background: var(--ide-accent); border: 0; color: #272822; border-radius: 3px; cursor: pointer; padding: 0 12px; font-weight: 600; }
+  .compose button { display: inline-flex; align-items: center; gap: 5px; background: var(--ide-accent); border: 0; color: #272822; border-radius: 3px; cursor: pointer; padding: 0 12px; font-weight: 600; }
   .compose button:disabled { opacity: .5; cursor: default; }
 </style>
