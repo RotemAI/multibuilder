@@ -326,8 +326,23 @@ def _launch_codex_cmd(
     return out
 
 
+# Agents the dashboard can launch in a session. Codex remains the default; the
+# value is stored per session so relaunch/resume keeps the same agent.
+CLAUDE_SESSION_CMD = os.environ.get(
+    "TMUX_DASH_CLAUDE_SESSION_CMD",
+    "claude --dangerously-skip-permissions",
+)
+_session_agent: dict[str, str] = {}
+
+
+def _session_agent_kind(session_name: str) -> str:
+    return _session_agent.get(session_name) or "codex"
+
+
 def _session_launch_base(session_name: str = "", user: dict | None = None) -> str:
     """Use the canonical full-access launch for members and configured admin command."""
+    if session_name and _session_agent_kind(session_name) == "claude":
+        return CLAUDE_SESSION_CMD
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
         if owner and not _is_admin(owner):
@@ -370,13 +385,18 @@ def _session_launch_command(
     pin_model: bool = True,
     resume: bool = False,
 ) -> str:
-    """Build the Codex command and keep its process tree in a session scope."""
-    launch = _launch_codex_cmd(
-        base,
-        pin_model=pin_model,
-        resume=resume,
-        codex_home=_session_config_base(session_name),
-    )
+    """Build the agent command and keep its process tree in a session scope."""
+    if _session_agent_kind(session_name) == "claude":
+        # Claude Code takes none of Codex's --model / CODEX_HOME flags; passing
+        # them through _launch_codex_cmd would produce an invalid command line.
+        launch = base
+    else:
+        launch = _launch_codex_cmd(
+            base,
+            pin_model=pin_model,
+            resume=resume,
+            codex_home=_session_config_base(session_name),
+        )
     launch = _session_launch_identity_prefix(session_name) + " " + launch
     return scoped_codex_command(
         session_name,
@@ -9185,6 +9205,7 @@ async def ws_session_raw(ws: WebSocket, session_name: str):
 
 class CreateSession(BaseModel):
     name: str = ""
+    agent: str = "codex"        # "codex" | "claude"
     # Optional workspace to attach to the new session. The agent always runs on
     # the dashboard host (it needs CODEX_HOME, the advisor token and the owner's
     # auth files); this only decides which folder the IDE opens and, for an SSH
@@ -9198,6 +9219,7 @@ class CreateSession(BaseModel):
     ssh_auth_mode: str = "agent"
     ssh_identity_file: str = ""
     ssh_password: str = ""
+    private_key: str = ""
     workspace_label: str = ""
 
 
@@ -9264,6 +9286,7 @@ async def _attach_session_workspace(
             identity_file=body.ssh_identity_file,
             auth_mode=body.ssh_auth_mode,
             password=body.ssh_password,
+            private_key=body.private_key,
             workspace_root=body.workspace_root or ".",
         )
 
@@ -9335,6 +9358,20 @@ async def api_create_session(request: Request, body: CreateSession):
             created = name
         else:
             created = sessions[-1]["name"] if sessions else "unknown"
+        # Record which agent this session runs before anything builds its launch
+        # command, so _session_launch_base/_session_launch_command see it.
+        _agent = (body.agent or "codex").strip().lower()
+        if _agent not in {"codex", "claude"}:
+            _agent = "codex"
+        if _agent == "claude" and not shutil.which("claude"):
+            # Fall back rather than launching a command that cannot exist; the
+            # session is still usable and the reason is reported to the caller.
+            logger.warning("Claude requested for %s but the CLI is not installed", created)
+            _agent = "codex"
+            _agent_warning = "Claude is not installed on this server — started Codex instead"
+        else:
+            _agent_warning = ""
+        _session_agent[created] = _agent
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
@@ -9414,7 +9451,9 @@ async def api_create_session(request: Request, body: CreateSession):
                 capture_output=True, text=True, timeout=5
             )
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
-        payload = {"ok": True, "name": created}
+        payload = {"ok": True, "name": created, "agent": _agent}
+        if _agent_warning:
+            payload["warning"] = _agent_warning
         attached = await _attach_session_workspace(request, created, body, user)
         if attached.get("connection"):
             payload["connection"] = attached["connection"]
@@ -10867,7 +10906,59 @@ def _normalized_ssh_identity_file(value: str) -> str | None:
     return str(candidate)
 
 
-_SSH_SECRET_FIELDS = ("password_enc", "passphrase_enc")
+_SSH_SECRET_FIELDS = ("password_enc", "passphrase_enc", "private_key_enc")
+
+# Pasted private keys live under the dashboard's own state dir, never in
+# ~/.ssh: the key belongs to one stored connection, so it is written 0600 with
+# the connection id as its name and removed when that connection is deleted.
+SSH_MANAGED_KEYS_DIR = MESSAGES_DIR / "ssh-keys"
+_SSH_KEY_HEADER_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+
+
+def _valid_private_key_blob(text: str) -> bool:
+    """Cheap shape check so an obviously wrong paste fails before it is stored."""
+    body = (text or "").strip()
+    if not body or len(body) > 64_000 or "\x00" in body:
+        return False
+    return bool(_SSH_KEY_HEADER_RE.search(body)) and "PRIVATE KEY-----" in body
+
+
+def _ssh_managed_key_path(connection_id: str) -> Path:
+    return SSH_MANAGED_KEYS_DIR / f"{connection_id}.key"
+
+
+def _materialize_ssh_key(profile: dict) -> str:
+    """Write a stored pasted key to a 0600 file and return its path.
+
+    The key is held encrypted at rest; OpenSSH needs a real file, so it is
+    decrypted to one owned by this user with 0600 permissions. Rewritten each
+    time rather than trusted from a previous run, so a rotated key takes effect.
+    """
+    blob = str(profile.get("private_key_enc") or "")
+    if not blob:
+        return ""
+    connection_id = str(profile.get("id") or "")
+    key_text = _ssh_vault_decrypt(blob, connection_id)
+    if not key_text.endswith("\n"):
+        key_text += "\n"
+    SSH_MANAGED_KEYS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = _ssh_managed_key_path(connection_id)
+    # Create with 0600 from the start; writing then chmod-ing leaves a window
+    # where the key is briefly readable by others.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(key_text)
+    return str(path)
+
+
+def _discard_ssh_key(connection_id: str) -> None:
+    """Remove a materialized key file; called when its connection is deleted."""
+    try:
+        _ssh_managed_key_path(connection_id).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.debug("Could not remove managed SSH key for %s", connection_id, exc_info=True)
 
 
 def _ssh_public_profile(profile: dict) -> dict:
@@ -10891,6 +10982,7 @@ def _ssh_public_profile(profile: dict) -> dict:
         "owner_id": str(profile.get("owner_id") or ""),
         "owner_username": str(profile.get("owner_username") or ""),
         "has_password": bool(profile.get("password_enc")),
+        "has_private_key": bool(profile.get("private_key_enc")),
         "last_directory": str(profile.get("last_directory") or "."),
     }
 
@@ -11041,9 +11133,12 @@ def _ssh_argv(profile: dict, *, password_auth: bool = False) -> list[str]:
     ]
     if password_auth:
         argv.extend(("-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=keyboard-interactive,password"))
-    identity_file = _normalized_ssh_identity_file(str(profile.get("identity_file") or ""))
-    if identity_file is None:
-        raise RuntimeError("Configured SSH key is unavailable or outside ~/.ssh")
+    # A pasted key wins over a ~/.ssh path: it belongs to this connection only.
+    identity_file = _materialize_ssh_key(profile)
+    if not identity_file:
+        identity_file = _normalized_ssh_identity_file(str(profile.get("identity_file") or ""))
+        if identity_file is None:
+            raise RuntimeError("Configured SSH key is unavailable or outside ~/.ssh")
     if identity_file:
         argv.extend(("-i", identity_file, "-o", "IdentitiesOnly=yes"))
     argv.append(f"{username}@{host}")
@@ -11607,6 +11702,10 @@ class SSHConnectionBody(BaseModel):
     identity_file: str = ""
     auth_mode: str = "agent"
     password: str = ""
+    # A private key pasted into the browser, stored encrypted like a password
+    # instead of requiring the key to be placed under ~/.ssh by hand.
+    private_key: str = ""
+    key_passphrase: str = ""
     workspace_root: str = "."
     max_file_bytes: int = SSH_MAX_FILE_BYTES
 
@@ -12001,8 +12100,17 @@ async def api_create_ssh_connection(request: Request, session_name: str, body: S
         return JSONResponse({"error": "Identity file must be a readable file under ~/.ssh"}, status_code=400)
     if auth_mode not in {"agent", "key", "password"}:
         return JSONResponse({"error": "Choose SSH agent, key, or password authentication"}, status_code=400)
-    if auth_mode == "key" and not identity_file:
-        return JSONResponse({"error": "Choose an existing identity file under ~/.ssh"}, status_code=400)
+    pasted_key = (body.private_key or "").strip()
+    if pasted_key and not _valid_private_key_blob(pasted_key):
+        return JSONResponse(
+            {"error": "That does not look like an OpenSSH private key (expected a BEGIN … PRIVATE KEY block)"},
+            status_code=400,
+        )
+    if auth_mode == "key" and not identity_file and not pasted_key:
+        return JSONResponse(
+            {"error": "Paste a private key, or name an existing identity file under ~/.ssh"},
+            status_code=400,
+        )
     if auth_mode == "password" and (not body.password or "\x00" in body.password or len(body.password) > 4096):
         return JSONResponse({"error": "Enter a valid SSH password"}, status_code=400)
     workspace_root = body.workspace_root.strip() or "."
@@ -12015,6 +12123,8 @@ async def api_create_ssh_connection(request: Request, session_name: str, body: S
     connection_id = secrets.token_urlsafe(12)
     try:
         password_enc = _ssh_vault_encrypt(body.password, connection_id)
+        private_key_enc = _ssh_vault_encrypt(pasted_key, connection_id)
+        passphrase_enc = _ssh_vault_encrypt(body.key_passphrase or "", connection_id)
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
     profile = {
@@ -12031,6 +12141,8 @@ async def api_create_ssh_connection(request: Request, session_name: str, body: S
         "owner_id": str((user or {}).get("id") or ""),
         "owner_username": str((user or {}).get("username") or ""),
         "password_enc": password_enc,
+        "private_key_enc": private_key_enc,
+        "passphrase_enc": passphrase_enc,
         "last_directory": ".",
         "created_at": time.time(),
     }
@@ -12068,6 +12180,9 @@ async def api_delete_ssh_connection(request: Request, session_name: str, connect
     if not removed:
         return JSONResponse({"error": "SSH connection not found"}, status_code=404)
     _harden_ssh_state_file(SSH_CONNECTIONS_FILE)
+    # A pasted key was materialized to disk for OpenSSH; it must not outlive the
+    # connection record that justified storing it.
+    _discard_ssh_key(connection_id)
 
     # Deleting the connection must also drop its stored buffers; leaving them
     # behind would outlive the credential that justified keeping them.
@@ -21184,13 +21299,14 @@ body.member-simple .hide-in-simple{display:none!important}
         <div class="ide-dialog-grid"><div><label>Host</label><input id="ide-conn-host" placeholder="server.example.com"></div><div><label>Port</label><input id="ide-conn-port" type="number" min="1" max="65535" value="22"></div></div>
         <label>Username</label><input id="ide-conn-user" placeholder="deploy">
         <label>Authentication</label><select id="ide-conn-auth" onchange="ideAuthModeChanged()"><option value="agent">SSH agent</option><option value="key">Existing SSH key</option><option value="password">Password (saved, encrypted)</option></select>
-        <div id="ide-conn-key-wrap"><label>Identity file (for key authentication)</label><input id="ide-conn-key" placeholder="~/.ssh/id_ed25519"></div>
+        <div id="ide-conn-key-wrap"><label>Identity file (for key authentication)</label><input id="ide-conn-key" placeholder="~/.ssh/id_ed25519">
+        <label>…or paste a private key</label><textarea id="ide-conn-privkey" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" spellcheck="false" style="width:100%;background:var(--ide-input,#171815);border:1px solid var(--ide-border,#3e3d32);color:var(--ide-fg,#f8f8f2);border-radius:3px;padding:4px 6px;font-family:ui-monospace,monospace;font-size:11px"></textarea></div>
         <div id="ide-conn-password-wrap" style="display:none"><label>Password (stored encrypted for resume)</label><input id="ide-conn-password" type="password" autocomplete="new-password"></div>
       </div>
       <label>Workspace root</label><input id="ide-conn-workspace" value="." placeholder="/srv/app">
       <label>Maximum file size (KB)</label><input id="ide-conn-max-file-kb" type="number" min="1" max="1000" value="1000">
       <div class="ide-dialog-note" id="ide-conn-note-local">Opens a folder that already exists on this dashboard server — no SSH, no credentials. Enter an absolute path such as <code>/var/www/multibuilder</code>.</div>
-      <div class="ide-dialog-note" id="ide-conn-note-ssh" style="display:none">Uses an SSH agent, a key already under <code>~/.ssh</code>, or a password held only while the session connection is established. Pasted private keys are not accepted. The host must already be trusted in <code>known_hosts</code>.</div>
+      <div class="ide-dialog-note" id="ide-conn-note-ssh" style="display:none">Uses an SSH agent, a key under <code>~/.ssh</code>, a private key you paste here, or a password. Pasted keys and passwords are encrypted at rest (AES-256-GCM) and a pasted key is written to a private 0600 file only while the connection exists. The host must already be trusted in <code>known_hosts</code>.</div>
       <div class="ide-dialog-actions"><button class="ide-btn" onclick="ideHideConnectionForm()">Cancel</button><button class="ide-btn primary" onclick="ideSaveConnection()">Save connection</button></div>
     </div>
     <div class="ide-dialog ide-quick-open-dialog" id="ide-quick-open-dialog">
@@ -24120,6 +24236,14 @@ function showCreateModal(){
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
     ${MEMBER_SIMPLE?'':`
+    <div class="ws-block">
+      <label class="ws-label" for="new-session-agent">Agent</label>
+      <select class="modal-input" id="new-session-agent">
+        <option value="codex">Codex (OpenAI)</option>
+        <option value="claude">Claude (Anthropic)</option>
+      </select>
+    </div>`}
+    ${MEMBER_SIMPLE?'':`
     <!-- Optional workspace for the IDE. The agent always runs here on the
          dashboard host; this only chooses the folder the IDE opens, and for an
          SSH target also adds a remote shell window to the session. -->
@@ -24149,6 +24273,7 @@ function showCreateModal(){
           <option value="password">Password (saved, encrypted)</option>
         </select>
         <input type="text" class="modal-input" id="new-session-ws-key" placeholder="~/.ssh/id_ed25519" style="display:none" autocomplete="off" spellcheck="false">
+        <textarea class="modal-input" id="new-session-ws-privkey" rows="4" placeholder="…or paste a private key (-----BEGIN OPENSSH PRIVATE KEY-----)" style="display:none;font-family:ui-monospace,monospace;font-size:.75rem" spellcheck="false"></textarea>
         <input type="password" class="modal-input" id="new-session-ws-pass" placeholder="SSH password" style="display:none" autocomplete="new-password">
         <input type="text" class="modal-input" id="new-session-ws-remote-root" placeholder="Remote folder (default: login directory)" autocomplete="off" spellcheck="false">
       </div>
@@ -24198,7 +24323,9 @@ function onNewSessionReuseChange(){
 function onNewSessionAuthChange(){
   const mode=(_wsEl('new-session-ws-auth')||{}).value||'agent';
   const key=_wsEl('new-session-ws-key');const pass=_wsEl('new-session-ws-pass');
+  const priv=_wsEl('new-session-ws-privkey');
   if(key)key.style.display=mode==='key'?'':'none';
+  if(priv)priv.style.display=mode==='key'?'':'none';
   if(pass)pass.style.display=mode==='password'?'':'none';
 }
 function _newSessionWorkspacePayload(){
@@ -24213,6 +24340,7 @@ function _newSessionWorkspacePayload(){
     ssh_username:((_wsEl('new-session-ws-user')||{}).value||'').trim(),
     ssh_auth_mode:(_wsEl('new-session-ws-auth')||{}).value||'agent',
     ssh_identity_file:((_wsEl('new-session-ws-key')||{}).value||'').trim(),
+    private_key:((_wsEl('new-session-ws-privkey')||{}).value||''),
     ssh_password:(_wsEl('new-session-ws-pass')||{}).value||'',
     workspace_root:((_wsEl('new-session-ws-remote-root')||{}).value||'').trim()||'.',
   };
@@ -24222,6 +24350,7 @@ async function createSession(){
   const input=document.getElementById('new-session-name');
   const name=input?input.value.trim():'';
   const workspace=_newSessionWorkspacePayload();
+  const agent=((document.getElementById('new-session-agent')||{}).value)||'codex';
   const modal=document.getElementById('modal-content');
   // Immediately show a loading state so it never looks frozen (the first session
   // for a member can take a few seconds to provision).
@@ -24233,7 +24362,7 @@ async function createSession(){
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name,...workspace})
+      body:JSON.stringify({name,agent,...workspace})
     });
     const data=await resp.json();
     if(!resp.ok){
@@ -27363,7 +27492,7 @@ async function ideSaveConnection(){
   const isLocal=kind==='local';
   const body=isLocal
     ?{kind:'local',label:document.getElementById('ide-conn-label').value,workspace_root:document.getElementById('ide-conn-workspace').value,max_file_bytes:Number(document.getElementById('ide-conn-max-file-kb').value||1000)*1000}
-    :{kind:'ssh',label:document.getElementById('ide-conn-label').value,host:document.getElementById('ide-conn-host').value,username:document.getElementById('ide-conn-user').value,port:Number(document.getElementById('ide-conn-port').value||22),identity_file:document.getElementById('ide-conn-key').value,auth_mode:document.getElementById('ide-conn-auth').value,password:document.getElementById('ide-conn-password').value,workspace_root:document.getElementById('ide-conn-workspace').value,max_file_bytes:Number(document.getElementById('ide-conn-max-file-kb').value||1000)*1000};
+    :{kind:'ssh',label:document.getElementById('ide-conn-label').value,host:document.getElementById('ide-conn-host').value,username:document.getElementById('ide-conn-user').value,port:Number(document.getElementById('ide-conn-port').value||22),identity_file:document.getElementById('ide-conn-key').value,private_key:((document.getElementById('ide-conn-privkey')||{}).value||''),auth_mode:document.getElementById('ide-conn-auth').value,password:document.getElementById('ide-conn-password').value,workspace_root:document.getElementById('ide-conn-workspace').value,max_file_bytes:Number(document.getElementById('ide-conn-max-file-kb').value||1000)*1000};
   const failure=isLocal?'Could not open the local folder':'Could not save SSH connection';
   try{const response=await fetch(ideApi('/ssh-connections'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||failure);_ide.password=body.password||'';document.getElementById('ide-conn-password').value='';_ide.connectionId=data.connection.id;ideHideConnectionForm();await ideLoadConnections();await ideConnectActive();}
   catch(error){ideSetStatus(error.message||failure);}

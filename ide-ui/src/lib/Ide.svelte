@@ -30,7 +30,7 @@
   let password = $state('')
   let form = $state({
     kind: 'local', label: '', host: '', username: '', port: 22,
-    auth_mode: 'agent', identity_file: '', password: '',
+    auth_mode: 'agent', identity_file: '', password: '', private_key: '',
     workspace_root: '', max_file_bytes: 1000000,
   })
 
@@ -95,7 +95,7 @@
     try {
       const data = await api.createConnection({ ...form, port: Number(form.port) })
       showConnectionForm = false
-      form = { ...form, label: '', host: '', username: '', password: '' }
+      form = { ...form, label: '', host: '', username: '', password: '', private_key: '' }
       await ide.loadConnections()
       ide.connectionId = data.connection.id
       await ide.refreshStatus()
@@ -280,6 +280,13 @@
                 </select>
                 {#if form.auth_mode === 'key'}
                   <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" placeholder="~/.ssh/id_ed25519" bind:value={form.identity_file} />
+                  <textarea
+                    class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 font-mono text-[11px] outline-none focus:border-vs-accent"
+                    rows="4"
+                    placeholder="…or paste a private key (-----BEGIN OPENSSH PRIVATE KEY-----)"
+                    spellcheck="false"
+                    bind:value={form.private_key}
+                  ></textarea>
                 {/if}
                 {#if form.auth_mode === 'password'}
                   <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs" type="password" placeholder="Password" bind:value={form.password} autocomplete="new-password" />
