@@ -9429,7 +9429,8 @@ async def api_create_session(request: Request, body: CreateSession):
         # Validate name: alphanumeric, dash, underscore only
         if not _is_valid_session_name(name):
             return JSONResponse(
-                {"error": "Invalid name. Use up to 128 letters, numbers, dots, dashes, or underscores."},
+                {"error": "Invalid name — no spaces or symbols. Use letters, numbers, "
+                          "dots, dashes or underscores, for example 'my-project'."},
                 status_code=400,
             )
         existing = [s["name"] for s in get_tmux_sessions()]
@@ -9458,7 +9459,14 @@ async def api_create_session(request: Request, body: CreateSession):
             cmd += ["-s", name]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
+            detail = result.stderr.strip() or "Failed to create session"
+            # tmux rejects a name already taken by a session the dashboard does
+            # not list; report that as a conflict rather than a server error.
+            if "duplicate session" in detail.lower():
+                return JSONResponse(
+                    {"error": f"Session '{name}' already exists."}, status_code=409
+                )
+            return JSONResponse({"error": detail}, status_code=500)
         # Find the new session name (if auto-named)
         sessions = get_tmux_sessions()
         if name:
@@ -11243,6 +11251,70 @@ def _valid_git_branch(value: str) -> bool:
     )
 
 
+SSH_KNOWN_HOSTS = Path.home() / ".ssh" / "known_hosts"
+
+
+def _ssh_host_is_known(host: str, port: int = 22) -> bool:
+    """Is this host already trusted in known_hosts?"""
+    try:
+        result = subprocess.run(
+            ["ssh-keygen", "-F", f"[{host}]:{port}" if port != 22 else host,
+             "-f", str(SSH_KNOWN_HOSTS)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and bool((result.stdout or "").strip())
+
+
+def _ssh_key_fingerprints(scan_lines: list[str]) -> list[dict]:
+    """SHA256 fingerprints for scanned host keys, for the user to verify."""
+    out = []
+    for line in scan_lines:
+        try:
+            proc = subprocess.run(
+                ["ssh-keygen", "-l", "-f", "-"],
+                input=line, capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        parts = (proc.stdout or "").strip().split()
+        # "256 SHA256:abc… host (ED25519)"
+        if len(parts) >= 4:
+            out.append({
+                "bits": parts[0],
+                "fingerprint": parts[1],
+                "type": parts[-1].strip("()"),
+            })
+    return out
+
+
+def _ssh_trust_host(host: str, port: int = 22) -> bool:
+    """Append this host's keys to known_hosts. Called only after the user
+    accepted the fingerprint shown to them."""
+    result = subprocess.run(
+        ["ssh-keyscan", "-T", "10", "-p", str(port), host],
+        capture_output=True, text=True, timeout=25,
+    )
+    lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip() and not ln.startswith("#")]
+    if not lines:
+        return False
+    SSH_KNOWN_HOSTS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    existing = SSH_KNOWN_HOSTS.read_text() if SSH_KNOWN_HOSTS.is_file() else ""
+    # Append only what is missing, so re-trusting does not duplicate entries.
+    added = [ln for ln in lines if ln.strip() not in existing]
+    if added:
+        with open(SSH_KNOWN_HOSTS, "a") as handle:
+            if existing and not existing.endswith("\n"):
+                handle.write("\n")
+            handle.write("\n".join(added) + "\n")
+    try:
+        SSH_KNOWN_HOSTS.chmod(0o600)
+    except OSError:
+        pass
+    return True
+
+
 def _ssh_argv(profile: dict, *, password_auth: bool = False) -> list[str]:
     """Build a non-interactive, no-forwarding SSH invocation from validated data."""
     if not shutil.which("ssh"):
@@ -12350,6 +12422,86 @@ async def api_delete_ssh_connection(request: Request, session_name: str, connect
     return JSONResponse({"ok": True})
 
 
+class SSHHostKeyBody(BaseModel):
+    accept: bool = False
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/host-key")
+async def api_ssh_host_key(request: Request, session_name: str, connection_id: str):
+    """Fetch the host's public key fingerprint so the user can verify it.
+
+    Connecting requires the host to be in known_hosts (StrictHostKeyChecking is
+    deliberately left on). Rather than weakening that, show the fingerprint and
+    let the user decide -- the same trust-on-first-use step ssh itself prompts
+    for, surfaced in the UI because a detached pane cannot answer a prompt.
+    """
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    if _is_local_profile(profile):
+        return JSONResponse({"error": "A local workspace has no SSH host key"}, status_code=400)
+    host = str(profile.get("host") or "")
+    port = int(profile.get("port") or 22)
+    if not _valid_ssh_host(host) or not 1 <= port <= 65535:
+        return JSONResponse({"error": "SSH connection profile is invalid"}, status_code=400)
+    known = await asyncio.to_thread(_ssh_host_is_known, host, port)
+    if known:
+        return JSONResponse({"known": True, "host": host, "port": port, "fingerprints": []})
+    try:
+        scan = await asyncio.to_thread(
+            subprocess.run,
+            ["ssh-keyscan", "-T", "10", "-p", str(port), host],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": f"Could not reach {host}: {exc}"[:200]}, status_code=502)
+    lines = [ln for ln in (scan.stdout or "").splitlines() if ln.strip() and not ln.startswith("#")]
+    if not lines:
+        # ssh-keyscan is silent when the host simply does not answer, so say
+        # that plainly rather than reporting an empty-looking key failure.
+        return JSONResponse({
+            "error": f"{host}:{port} is not responding. Check the machine is running "
+                     "and reachable from this server.",
+            "unreachable": True,
+        }, status_code=502)
+    return JSONResponse({
+        "known": False,
+        "host": host,
+        "port": port,
+        "fingerprints": await asyncio.to_thread(_ssh_key_fingerprints, lines),
+    })
+
+
+@app.post("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/host-key")
+async def api_trust_ssh_host(
+    request: Request, session_name: str, connection_id: str, body: SSHHostKeyBody
+):
+    """Add this host's key to known_hosts after the user accepted it."""
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    if not body.accept:
+        return JSONResponse({"error": "Host key was not accepted"}, status_code=400)
+    host = str(profile.get("host") or "")
+    port = int(profile.get("port") or 22)
+    if not _valid_ssh_host(host) or not 1 <= port <= 65535:
+        return JSONResponse({"error": "SSH connection profile is invalid"}, status_code=400)
+    try:
+        added = await asyncio.to_thread(_ssh_trust_host, host, port)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)[:200]}, status_code=502)
+    if not added:
+        return JSONResponse({"error": f"Could not fetch a host key from {host}"}, status_code=502)
+    await _record_ssh_ide_audit(request, session_name, profile, "host_key_trusted")
+    return JSONResponse({"ok": True, "host": host, "port": port})
+
+
 @app.post("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/connect")
 async def api_connect_ssh_connection(
     request: Request,
@@ -12388,7 +12540,35 @@ async def api_connect_ssh_connection(
         await _record_ssh_ide_audit(request, session_name, profile, "connect_requested")
         window_name = await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-        return JSONResponse({"error": str(exc)}, status_code=502)
+        detail = str(exc)
+        low = detail.lower()
+        # An untrusted host is a decision the user can make, not a dead end.
+        # Flag it so the IDE can offer the fingerprint instead of just failing.
+        if "host key verification failed" in low or "is known for" in low:
+            return JSONResponse({"error": detail, "needs_host_key": True}, status_code=502)
+        # Distinguish "the host is not answering" from a credential problem:
+        # the first is nothing the user can fix in this dialog, and reporting it
+        # as a generic failure sends people hunting for a wrong password.
+        host = str(profile.get("host") or "the host")
+        if "timed out" in low or "no route to host" in low or "network is unreachable" in low:
+            return JSONResponse({
+                "error": f"{host} is not responding on port {int(profile.get('port') or 22)}. "
+                         "Check the machine is running and reachable from this server.",
+                "unreachable": True,
+            }, status_code=502)
+        if "connection refused" in low:
+            return JSONResponse({
+                "error": f"{host} refused the connection on port "
+                         f"{int(profile.get('port') or 22)} — is its SSH service running?",
+                "unreachable": True,
+            }, status_code=502)
+        if "permission denied" in low:
+            return JSONResponse({
+                "error": f"{host} rejected the credentials. Check the username, and the key "
+                         "or password for this connection.",
+                "auth_failed": True,
+            }, status_code=502)
+        return JSONResponse({"error": detail}, status_code=502)
     # Persist a freshly supplied password only after it actually authenticated,
     # so a typo never overwrites a working stored credential.
     if supplied and supplied != stored:
@@ -24689,9 +24869,28 @@ function _newSessionWorkspacePayload(){
   };
 }
 
+// tmux session names cannot contain spaces or punctuation, but people type
+// natural names like "My Project". Convert rather than reject: spaces become
+// dashes and unsupported characters are dropped, matching the server's rule.
+function _normalizeSessionName(raw){
+  return (raw||'').trim()
+    .replace(/\s+/g,'-')
+    .replace(/[^A-Za-z0-9_.-]/g,'')
+    .replace(/-{2,}/g,'-')
+    .replace(/^[-.]+|[-.]+$/g,'')
+    .slice(0,128);
+}
+
 async function createSession(){
   const input=document.getElementById('new-session-name');
-  const name=input?input.value.trim():'';
+  const typed=input?input.value.trim():'';
+  const name=_normalizeSessionName(typed);
+  if(typed&&!name){
+    const m=document.getElementById('modal-content');
+    if(m){const p=m.querySelector('p');if(p){p.textContent='That name has no letters or numbers — try something like "my-project".';p.style.color='#f85149';}}
+    if(input)input.focus();
+    return;
+  }
   const workspace=_newSessionWorkspacePayload();
   const agent=((document.getElementById('new-session-agent')||{}).value)||'codex';
   const modal=document.getElementById('modal-content');

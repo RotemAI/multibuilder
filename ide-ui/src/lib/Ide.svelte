@@ -11,6 +11,7 @@
   import Terminal from './Terminal.svelte'
   import OpenFolderDialog from './OpenFolderDialog.svelte'
   import SearchPanel from './SearchPanel.svelte'
+  import HostKeyDialog from './HostKeyDialog.svelte'
   import Resizer from './Resizer.svelte'
   import {
     Files, GitBranch, MessageSquare, Server, Plus, Trash2, SquareTerminal,
@@ -350,6 +351,13 @@
                 onclick={() => ide.connect(password)}>
                 {isLocal ? 'Open workspace' : 'Connect'}
               </button>
+              {#if !isLocal}
+                <button class="w-full rounded-sm border border-vs-line px-2 py-1 text-xs hover:bg-vs-hover"
+                  title="Show this host's key fingerprint and trust it"
+                  onclick={() => (ide.needsHostKey = true)}>
+                  Verify host key…
+                </button>
+              {/if}
             {/if}
 
             {#if ide.connection}
@@ -528,5 +536,14 @@
   {/if}
   {#if showOpenFolder}
     <OpenFolderDialog onopen={openFolder} onclose={() => (showOpenFolder = false)} />
+  {/if}
+  {#if ide.needsHostKey}
+    <HostKeyDialog
+      onclose={() => (ide.needsHostKey = false)}
+      ontrusted={async () => {
+        ide.needsHostKey = false
+        await ide.connect(password)
+      }}
+    />
   {/if}
 </div>

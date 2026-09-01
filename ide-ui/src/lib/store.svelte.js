@@ -24,6 +24,7 @@ class IdeStore {
   gitStatus = $state('')
   gitBranches = $state([])
   gitBranch = $state('')
+  needsHostKey = $state(false)
 
   restoredKey = ''
   persistTimer = null
@@ -112,6 +113,9 @@ class IdeStore {
     } catch (error) {
       this.connectionState = 'error'
       this.setStatus(error.message || 'Could not connect')
+      // An untrusted host is fixable by the user; surface it so the IDE can
+      // show the fingerprint rather than leaving a dead "error" state.
+      this.needsHostKey = !!error.needs_host_key
     }
   }
 

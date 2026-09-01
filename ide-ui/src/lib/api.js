@@ -11,7 +11,13 @@ export function ideApi(path) {
 async function request(path, options = {}) {
   const response = await fetch(ideApi(path), options)
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.error || 'Request failed')
+  if (!response.ok) {
+    const error = new Error(data.error || 'Request failed')
+    // Carry server hints (e.g. needs_host_key) so callers can offer a fix
+    // instead of only showing the message.
+    Object.assign(error, data)
+    throw error
+  }
   return data
 }
 
@@ -86,6 +92,15 @@ export const api = {
     if (!response.ok) throw new Error(data.error || 'Could not change effort')
     return data
   },
+
+  hostKey: (id) => request(conn(id, '/host-key')),
+
+  trustHost: (id) =>
+    request(conn(id, '/host-key'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accept: true }),
+    }),
 
   listConnections: () => request('/ssh-connections'),
 
