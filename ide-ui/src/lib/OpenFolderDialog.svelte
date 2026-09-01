@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte'
   import { api } from './api.js'
+  import { ide } from './store.svelte.js'
   import { Folder, CornerLeftUp, HardDrive, Loader } from 'lucide-svelte'
 
   let { onopen, onclose } = $props()
@@ -16,7 +17,10 @@
     loading = true
     error = ''
     try {
-      const data = await api.browse(target)
+      // With a connection open, browse ITS filesystem; otherwise this host.
+      const data = ide.connectionId
+        ? await api.browseOn(ide.connectionId, target)
+        : await api.browse(target)
       path = data.path
       parent = data.parent
       entries = data.entries || []
@@ -43,7 +47,16 @@
   role="presentation"
 >
   <div class="flex h-[70vh] w-[min(640px,92vw)] flex-col overflow-hidden rounded-md border border-vs-line bg-vs-panel shadow-2xl">
-    <div class="border-b border-vs-line px-4 py-3 text-sm font-semibold text-vs-bright">Open Folder</div>
+    <div class="border-b border-vs-line px-4 py-3 text-sm font-semibold text-vs-bright">
+      Open Folder
+      <span class="ml-1 font-normal text-vs-muted">
+        {#if ide.connection && ide.connection.kind !== 'local'}
+          on {ide.connection.username}@{ide.connection.host}
+        {:else}
+          on this server
+        {/if}
+      </span>
+    </div>
 
     <form class="flex gap-2 border-b border-vs-line px-3 py-2" onsubmit={submitManual}>
       <button

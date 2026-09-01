@@ -112,9 +112,7 @@
 
   async function onConnectionChange(event) {
     ide.connectionId = event.currentTarget.value
-    ide.tabs = []
-    ide.activeKey = ''
-    ide.restoredKey = ''
+    ide.resetWorkspaceView()
     await ide.refreshStatus()
   }
 
@@ -123,14 +121,42 @@
     showOpenFolder = false
     try {
       const label = path.split('/').filter(Boolean).pop() || path
+      const current = ide.connection
+      // Opening a folder while connected over SSH must stay on THAT host. This
+      // used to hardcode kind:'local', so picking a remote folder silently made
+      // a LOCAL workspace pointing at a path on the wrong machine.
+      //
+      // A remote pick re-roots the existing connection rather than cloning it:
+      // stored keys and passwords are sealed with the connection id as GCM AAD,
+      // so a copy under a new id could not decrypt them.
+      if (current && current.kind !== 'local') {
+        await api.setWorkspaceRoot(current.id, path, label)
+        await ide.loadConnections()
+        ide.resetWorkspaceView()
+        await ide.refreshFiles('.')
+        ide.setStatus(`Opened ${path} on ${current.username}@${current.host}`)
+        view = 'files'
+        sidebarOpen = true
+        return
+      }
+      if (current && current.kind === 'local') {
+        // Re-root rather than creating a connection per folder, which left a
+        // growing pile of near-identical local workspaces in the dropdown.
+        await api.setWorkspaceRoot(current.id, path, label)
+        await ide.loadConnections()
+        ide.resetWorkspaceView()
+        await ide.refreshFiles('.')
+        ide.setStatus(`Opened ${path}`)
+        view = 'files'
+        sidebarOpen = true
+        return
+      }
       const data = await api.createConnection({
         kind: 'local', label, workspace_root: path, max_file_bytes: 1000000,
       })
       await ide.loadConnections()
       ide.connectionId = data.connection.id
-      ide.tabs = []
-      ide.activeKey = ''
-      ide.restoredKey = ''
+      ide.resetWorkspaceView()
       await ide.connect('')
       view = 'files'
       sidebarOpen = true
@@ -161,7 +187,7 @@
     try {
       await api.deleteConnection(current.id)
       ide.connectionId = ''
-      ide.tabs = []
+      ide.resetWorkspaceView()
       await ide.loadConnections()
     } catch (error) {
       ide.setStatus(error.message || 'Could not delete')

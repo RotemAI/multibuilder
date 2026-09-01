@@ -25,6 +25,7 @@ class IdeStore {
   gitBranches = $state([])
   gitBranch = $state('')
   needsHostKey = $state(false)
+  notARepo = $state(false)
 
   restoredKey = ''
   persistTimer = null
@@ -52,6 +53,29 @@ class IdeStore {
     return this.gitStatus
       .split('\n')
       .filter((line) => line.trim() && !line.startsWith('##')).length
+  }
+
+  /** Clear everything scoped to one workspace before showing another.
+   *
+   * Only tabs were being reset, so the file tree, git status and filter leaked
+   * across workspaces — and treeChildren is keyed by bare path, so two
+   * workspaces that both have `src/` showed each other's contents.
+   */
+  resetWorkspaceView() {
+    this.tabs = []
+    this.activeKey = ''
+    this.restoredKey = ''
+    this.path = '.'
+    this.entries = []
+    this.expanded = {}
+    this.treeChildren = {}
+    this.filter = ''
+    this.gitOutput = ''
+    this.gitStatus = ''
+    this.gitBranches = []
+    this.gitBranch = ''
+    this.needsHostKey = false
+    this.notARepo = false
   }
 
   setStatus(status, detail) {
@@ -257,6 +281,17 @@ class IdeStore {
   async runGit(action, extra = {}) {
     try {
       const data = await api.git(this.connectionId, { action, path: this.path || '.', ...extra })
+      if (data.not_a_repo) {
+        // An ordinary state, not a failure: say so once and clear the panel
+        // rather than leaving the previous workspace's status on screen.
+        this.gitOutput = data.error || 'This folder is not a Git repository.'
+        this.gitStatus = ''
+        this.gitBranches = []
+        this.gitBranch = ''
+        this.notARepo = true
+        return null
+      }
+      this.notARepo = false
       this.gitOutput = data.output || data.status || ''
       this.gitStatus = data.status || ''
       this.gitBranches = data.branches || []

@@ -93,6 +93,18 @@ export const api = {
     return data
   },
 
+  // Browse folders on the machine a connection points at (remote over SSH, or
+  // this host for a local workspace).
+  browseOn: (id, path = '') =>
+    request(conn(id, `/browse?path=${encodeURIComponent(path)}`)),
+
+  setWorkspaceRoot: (id, workspace_root, label) =>
+    request(conn(id, '/workspace-root'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspace_root, label }),
+    }),
+
   hostKey: (id) => request(conn(id, '/host-key')),
 
   trustHost: (id) =>

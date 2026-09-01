@@ -45,6 +45,15 @@
     <button onclick={() => ide.runGit('stage', { files: ['.'] })}><FilePlus2 size={13} /> Stage all</button>
   </div>
 
+  {#if ide.notARepo}
+    <!-- Staging and committing are meaningless without a repository, so state
+         the situation plainly instead of leaving dead controls on screen. -->
+    <p class="empty-repo">
+      This folder isn't a Git repository.<br />
+      Open a folder containing a <code>.git</code> directory, or run
+      <code>git init</code> in the terminal.
+    </p>
+  {:else}
   {#if ide.gitBranch}
     <div class="branch">On <strong>{ide.gitBranch}</strong></div>
   {/if}
@@ -93,9 +102,12 @@
   </div>
 
   <pre class="output">{ide.gitOutput || 'No git output yet.'}</pre>
+  {/if}
 </div>
 
 <style>
+  .empty-repo { margin: 10px 8px; color: var(--ide-muted); font-size: 12px; line-height: 1.6; }
+  .empty-repo code { background: var(--ide-input); padding: 1px 4px; border-radius: 3px; }
   .git { display: flex; flex-direction: column; gap: 6px; padding: 8px; height: 100%; min-height: 0; }
   .row { display: flex; gap: 4px; }
   .row input, select { flex: 1; min-width: 0; background: var(--ide-input); border: 1px solid var(--ide-border); color: var(--ide-fg); border-radius: 3px; padding: 4px 6px; font-size: 12px; }

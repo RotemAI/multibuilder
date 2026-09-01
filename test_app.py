@@ -1204,7 +1204,7 @@ class TestSshIdeSafety:
 
         command = run.call_args.args[0]
         assert command[:5] == ["tmux", "new-window", "-d", "-t", "test-session"]
-        assert window_name == "ssh:Production-API"
+        assert window_name == "ssh:Production-API-abcdefgh"
 
     @patch("app._ssh_control_is_alive", side_effect=[False, True])
     @patch("app.shutil.which", return_value="/usr/bin/ssh")
@@ -1227,10 +1227,14 @@ class TestSshIdeSafety:
         from app import _ssh_focus_tmux_window
 
         run.return_value = MagicMock(returncode=0, stderr=b"")
-        window_name = _ssh_focus_tmux_window({"label": "Production API"}, "test-session")
+        window_name = _ssh_focus_tmux_window(
+            {"id": "abcdefghijkl", "label": "Production API"}, "test-session"
+        )
 
-        assert window_name == "ssh:Production-API"
-        assert run.call_args.args[0] == ["tmux", "select-window", "-t", "test-session:ssh:Production-API"]
+        assert window_name == "ssh:Production-API-abcdefgh"
+        assert run.call_args.args[0] == [
+            "tmux", "select-window", "-t", "test-session:ssh:Production-API-abcdefgh",
+        ]
 
 
 class TestSshCredentialVault:

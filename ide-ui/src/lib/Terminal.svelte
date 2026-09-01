@@ -64,8 +64,22 @@
         typeof event.data === 'string' ? event.data : new Uint8Array(event.data),
       )
     }
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (disposed) return
+      // 1008 is a deliberate refusal (not signed in, or not your session) —
+      // retrying can never succeed and just hammers the server. 1011 means the
+      // workspace is gone; retry a few times, then stop with a real message
+      // instead of an endless "reconnecting" that hides the cause.
+      if (event.code === 1008) {
+        status = 'refused'
+        term?.write('\r\n\x1b[31m— not authorised for this terminal —\x1b[0m\r\n')
+        return
+      }
+      if (retry >= 6) {
+        status = 'closed'
+        term?.write('\r\n\x1b[33m— terminal unavailable; reopen the panel to retry —\x1b[0m\r\n')
+        return
+      }
       status = 'reconnecting'
       // Back off up to 10s so a server restart does not spin the browser.
       const delay = Math.min(1000 * 2 ** retry, 10000)
@@ -133,5 +147,6 @@
   .status.connected { color: var(--ide-accent); }
   .status.error, .status.closed { color: #f92672; }
   .status.reconnecting { color: #e6db74; }
+  .status.refused { color: #f92672; }
   .screen { flex: 1; min-height: 0; padding: 4px 6px; overflow: hidden; }
 </style>

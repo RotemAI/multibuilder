@@ -29,9 +29,15 @@
   async function loadConfig() {
     if (!target) return
     try {
-      config = { ...config, ...(await api.sessionAgent(target)) }
-    } catch {
-      /* controls stay on their last known values */
+      // Replace rather than merge: merging left the PREVIOUS session's model
+      // catalogue and effort levels in place, so a Claude session could render
+      // Codex's options and POST one its API rejects.
+      config = { agent: 'codex', available: [], model: '', effort: '', models: [], efforts: [],
+                 ...(await api.sessionAgent(target)) }
+    } catch (exc) {
+      // Clear the controls instead of showing another session's options.
+      config = { agent: config.agent, available: [], model: '', effort: '', models: [], efforts: [] }
+      ide.setStatus(exc.message || 'Could not read agent settings')
     }
   }
 
@@ -87,7 +93,7 @@
     switching = 'model'
     try {
       await api.setSessionModel(target, model)
-      config = { ...config, model }
+      await loadConfig()
       ide.setStatus(`Model set to ${model}`)
     } catch (exc) {
       ide.setStatus(exc.message || 'Could not change model')
@@ -102,7 +108,7 @@
     switching = 'effort'
     try {
       await api.setSessionEffort(target, effort)
-      config = { ...config, effort }
+      await loadConfig()
       ide.setStatus(`Reasoning effort set to ${effort}`)
     } catch (exc) {
       ide.setStatus(exc.message || 'Could not change effort')

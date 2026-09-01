@@ -376,6 +376,16 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_MODEL_ALIASES = ("fable", "opus", "sonnet")
 
 
+def _agent_quit_command(session_name: str) -> str:
+    """The slash command that exits this session's agent.
+
+    Codex quits on "/quit", Claude Code on "/exit". Sending the wrong one is not
+    inert: the live agent treats it as a chat message, stays running, and the
+    caller then believes the pane is free.
+    """
+    return "/exit" if _session_agent_kind(session_name) == "claude" else "/quit"
+
+
 def _session_claude_setting(session_name: str, key: str) -> str:
     try:
         row = (_session_agents_store().read() or {}).get(str(session_name))
@@ -472,7 +482,9 @@ def _session_launch_command(
     if _session_agent_kind(session_name) == "claude":
         # Claude Code takes none of Codex's --model / CODEX_HOME flags; passing
         # them through _launch_codex_cmd would produce an invalid command line.
-        launch = base
+        # It does have its own resume flag, though: without it a crash-restart
+        # silently dropped the whole conversation while logging "restarted".
+        launch = base + (" --continue" if resume else "")
     else:
         launch = _launch_codex_cmd(
             base,
@@ -8896,7 +8908,7 @@ async def _park_session_local(session_name: str, last_activity: float) -> dict:
 
     await asyncio.to_thread(
         subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
+        ["tmux", "send-keys", "-t", session_name, "-l", _agent_quit_command(session_name)],
         capture_output=True,
         text=True,
         timeout=5,
@@ -8925,7 +8937,7 @@ async def _park_session_local(session_name: str, last_activity: float) -> dict:
         await asyncio.sleep(0.5)
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
+            ["tmux", "send-keys", "-t", session_name, "-l", _agent_quit_command(session_name)],
             capture_output=True,
             text=True,
             timeout=5,
@@ -11053,6 +11065,28 @@ SSH_MANAGED_KEYS_DIR = MESSAGES_DIR / "ssh-keys"
 _SSH_KEY_HEADER_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 
 
+def _private_key_is_encrypted(text: str) -> bool:
+    """Is this pasted key protected by a passphrase?
+
+    Classic PEM announces it in headers; OpenSSH-format keys name a cipher other
+    than "none" in the base64 body, which decodes to a readable marker.
+    """
+    body = text or ""
+    if "Proc-Type: 4,ENCRYPTED" in body or "DEK-Info:" in body:
+        return True
+    try:
+        inner = "".join(
+            line.strip() for line in body.splitlines() if not line.startswith("-----")
+        )
+        raw = base64.b64decode(inner, validate=False)[:120]
+    except (ValueError, binascii.Error):
+        return False
+    if not raw.startswith(b"openssh-key-v1\x00"):
+        return False
+    # After the magic comes a length-prefixed cipher name; "none" means plaintext.
+    return b"none" not in raw[:40]
+
+
 def _valid_private_key_blob(text: str) -> bool:
     """Cheap shape check so an obviously wrong paste fails before it is stored."""
     body = (text or "").strip()
@@ -11425,11 +11459,21 @@ def _ssh_start_control_master(profile: dict, session_name: str, *, password: str
     return socket_path
 
 
+def _tmux_window_suffix(profile: dict) -> str:
+    """A short, unique tail for a connection's tmux window name.
+
+    Labels alone collided: sanitising "prod server", "prod-server" and
+    "prod/server" all yield "prod-server", so a second connection reused the
+    first one's window — and its terminal then attached to the WRONG host.
+    """
+    return str(profile.get("id") or "")[:8]
+
+
 def _ssh_tmux_window_name(profile: dict) -> str:
     if _is_local_profile(profile):
         return _local_tmux_window_name(profile)
     label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile.get("label") or "remote")).strip("-.")
-    return f"ssh:{(label or 'remote')[:36]}"
+    return f"ssh:{(label or 'remote')[:28]}-{_tmux_window_suffix(profile)}"
 
 
 def _ssh_tmux_window_exists(profile: dict, session_name: str) -> bool:
@@ -11605,7 +11649,7 @@ def _local_run(
 
 def _local_tmux_window_name(profile: dict) -> str:
     label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile.get("label") or "local")).strip("-.")
-    return f"local:{(label or 'local')[:36]}"
+    return f"local:{(label or 'local')[:28]}-{_tmux_window_suffix(profile)}"
 
 
 def _local_open_tmux_window(profile: dict, session_name: str) -> str:
@@ -11665,6 +11709,40 @@ def _ssh_run(
         detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
         raise RuntimeError((detail or "SSH command failed")[:800])
     return result.stdout.decode("utf-8", "replace")
+
+
+# Directory-only listing for the remote "Open Folder" picker. Unlike
+# _SSH_LIST_SCRIPT this is NOT confined to the workspace root -- the whole point
+# is choosing a new root -- so it returns directory names only and never file
+# contents, and the caller must already hold an authenticated connection.
+_SSH_BROWSE_SCRIPT = """
+import json, os, sys
+target = os.path.realpath(os.path.expanduser(sys.argv[-1] or '.'))
+if not os.path.isdir(target):
+    raise SystemExit('not a directory: ' + target)
+entries = []
+try:
+    with os.scandir(target) as children:
+        for entry in children:
+            if entry.name.startswith('.'):
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    entries.append({'name': entry.name,
+                                    'path': os.path.join(target, entry.name)})
+            except OSError:
+                continue
+except PermissionError:
+    raise SystemExit('permission denied: ' + target)
+entries.sort(key=lambda item: item['name'].lower())
+parent = os.path.dirname(target)
+print(json.dumps({
+    'path': target,
+    'parent': parent if parent != target else '',
+    'entries': entries[:1000],
+    'is_git': os.path.exists(os.path.join(target, '.git')),
+}))
+"""
 
 
 _SSH_LIST_SCRIPT = """
@@ -11815,7 +11893,15 @@ def git(*args):
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout or 'Git command failed').strip()[:1200])
     return result.stdout[:250000]
-git('rev-parse', '--show-toplevel')
+# A workspace that is not a repository is an ordinary state, not a crash: report
+# it as data so the panel can say so, instead of raising and surfacing a raw
+# Python traceback to the user.
+probe = subprocess.run(['git', '-C', root, 'rev-parse', '--show-toplevel'],
+                       text=True, capture_output=True, timeout=25)
+if probe.returncode:
+    print(json.dumps({'ok': False, 'not_a_repo': True, 'root': root,
+                      'error': 'This folder is not a Git repository.'}))
+    raise SystemExit(0)
 if action == 'status':
     output = git('status', '--short', '--branch')
 elif action == 'diff':
@@ -12172,11 +12258,36 @@ def _browse_roots(user: dict | None) -> list[Path]:
 def _browse_path_allowed(candidate: Path, roots: list[Path]) -> bool:
     for root in roots:
         try:
-            candidate.relative_to(root)
+            # Resolve the root too: comparing a resolved candidate against an
+            # unresolved root fails for everything as soon as any component of
+            # the path is a symlink.
+            candidate.relative_to(root.resolve(strict=False))
             return True
-        except ValueError:
+        except (ValueError, OSError):
             continue
     return False
+
+
+def _local_root_denied(request: Request, root: str) -> JSONResponse | None:
+    """Refuse a local workspace root outside the caller's allowed area.
+
+    The folder PICKER was tenant-scoped but connection creation was not, so a
+    member could name any directory on the host directly (~/.ssh, /, the
+    dashboard's own state) and get read/write through the file routes.
+    """
+    user = _current_user(request)
+    roots = _browse_roots(user)
+    if not roots:
+        return JSONResponse({"error": "No browsable location for this account"}, status_code=403)
+    try:
+        resolved = Path(root).expanduser().resolve(strict=False)
+    except (OSError, ValueError, RuntimeError):
+        return JSONResponse({"error": "Invalid folder path"}, status_code=400)
+    if not _browse_path_allowed(resolved, roots):
+        return JSONResponse(
+            {"error": "That folder is outside your allowed area"}, status_code=403
+        )
+    return None
 
 
 @app.get("/api/ide/connections/saved")
@@ -12211,6 +12322,43 @@ async def api_saved_connections(request: Request):
             seen[key] = public
     items = sorted(seen.values(), key=lambda item: (item.get("kind") or "", (item.get("label") or "").lower()))
     return JSONResponse({"connections": items})
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/browse")
+async def api_browse_connection_directories(
+    request: Request, session_name: str, connection_id: str, path: str = ""
+):
+    """Browse folders on whichever machine this connection points at.
+
+    "Open Folder" used to always browse the dashboard host, so choosing a folder
+    while connected over SSH silently created a LOCAL workspace pointing at a
+    path on the wrong machine. This walks the connection's own filesystem.
+    """
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    if _is_local_profile(profile):
+        # A local workspace browses this host, with the caller's own scoping.
+        return await api_browse_directories(request, path=path)
+    target = (path or "").strip() or "."
+    if len(target) > 4096 or "\x00" in target:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        raw = await asyncio.to_thread(
+            _ssh_run,
+            profile,
+            session_name,
+            _WorkspaceCommand(
+                _ssh_remote_command(_SSH_BROWSE_SCRIPT, target), _SSH_BROWSE_SCRIPT, target
+            ),
+            timeout=25,
+        )
+        return JSONResponse(json.loads(raw))
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)[:300]}, status_code=502)
 
 
 @app.get("/api/ide/browse")
@@ -12272,6 +12420,9 @@ async def _create_local_workspace(request: Request, session_name: str, body: SSH
         return JSONResponse(
             {"error": "Enter an existing folder path on this server"}, status_code=400
         )
+    denied = _local_root_denied(request, root)
+    if denied:
+        return denied
     if not 1_024 <= body.max_file_bytes <= SSH_MAX_FILE_BYTES:
         return JSONResponse({"error": "File limit must be between 1 KB and 1 MB"}, status_code=400)
     label = (body.label.strip() or Path(root).name or root)[:80]
@@ -12335,6 +12486,16 @@ async def api_create_ssh_connection(request: Request, session_name: str, body: S
             {"error": "That does not look like an OpenSSH private key (expected a BEGIN … PRIVATE KEY block)"},
             status_code=400,
         )
+    # A passphrase-protected key cannot be used: connections run under
+    # BatchMode=yes with no askpass, so OpenSSH fails with a bare
+    # "permission denied" that reads like wrong credentials. Say so up front
+    # instead of storing a passphrase nothing ever applies.
+    if pasted_key and _private_key_is_encrypted(pasted_key):
+        return JSONResponse(
+            {"error": "That key is passphrase-protected, which is not supported here. "
+                      "Paste a key without a passphrase, or use password authentication."},
+            status_code=400,
+        )
     if auth_mode == "key" and not identity_file and not pasted_key:
         return JSONResponse(
             {"error": "Paste a private key, or name an existing identity file under ~/.ssh"},
@@ -12382,6 +12543,74 @@ async def api_create_ssh_connection(request: Request, session_name: str, body: S
     _ssh_connections_store().update(add)
     _harden_ssh_state_file(SSH_CONNECTIONS_FILE)
     return JSONResponse({"ok": True, "connection": _ssh_public_profile(profile)}, status_code=201)
+
+
+class SSHWorkspaceRootBody(BaseModel):
+    workspace_root: str
+    label: str = ""
+
+
+@app.post("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/workspace-root")
+async def api_set_workspace_root(
+    request: Request, session_name: str, connection_id: str, body: SSHWorkspaceRootBody
+):
+    """Point an existing connection at a different folder.
+
+    Cloning the connection instead would break authentication: a stored key or
+    password is sealed with the connection id as GCM AAD, so a copy under a new
+    id cannot decrypt it. Re-rooting keeps the working credential.
+    """
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    root = (body.workspace_root or "").strip()
+    if not root or len(root) > 4096 or "\x00" in root:
+        return JSONResponse({"error": "Enter a valid folder path"}, status_code=400)
+    if _is_local_profile(profile):
+        resolved = _normalized_local_root(root)
+        if resolved is None:
+            return JSONResponse(
+                {"error": "Enter an existing folder path on this server"}, status_code=400
+            )
+        denied = _local_root_denied(request, resolved)
+        if denied:
+            return denied
+        root = resolved
+    else:
+        # Validate the remote path BEFORE committing: this route also clears the
+        # stored tabs and buffers, so a typo would destroy unsaved work and
+        # leave the connection pointing at a directory that does not exist.
+        try:
+            await asyncio.to_thread(
+                _ssh_run,
+                profile,
+                session_name,
+                _WorkspaceCommand(
+                    _ssh_remote_command(_SSH_BROWSE_SCRIPT, root), _SSH_BROWSE_SCRIPT, root
+                ),
+                timeout=25,
+            )
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            return JSONResponse(
+                {"error": f"Could not open {root} on the remote host: {str(exc)[:200]}"},
+                status_code=400,
+            )
+    changes = {"workspace_root": root, "last_directory": "."}
+    label = (body.label or "").strip()
+    if label:
+        changes["label"] = label[:80]
+    _ssh_update_profile(session_name, connection_id, changes)
+    # Stored tabs and buffers belong to the old root; keep them from reopening
+    # against paths that may not exist under the new one.
+    def drop_state(data: dict) -> None:
+        data.setdefault("workspaces", {}).pop(_ssh_ide_state_key(session_name, connection_id), None)
+
+    _ssh_ide_state_store().update(drop_state)
+    updated = _ssh_profile(session_name, connection_id, _current_user(request))
+    return JSONResponse({"ok": True, "connection": _ssh_public_profile(updated or {})})
 
 
 @app.delete("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}")
@@ -12537,8 +12766,11 @@ async def api_connect_ssh_connection(
     password = supplied or stored
     try:
         await asyncio.to_thread(_ssh_start_control_master, profile, session_name, password=password)
-        await _record_ssh_ide_audit(request, session_name, profile, "connect_requested")
         window_name = await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name)
+        # Recorded only after the connection is actually usable: an audit row
+        # written before the last failure point implies a connect that never
+        # happened, and this log is the security record.
+        await _record_ssh_ide_audit(request, session_name, profile, "connected")
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         detail = str(exc)
         low = detail.lower()
@@ -17415,7 +17647,7 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
     try:
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
+            ["tmux", "send-keys", "-t", session_name, "-l", _agent_quit_command(session_name)],
             capture_output=True,
             text=True,
             timeout=5,
@@ -17446,7 +17678,7 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
             await asyncio.sleep(0.5)
             await asyncio.to_thread(
                 subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
+                ["tmux", "send-keys", "-t", session_name, "-l", _agent_quit_command(session_name)],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -17564,6 +17796,35 @@ async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
     })
 
 
+async def _quit_running_agent(session_name: str) -> bool:
+    """Exit the agent in this pane, using its own quit command then Ctrl-C.
+
+    Returns True when the pane is free. Callers MUST check: sending a launch
+    command into a pane where the old agent is still alive types it into that
+    agent's prompt instead of a shell.
+    """
+    for keys in (["-l", _agent_quit_command(session_name)], ["Enter"]):
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, *keys],
+            capture_output=True, text=True, timeout=5,
+        )
+    for _ in range(12):
+        await asyncio.sleep(1)
+        if not await _async_is_codex_running(session_name):
+            return True
+    await asyncio.to_thread(
+        subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "C-c"],
+        capture_output=True, text=True, timeout=5,
+    )
+    for _ in range(8):
+        await asyncio.sleep(1)
+        if not await _async_is_codex_running(session_name):
+            return True
+    return False
+
+
 async def _restart_agent_with_new_flags(session_name: str) -> bool:
     """Relaunch the session's agent so changed launch flags take effect.
 
@@ -17575,34 +17836,7 @@ async def _restart_agent_with_new_flags(session_name: str) -> bool:
     # command line — so a changed --effort/--model would never take effect.
     # Quit the process, then send a freshly built launch command instead.
     if await _async_is_codex_running(session_name):
-        # Codex quits on "/quit"; Claude Code uses "/exit". Send the agent's own
-        # command, then fall back to Ctrl-C — sending the wrong one leaves the
-        # old process alive and the relaunch spawns a SECOND agent in the pane.
-        quit_cmd = "/exit" if _session_agent_kind(session_name) == "claude" else "/quit"
-        for keys in (["-l", quit_cmd], ["Enter"]):
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, *keys],
-                capture_output=True, text=True, timeout=5,
-            )
-        stopped = False
-        for _ in range(12):
-            await asyncio.sleep(1)
-            if not await _async_is_codex_running(session_name):
-                stopped = True
-                break
-        if not stopped:
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "C-c"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for _ in range(8):
-                await asyncio.sleep(1)
-                if not await _async_is_codex_running(session_name):
-                    stopped = True
-                    break
-        if not stopped:
+        if not await _quit_running_agent(session_name):
             # Never paste a launch command into a live agent's prompt.
             raise RuntimeError("The running agent did not exit; settings saved for its next start")
     owner = _user_for_session(session_name)
@@ -17685,36 +17919,38 @@ async def api_set_session_agent(request: Request, session_name: str, body: SetSe
             {"error": f"{agent} is not installed on this server"}, status_code=503
         )
     previous = _session_agent_kind(session_name)
-    _set_session_agent(session_name, agent)
     if not body.restart:
+        _set_session_agent(session_name, agent)
         return JSONResponse({"ok": True, "agent": agent, "restarted": False})
-    # Quit whatever is running, then start the newly chosen agent in its place.
-    running = await _async_is_codex_running(session_name)
-    restarted = False
+    # Order matters: the OLD agent is what is running, so quit it with ITS quit
+    # command before recording the new one. Setting the agent first made
+    # _agent_quit_command return the new agent's command, which the running one
+    # does not recognise — it stayed alive and the switch reported false success.
     try:
-        if running:
-            await _restart_codex_for_session(session_name)
-            restarted = True
-        else:
-            _send_session_owner_environment(session_name)
-            base = _session_launch_base(session_name, user)
+        if await _async_is_codex_running(session_name):
+            await _quit_running_agent(session_name)
+            if await _async_is_codex_running(session_name):
+                return JSONResponse(
+                    {"error": f"The running {previous} did not exit; agent unchanged"},
+                    status_code=409,
+                )
+        _set_session_agent(session_name, agent)
+        _send_session_owner_environment(session_name)
+        base = _session_launch_base(session_name, user)
+        for keys in (
+            ["-l", _session_launch_command(session_name, base, pin_model=agent == "codex")],
+            ["Enter"],
+        ):
             await asyncio.to_thread(
                 subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 _session_launch_command(session_name, base, pin_model=agent == "codex")],
+                ["tmux", "send-keys", "-t", session_name, *keys],
                 capture_output=True, text=True, timeout=5,
             )
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5,
-            )
-            restarted = True
     except Exception as exc:  # noqa: BLE001 - report, don't 500 the switch
         _set_session_agent(session_name, previous)
         logger.warning("Agent switch failed for %s", session_name, exc_info=True)
         return JSONResponse({"error": str(exc)[:200] or "Could not switch agent"}, status_code=502)
-    return JSONResponse({"ok": True, "agent": agent, "restarted": restarted})
+    return JSONResponse({"ok": True, "agent": agent, "restarted": True})
 
 
 @app.post("/api/sessions/{session_name}/model")
