@@ -25,6 +25,23 @@
   --color-vs-yellow: #dcdcaa;
   --color-vs-orange: #ce9178;
   --color-vs-red: #f48771;
+
+  /* Monokai accents for the chat panel. The editor is Monokai, so the
+     assistant's voice and inline code should read from the same palette rather
+     than VS Code's blues. */
+  --color-mk-bg: #272822;        /* Monokai canvas */
+  --color-mk-panel: #2f302a;     /* raised surface */
+  --color-mk-input: #1e1f1c;
+  --color-mk-line: #3e3d32;      /* borders / selection */
+  --color-mk-fg: #f8f8f2;
+  --color-mk-muted: #90908a;
+  --color-mk-comment: #75715e;
+  --color-mk-green: #a6e22e;     /* functions — assistant name */
+  --color-mk-pink: #f92672;      /* keywords — errors, emphasis */
+  --color-mk-blue: #66d9ef;      /* types — user voice */
+  --color-mk-yellow: #e6db74;    /* strings — inline code */
+  --color-mk-purple: #ae81ff;    /* constants */
+  --color-mk-orange: #fd971f;
 }
 
 /* The IDE owns the whole viewport; the shell scrolls its own panes. */
