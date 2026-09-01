@@ -11,6 +11,9 @@
   let socket = null
   let status = $state('connecting')
   let resizeObserver = null
+  let retry = 0
+  let retryTimer = null
+  let disposed = false
 
   // xterm's palette, matched to the Monokai editor theme so the terminal does
   // not read as a different application.
@@ -36,6 +39,42 @@
     }
   }
 
+  /** Attach to the session's tmux window, retrying if the socket drops.
+   *
+   * The shell itself lives in tmux on the server, so a dropped WebSocket is a
+   * lost *view*, not a lost session — reconnecting re-attaches to the very same
+   * window with its history and working directory intact.
+   */
+  function connect() {
+    if (disposed) return
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
+    const url =
+      `${scheme}://${location.host}${rootPath}/ws/sessions/` +
+      `${encodeURIComponent(session)}/ide/terminal/${encodeURIComponent(ide.connectionId)}`
+    socket = new WebSocket(url)
+    socket.binaryType = 'arraybuffer'
+
+    socket.onopen = () => {
+      status = 'connected'
+      retry = 0
+      sendResize()
+    }
+    socket.onmessage = (event) => {
+      term.write(
+        typeof event.data === 'string' ? event.data : new Uint8Array(event.data),
+      )
+    }
+    socket.onclose = () => {
+      if (disposed) return
+      status = 'reconnecting'
+      // Back off up to 10s so a server restart does not spin the browser.
+      const delay = Math.min(1000 * 2 ** retry, 10000)
+      retry += 1
+      retryTimer = setTimeout(connect, delay)
+    }
+    socket.onerror = () => { if (!disposed) status = 'error' }
+  }
+
   onMount(async () => {
     const [{ Terminal }, { FitAddon }] = await Promise.all([
       import('@xterm/xterm'),
@@ -55,27 +94,7 @@
     term.open(container)
     fit.fit()
 
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-    const url =
-      `${scheme}://${location.host}${rootPath}/ws/sessions/` +
-      `${encodeURIComponent(session)}/ide/terminal/${encodeURIComponent(ide.connectionId)}`
-    socket = new WebSocket(url)
-    socket.binaryType = 'arraybuffer'
-
-    socket.onopen = () => {
-      status = 'connected'
-      sendResize()
-    }
-    socket.onmessage = (event) => {
-      term.write(
-        typeof event.data === 'string' ? event.data : new Uint8Array(event.data),
-      )
-    }
-    socket.onclose = () => {
-      status = 'closed'
-      term?.write('\r\n\x1b[90m— terminal detached —\x1b[0m\r\n')
-    }
-    socket.onerror = () => { status = 'error' }
+    connect()
 
     // Keystrokes go as binary so the server never confuses them with the JSON
     // control messages used for resize.
@@ -90,6 +109,8 @@
   })
 
   onDestroy(() => {
+    disposed = true
+    if (retryTimer) clearTimeout(retryTimer)
     resizeObserver?.disconnect()
     socket?.close()
     term?.dispose()
@@ -98,7 +119,7 @@
 
 <div class="terminal-pane">
   <div class="bar">
-    <span class="label">SSH terminal</span>
+    <span class="label">Terminal</span>
     <span class="status {status}">{status}</span>
   </div>
   <div class="screen" bind:this={container}></div>
@@ -111,5 +132,6 @@
   .status { font-size: 11px; margin-left: auto; color: var(--ide-muted); }
   .status.connected { color: var(--ide-accent); }
   .status.error, .status.closed { color: #f92672; }
+  .status.reconnecting { color: #e6db74; }
   .screen { flex: 1; min-height: 0; padding: 4px 6px; overflow: hidden; }
 </style>

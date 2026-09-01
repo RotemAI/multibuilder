@@ -332,17 +332,92 @@ CLAUDE_SESSION_CMD = os.environ.get(
     "TMUX_DASH_CLAUDE_SESSION_CMD",
     "claude --dangerously-skip-permissions",
 )
-_session_agent: dict[str, str] = {}
+# Persisted per session: uvicorn runs several workers, so an in-memory dict
+# would let the worker that answers a read disagree with the one that handled
+# the write — the agent picker showed the old value after a successful switch.
+def _session_agents_file() -> Path:
+    # Resolved lazily: this helper is defined above MESSAGES_DIR, and binding
+    # the path at import time would fail with an undefined name.
+    return MESSAGES_DIR / "session_agents.json"
+
+
+def _session_agents_store() -> LockedJsonStore:
+    return LockedJsonStore(_session_agents_file(), dict)
 
 
 def _session_agent_kind(session_name: str) -> str:
-    return _session_agent.get(session_name) or "codex"
+    try:
+        row = (_session_agents_store().read() or {}).get(str(session_name))
+        # Rows were plain strings before per-agent settings were added; accept
+        # both shapes so existing sessions keep their agent after an upgrade.
+        raw = row.get("agent") if isinstance(row, dict) else row
+        value = str(raw or "").strip().lower()
+        return value if value in {"codex", "claude"} else "codex"
+    except Exception:
+        return "codex"
+
+
+def _set_session_agent(session_name: str, agent: str) -> None:
+    def mutate(agents: dict):
+        # Preserve any sibling settings (effort, model) stored for this session.
+        row = agents.get(str(session_name))
+        if isinstance(row, dict):
+            row["agent"] = str(agent)
+        else:
+            agents[str(session_name)] = {"agent": str(agent)}
+
+    _session_agents_store().update(mutate)
+
+
+# Claude Code takes effort and model as LAUNCH FLAGS (--effort/--model); it does
+# not read Codex's config.toml. They are stored per session here and applied
+# when the pane starts, rather than written into a config Claude never reads.
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_MODEL_ALIASES = ("fable", "opus", "sonnet")
+
+
+def _session_claude_setting(session_name: str, key: str) -> str:
+    try:
+        row = (_session_agents_store().read() or {}).get(str(session_name))
+        return str(row.get(key) or "") if isinstance(row, dict) else ""
+    except Exception:
+        return ""
+
+
+def _set_session_claude_setting(session_name: str, key: str, value: str) -> None:
+    def mutate(agents: dict):
+        row = agents.get(str(session_name))
+        if not isinstance(row, dict):
+            row = {"agent": str(row or "codex")}
+        row[key] = str(value)
+        agents[str(session_name)] = row
+
+    _session_agents_store().update(mutate)
+
+
+def _clear_session_agent(session_name: str) -> None:
+    def mutate(agents: dict):
+        agents.pop(str(session_name), None)
+
+    _session_agents_store().update(mutate)
+
+
+def _claude_launch_flags(session_name: str) -> str:
+    """--effort/--model flags for this session's stored Claude settings."""
+    parts = []
+    effort = _session_claude_setting(session_name, "claude_effort")
+    if effort in CLAUDE_EFFORTS:
+        parts.append("--effort " + shlex.quote(effort))
+    model = _session_claude_setting(session_name, "claude_model")
+    if model and re.fullmatch(r"[A-Za-z0-9._:-]{2,80}", model):
+        parts.append("--model " + shlex.quote(model))
+    return (" " + " ".join(parts)) if parts else ""
 
 
 def _session_launch_base(session_name: str = "", user: dict | None = None) -> str:
     """Use the canonical full-access launch for members and configured admin command."""
     if session_name and _session_agent_kind(session_name) == "claude":
-        return CLAUDE_SESSION_CMD
+        return CLAUDE_SESSION_CMD + _claude_launch_flags(session_name)
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
         if owner and not _is_admin(owner):
@@ -366,12 +441,20 @@ def _session_launch_identity_prefix(session_name: str) -> str:
         return (
             "env CODEX_HOME="
             + shlex.quote(str(codex_home))
+            + " CLAUDE_CONFIG_DIR="
+            + shlex.quote(str(_user_claude_config_dir(owner)))
             + " ADVISOR_TOKEN=\"$(cat "
             + shlex.quote(str(token_path))
             + " 2>/dev/null)\""
         )
     token_path = Path.home() / ".advisor-token"
     return (
+        # CLAUDE_CONFIG_DIR is deliberately NOT set for the admin: Claude's
+        # default layout keeps credentials in ~/.claude/.credentials.json but
+        # its main config at ~/.claude.json (home level, not inside the dir).
+        # Pointing CLAUDE_CONFIG_DIR at ~/.claude makes Claude look for
+        # ~/.claude/.claude.json, miss the real config, and rewrite a blank one.
+        # Inheriting the environment is what keeps the existing login working.
         "env -u CODEX_HOME ADVISOR_TOKEN=\"$(cat "
         + shlex.quote(str(token_path))
         + " 2>/dev/null)\""
@@ -793,7 +876,10 @@ def _is_codex_running(session_name: str) -> bool:
             if current in seen:
                 continue
             seen.add(current)
-            if commands.get(current) == "codex":
+            # Match any supported agent, not just "codex": a Claude pane was
+            # reported as idle, so restart logic typed a launch command straight
+            # into the live agent's prompt instead of a shell.
+            if commands.get(current) in _AGENT_PROCESS_NAMES:
                 return True
             pending.extend(children.get(current, ()))
         return False
@@ -4515,10 +4601,25 @@ def _apply_member_auth(cfg_dir: Path) -> str:
         return "api" if _active_openai_key() else "unconfigured"
 
 
+def _claude_config_json(cfg_dir: Path) -> Path:
+    """Where Claude keeps its main config for a given config dir.
+
+    The default ~/.claude uses the HOME-level ~/.claude.json, not a file inside
+    the directory. Writing the wrong one leaves the real config untouched and
+    the session still prompts.
+    """
+    try:
+        if cfg_dir.resolve() == (Path.home() / ".claude").resolve():
+            return Path.home() / ".claude.json"
+    except OSError:
+        pass
+    return cfg_dir / ".claude.json"
+
+
 def _seed_trust(cfg_dir: Path, cwd: str):
     """Pre-accept Claude Code's per-folder trust dialog for `cwd` in this config
     dir's .claude.json so it doesn't prompt (which would hang a detached session)."""
-    cj = cfg_dir / ".claude.json"
+    cj = _claude_config_json(cfg_dir)
     try:
         d = json.loads(cj.read_text()) if cj.exists() else {}
         if not isinstance(d, dict):
@@ -6627,6 +6728,12 @@ def _process_tree_snapshot() -> tuple[dict[str, list[str]], dict[str, str]]:
         return {}, {}
 
 
+# Process names that mark a tmux session as belonging to this dashboard. Claude
+# sessions were invisible while this matched only "codex", so a session started
+# with the Claude agent vanished from the list the moment its shell was replaced.
+_AGENT_PROCESS_NAMES = frozenset({"codex", "claude"})
+
+
 def _session_is_codex(name: str) -> bool:
     """Return True if this tmux session belongs to the codex dashboard.
 
@@ -6662,7 +6769,7 @@ def _session_is_codex(name: str) -> bool:
             if current in seen:
                 continue
             seen.add(current)
-            if commands.get(current) == "codex":
+            if commands.get(current) in _AGENT_PROCESS_NAMES:
                 has_codex = True
                 break
             to_check.extend(children.get(current, ()))
@@ -9371,7 +9478,28 @@ async def api_create_session(request: Request, body: CreateSession):
             _agent_warning = "Claude is not installed on this server — started Codex instead"
         else:
             _agent_warning = ""
-        _session_agent[created] = _agent
+        _set_session_agent(created, _agent)
+        if _agent == "claude":
+            # Claude asks a per-folder trust question on first use of a
+            # directory. A detached pane cannot answer it, so pre-accept it for
+            # the folder this session will work in — the user already owns it,
+            # and the alternative is a session that hangs on a prompt forever.
+            try:
+                _cfg_dir = (
+                    _user_claude_config_dir(user)
+                    if (user and not _is_admin(user))
+                    else Path.home() / ".claude"
+                )
+                # A member's pane starts in their project dir; an admin's starts
+                # in the dashboard directory. Seed both rather than guessing,
+                # since trust is keyed on the exact path.
+                for _cwd in {
+                    str(PROJECTS_ROOT / ((user or {}).get("username") or "admin") / created),
+                    str(Path(__file__).resolve().parent),
+                }:
+                    _seed_trust(_cfg_dir, _cwd)
+            except Exception:
+                logger.debug("Could not seed Claude trust for %s", created, exc_info=True)
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
@@ -9475,6 +9603,7 @@ async def api_delete_session(request: Request, session_name: str):
     if sess.get("virtual"):
         await asyncio.to_thread(_session_lifecycle.remove, session_name)
         _clear_session_owner(session_name)
+        _clear_session_agent(session_name)
         return JSONResponse({"ok": True, "killed": session_name, "virtual": True})
     try:
         # First, find and kill all processes in the session's panes.
@@ -9547,6 +9676,7 @@ async def api_delete_session(request: Request, session_name: str):
         # Drop the ownership record. Messages/notes are kept on disk so they
         # show up in the user's History tab even after the live session dies.
         _clear_session_owner(session_name)
+        _clear_session_agent(session_name)
         await asyncio.to_thread(_session_lifecycle.remove, session_name)
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
@@ -11230,6 +11360,22 @@ def _ssh_tmux_window_name(profile: dict) -> str:
     return f"ssh:{(label or 'remote')[:36]}"
 
 
+def _ssh_tmux_window_exists(profile: dict, session_name: str) -> bool:
+    """Is this connection's terminal window still present in the tmux session?"""
+    if not shutil.which("tmux"):
+        return False
+    try:
+        result = subprocess.run(
+            ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    return _ssh_tmux_window_name(profile) in result.stdout.split()
+
+
 def _ssh_open_tmux_window(profile: dict, session_name: str) -> str:
     """Open an interactive view of the already-authenticated SSH control master."""
     if _is_local_profile(profile):
@@ -11809,6 +11955,17 @@ async def ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: s
     if not await asyncio.to_thread(_ssh_control_is_alive, profile, session_name):
         await ws.close(code=1011)
         return
+    # The shell lives in a tmux window, which is what makes this terminal
+    # persistent across browser reloads. If that window is gone (killed, or the
+    # tmux server restarted) attaching would fail forever, so re-create it and
+    # hand the client a working terminal instead of a dead one.
+    if not await asyncio.to_thread(_ssh_tmux_window_exists, profile, session_name):
+        try:
+            await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            logger.info("Could not re-open terminal window for %s", session_name, exc_info=True)
+            await ws.close(code=1011)
+            return
 
     await ws.accept()
     process = master_fd = None
@@ -17183,6 +17340,26 @@ async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    # Claude takes --effort as a launch flag and never reads Codex's config.toml,
+    # so its effort is stored per session and applied when the pane restarts.
+    if _session_agent_kind(session_name) == "claude":
+        level = (body.effort or "").strip().lower()
+        if level not in CLAUDE_EFFORTS:
+            return JSONResponse(
+                {"error": f"Invalid effort. Use {', '.join(CLAUDE_EFFORTS)}."}, status_code=400
+            )
+        _set_session_claude_setting(session_name, "claude_effort", level)
+        restarted = False
+        if body.restart:
+            try:
+                await _restart_agent_with_new_flags(session_name)
+                restarted = True
+            except Exception as exc:  # noqa: BLE001 - setting is saved either way
+                logger.info("Could not restart Claude for effort change", exc_info=True)
+                return JSONResponse(
+                    {"ok": True, "effort": level, "restarted": False, "warning": str(exc)[:200]}
+                )
+        return JSONResponse({"ok": True, "effort": level, "restarted": restarted})
     effort = _normalize_reasoning_effort(body.effort)
     if effort is None or effort == "":
         allowed = ", ".join(_CODEX_REASONING_EFFORTS)
@@ -17207,6 +17384,159 @@ async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
     })
 
 
+async def _restart_agent_with_new_flags(session_name: str) -> bool:
+    """Relaunch the session's agent so changed launch flags take effect.
+
+    Claude's --effort/--model are read at process start, so a change only lands
+    on the next launch. Quitting and relaunching in the same pane is what makes
+    the setting apply without the user retyping anything.
+    """
+    # _restart_codex_for_session RESUMES the agent, which re-runs the previous
+    # command line — so a changed --effort/--model would never take effect.
+    # Quit the process, then send a freshly built launch command instead.
+    if await _async_is_codex_running(session_name):
+        # Codex quits on "/quit"; Claude Code uses "/exit". Send the agent's own
+        # command, then fall back to Ctrl-C — sending the wrong one leaves the
+        # old process alive and the relaunch spawns a SECOND agent in the pane.
+        quit_cmd = "/exit" if _session_agent_kind(session_name) == "claude" else "/quit"
+        for keys in (["-l", quit_cmd], ["Enter"]):
+            await asyncio.to_thread(
+                subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, *keys],
+                capture_output=True, text=True, timeout=5,
+            )
+        stopped = False
+        for _ in range(12):
+            await asyncio.sleep(1)
+            if not await _async_is_codex_running(session_name):
+                stopped = True
+                break
+        if not stopped:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "C-c"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for _ in range(8):
+                await asyncio.sleep(1)
+                if not await _async_is_codex_running(session_name):
+                    stopped = True
+                    break
+        if not stopped:
+            # Never paste a launch command into a live agent's prompt.
+            raise RuntimeError("The running agent did not exit; settings saved for its next start")
+    owner = _user_for_session(session_name)
+    _send_session_owner_environment(session_name)
+    base = _session_launch_base(session_name, owner)
+    await asyncio.to_thread(
+        subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "-l",
+         _session_launch_command(session_name, base, pin_model=False)],
+        capture_output=True, text=True, timeout=5,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "Enter"],
+        capture_output=True, text=True, timeout=5,
+    )
+    return True
+
+
+class SetSessionAgentBody(BaseModel):
+    agent: str = "codex"
+    restart: bool = True
+
+
+@app.get("/api/sessions/{session_name}/agent")
+async def api_get_session_agent(request: Request, session_name: str):
+    """Everything the chat panel's agent/model/effort controls need, in one call.
+
+    The panel would otherwise fan out to /api/models plus two session reads on
+    every open; the values all come from the same place, so serve them together.
+    """
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    agent = _session_agent_kind(session_name)
+    if agent == "claude":
+        # Claude's settings live with the session, not in Codex's config, and it
+        # offers its own model aliases and effort levels.
+        return JSONResponse({
+            "agent": agent,
+            "available": [name for name in ("codex", "claude") if shutil.which(name)],
+            "model": _session_claude_setting(session_name, "claude_model"),
+            "model_pending": "",
+            "effort": _session_claude_setting(session_name, "claude_effort"),
+            "models": [[alias, alias.capitalize()] for alias in CLAUDE_MODEL_ALIASES],
+            "efforts": list(CLAUDE_EFFORTS),
+            "default_model": "",
+        })
+    fields = await asyncio.to_thread(_session_model_fields, session_name)
+    return JSONResponse({
+        "agent": agent,
+        "available": [name for name in ("codex", "claude") if shutil.which(name)],
+        "model": fields.get("model", ""),
+        "model_pending": fields.get("model_pending", ""),
+        "effort": fields.get("effort", ""),
+        "models": MODEL_CATALOG,
+        "efforts": list(_CODEX_REASONING_EFFORTS),
+        "default_model": DEFAULT_MODEL,
+    })
+
+
+@app.post("/api/sessions/{session_name}/agent")
+async def api_set_session_agent(request: Request, session_name: str, body: SetSessionAgentBody):
+    """Switch the agent running in a session.
+
+    Unlike the model, the agent IS the process, so taking effect means quitting
+    the current one and launching the other in the same pane.
+    """
+    user = _current_user(request)
+    if user and not _user_can_access_session(user, session_name):
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    agent = (body.agent or "").strip().lower()
+    if agent not in {"codex", "claude"}:
+        return JSONResponse({"error": "Agent must be 'codex' or 'claude'"}, status_code=400)
+    if not shutil.which(agent):
+        return JSONResponse(
+            {"error": f"{agent} is not installed on this server"}, status_code=503
+        )
+    previous = _session_agent_kind(session_name)
+    _set_session_agent(session_name, agent)
+    if not body.restart:
+        return JSONResponse({"ok": True, "agent": agent, "restarted": False})
+    # Quit whatever is running, then start the newly chosen agent in its place.
+    running = await _async_is_codex_running(session_name)
+    restarted = False
+    try:
+        if running:
+            await _restart_codex_for_session(session_name)
+            restarted = True
+        else:
+            _send_session_owner_environment(session_name)
+            base = _session_launch_base(session_name, user)
+            await asyncio.to_thread(
+                subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "-l",
+                 _session_launch_command(session_name, base, pin_model=agent == "codex")],
+                capture_output=True, text=True, timeout=5,
+            )
+            await asyncio.to_thread(
+                subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5,
+            )
+            restarted = True
+    except Exception as exc:  # noqa: BLE001 - report, don't 500 the switch
+        _set_session_agent(session_name, previous)
+        logger.warning("Agent switch failed for %s", session_name, exc_info=True)
+        return JSONResponse({"error": str(exc)[:200] or "Could not switch agent"}, status_code=502)
+    return JSONResponse({"ok": True, "agent": agent, "restarted": restarted})
+
+
 @app.post("/api/sessions/{session_name}/model")
 async def api_set_session_model(session_name: str, body: SetSessionModelBody):
     """Persist the account's Codex model and optionally restart the live pane."""
@@ -17216,6 +17546,19 @@ async def api_set_session_model(session_name: str, body: SetSessionModelBody):
     model = (body.model or "").strip()
     if not re.match(r"^[A-Za-z0-9._:/-]{2,80}$", model):
         return JSONResponse({"error": "Invalid model id."}, status_code=400)
+    if _session_agent_kind(session_name) == "claude":
+        _set_session_claude_setting(session_name, "claude_model", model)
+        restarted = False
+        if body.restart:
+            try:
+                await _restart_agent_with_new_flags(session_name)
+                restarted = True
+            except Exception as exc:  # noqa: BLE001 - setting is saved either way
+                logger.info("Could not restart Claude for model change", exc_info=True)
+                return JSONResponse(
+                    {"ok": True, "model": model, "restarted": False, "warning": str(exc)[:200]}
+                )
+        return JSONResponse({"ok": True, "model": model, "restarted": restarted})
     await asyncio.to_thread(
         _write_session_codex_settings,
         session_name,
@@ -28168,7 +28511,10 @@ if __name__ == "__main__":
     else:
         # One controller owns watchdogs, lifecycle and tmux readers. Uvicorn's
         # workers are stateless HTTP/WebSocket relays and can scale independently.
-        workers = max(2, min(8, int(os.environ.get("TMUX_DASH_WEB_WORKERS", "2"))))
+        # Floor of 1, not 2: this host has ~2 GB RAM and each worker imports the
+        # whole 28k-line module, so forcing a second worker on a memory-tight box
+        # made every child die at spawn and the service never bound its port.
+        workers = max(1, min(8, int(os.environ.get("TMUX_DASH_WEB_WORKERS", "2"))))
         controller_env = os.environ.copy()
         controller_env["TMUX_DASH_PROCESS_ROLE"] = "controller"
         controller = subprocess.Popen(

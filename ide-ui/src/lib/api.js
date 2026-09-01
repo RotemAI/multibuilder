@@ -41,6 +41,52 @@ export const api = {
     return data
   },
 
+  // Agent / model / effort for one session. These are session-level dashboard
+  // routes, not IDE-scoped ones, so they bypass ideApi's /ide prefix.
+  sessionAgent: async (name) => {
+    const { rootPath = '' } = base()
+    const response = await fetch(`${rootPath}/api/sessions/${encodeURIComponent(name)}/agent`)
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data.error || 'Could not read agent settings')
+    return data
+  },
+
+  setSessionAgent: async (name, agent) => {
+    const { rootPath = '' } = base()
+    const response = await fetch(`${rootPath}/api/sessions/${encodeURIComponent(name)}/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent, restart: true }),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data.error || 'Could not switch agent')
+    return data
+  },
+
+  setSessionModel: async (name, model) => {
+    const { rootPath = '' } = base()
+    const response = await fetch(`${rootPath}/api/sessions/${encodeURIComponent(name)}/model`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, restart: true }),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data.error || 'Could not change model')
+    return data
+  },
+
+  setSessionEffort: async (name, effort) => {
+    const { rootPath = '' } = base()
+    const response = await fetch(`${rootPath}/api/sessions/${encodeURIComponent(name)}/effort`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ effort, restart: true }),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data.error || 'Could not change effort')
+    return data
+  },
+
   listConnections: () => request('/ssh-connections'),
 
   createConnection: (body) =>

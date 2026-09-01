@@ -46,6 +46,13 @@ class IdeStore {
     return this.tabs.filter((tab) => tab.dirty).length
   }
 
+  /** Pending Git changes, for the Source Control badge in the activity bar. */
+  get gitDirtyCount() {
+    return this.gitStatus
+      .split('\n')
+      .filter((line) => line.trim() && !line.startsWith('##')).length
+  }
+
   setStatus(status, detail) {
     this.statusText = status
     if (detail !== undefined) this.detailText = detail

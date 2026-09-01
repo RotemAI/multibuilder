@@ -10,10 +10,13 @@
   import QuickOpen from './QuickOpen.svelte'
   import Terminal from './Terminal.svelte'
   import OpenFolderDialog from './OpenFolderDialog.svelte'
+  import SearchPanel from './SearchPanel.svelte'
+  import Resizer from './Resizer.svelte'
   import {
     Files, GitBranch, MessageSquare, Server, Plus, Trash2, SquareTerminal,
     ExternalLink, FolderOpen, FileCode2, X, PanelBottom, Circle, CircleDot,
-    CircleCheck, CircleAlert,
+    CircleCheck, CircleAlert, Search, MonitorSmartphone, Settings, CircleUser,
+    Ellipsis, PanelLeft,
   } from 'lucide-svelte'
 
   let { sessions = [], session = '', rootPath = '' } = $props()
@@ -21,10 +24,52 @@
   let view = $state('files')          // files | git | remote
   // Chat lives in its own right-hand pane (like VS Code's secondary side bar)
   // rather than replacing the Explorer, so you can read files while asking.
-  let showChat = $state(true)
-  let sidebarOpen = $state(true)
+  function storedFlag(key, fallback) {
+    try {
+      const raw = localStorage.getItem(`ide.show.${key}`)
+      return raw === null ? fallback : raw === '1'
+    } catch {
+      return fallback
+    }
+  }
+  let showChat = $state(storedFlag('chat', true))
+
+  // Pane sizes are per-viewer chrome, so they live in localStorage rather than
+  // server state. Reads are wrapped: a private window can throw on access.
+  const SIZE_DEFAULTS = { sidebar: 240, chat: 320, panel: 240 }
+  function storedSize(key) {
+    try {
+      const raw = localStorage.getItem(`ide.size.${key}`)
+      const value = Number(raw)
+      return Number.isFinite(value) && value > 0 ? value : SIZE_DEFAULTS[key]
+    } catch {
+      return SIZE_DEFAULTS[key]
+    }
+  }
+  let sidebarWidth = $state(storedSize('sidebar'))
+  let chatWidth = $state(storedSize('chat'))
+  let panelHeight = $state(storedSize('panel'))
+  $effect(() => {
+    try {
+      localStorage.setItem('ide.size.sidebar', String(sidebarWidth))
+      localStorage.setItem('ide.size.chat', String(chatWidth))
+      localStorage.setItem('ide.size.panel', String(panelHeight))
+      localStorage.setItem('ide.show.terminal', showTerminal ? '1' : '0')
+      localStorage.setItem('ide.show.chat', showChat ? '1' : '0')
+      localStorage.setItem('ide.show.sidebar', sidebarOpen ? '1' : '0')
+    } catch {
+      /* storage unavailable — layout just does not persist */
+    }
+  })
+  let sidebarOpen = $state(storedFlag('sidebar', true))
   let quickOpen = $state(false)
-  let showTerminal = $state(false)
+  let showTerminal = $state(storedFlag('terminal', false))
+  // Once opened, the panel stays in the DOM (hidden when toggled off) so the
+  // terminal keeps its buffer and socket across toggles.
+  let terminalMounted = $state(false)
+  $effect(() => {
+    if (showTerminal) terminalMounted = true
+  })
   let showConnectionForm = $state(false)
   let showOpenFolder = $state(false)
   let password = $state('')
@@ -44,10 +89,13 @@
   const StateIcon = $derived(STATE_META[ide.connectionState].icon)
   const isLocal = $derived(ide.connection?.kind === 'local')
 
+  // VS Code's own activity bar order and iconography. `badge` mirrors the blue
+  // count VS Code puts on Source Control when there are pending changes.
   const ACTIVITY = [
-    { id: 'files', icon: Files, label: 'Explorer' },
-    { id: 'git', icon: GitBranch, label: 'Source Control' },
-    { id: 'remote', icon: Server, label: 'Workspaces' },
+    { id: 'files', icon: Files, label: 'Explorer', keys: 'Ctrl+Shift+E' },
+    { id: 'search', icon: Search, label: 'Search', keys: 'Ctrl+Shift+F' },
+    { id: 'git', icon: GitBranch, label: 'Source Control', keys: 'Ctrl+Shift+G' },
+    { id: 'remote', icon: MonitorSmartphone, label: 'Remote Explorer', keys: '' },
   ]
 
   onMount(async () => {
@@ -144,6 +192,11 @@
     } else if (mod && event.shiftKey && key === 'o') {
       event.preventDefault()
       showOpenFolder = true
+    } else if (mod && event.shiftKey && ['e', 'f', 'g'].includes(key)) {
+      // VS Code's view shortcuts: Explorer / Search / Source Control.
+      event.preventDefault()
+      view = { e: 'files', f: 'search', g: 'git' }[key]
+      sidebarOpen = true
     } else if (mod && key === 'b' && !inField) {
       event.preventDefault()
       sidebarOpen = !sidebarOpen
@@ -178,6 +231,19 @@
     >
       Open File…
     </button>
+    <!-- The panel is easy to lose once hidden, so it gets a visible toggle here
+         rather than living only on the status bar. -->
+    <button
+      class="flex items-center gap-1 rounded-sm px-2 py-0.5 hover:bg-vs-hover disabled:opacity-40"
+      class:text-vs-bright={showTerminal}
+      onclick={() => (showTerminal = !showTerminal)}
+      disabled={ide.connectionState !== 'connected'}
+      title={ide.connectionState === 'connected'
+        ? 'Toggle terminal (Ctrl+`)'
+        : 'Open a workspace to use the terminal'}
+    >
+      <SquareTerminal size={13} /> Terminal
+    </button>
     <span class="mx-auto truncate text-vs-muted" title={ide.connection?.workspace_root}>
       {ide.connection ? `${ide.connection.label} — Multibuilder IDE` : 'Multibuilder IDE'}
     </span>
@@ -189,27 +255,56 @@
 
   <div class="flex min-h-0 flex-1">
     <!-- Activity bar -->
-    <nav class="flex w-12 shrink-0 flex-col items-center bg-vs-activity py-1">
+    <nav class="flex w-12 shrink-0 flex-col items-center bg-vs-activity">
       {#each ACTIVITY as item (item.id)}
         <button
           class="relative flex h-12 w-12 items-center justify-center {view === item.id && sidebarOpen ? 'text-vs-bright' : 'text-vs-muted hover:text-vs-fg'}"
-          title={item.label}
+          title={item.keys ? `${item.label} (${item.keys})` : item.label}
           aria-label={item.label}
           onclick={() => pickView(item.id)}
         >
           {#if view === item.id && sidebarOpen}
             <span class="absolute top-0 bottom-0 left-0 w-0.5 bg-vs-bright"></span>
           {/if}
-          <item.icon size={22} strokeWidth={1.5} />
+          <item.icon size={24} strokeWidth={1.4} />
+          {#if item.id === 'git' && ide.gitDirtyCount}
+            <!-- VS Code's pending-changes badge. -->
+            <span class="absolute right-1.5 bottom-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-vs-status px-1 text-[10px] leading-none font-semibold text-white">
+              {ide.gitDirtyCount}
+            </span>
+          {/if}
         </button>
       {/each}
+
+      <!-- Account and settings sit at the bottom of VS Code's activity bar. -->
+      <div class="mt-auto flex flex-col items-center pb-1">
+        <button
+          class="flex h-12 w-12 items-center justify-center text-vs-muted hover:text-vs-fg"
+          title="Account — signed in to the dashboard" aria-label="Account"
+          onclick={() => ide.setStatus('Signed in to the Multibuilder dashboard')}
+        >
+          <CircleUser size={24} strokeWidth={1.4} />
+        </button>
+        <button
+          class="flex h-12 w-12 items-center justify-center text-vs-muted hover:text-vs-fg"
+          title="Toggle side bar (Ctrl+B)" aria-label="Toggle side bar"
+          onclick={() => (sidebarOpen = !sidebarOpen)}
+        >
+          <PanelLeft size={24} strokeWidth={1.4} />
+        </button>
+      </div>
     </nav>
 
     <!-- Side bar -->
     {#if sidebarOpen}
-      <aside class="flex w-60 shrink-0 flex-col overflow-hidden border-r border-vs-border bg-vs-panel">
+      <aside
+        class="flex shrink-0 flex-col overflow-hidden border-r border-vs-border bg-vs-panel"
+        style="width: {sidebarWidth}px"
+      >
         {#if view === 'files'}
           <Explorer />
+        {:else if view === 'search'}
+          <SearchPanel />
         {:else if view === 'git'}
           <GitPanel />
         {:else}
@@ -306,6 +401,13 @@
           {/if}
         {/if}
       </aside>
+      <Resizer
+        bind:size={sidebarWidth}
+        side="right"
+        min={170}
+        max={620}
+        onreset={() => (sidebarWidth = SIZE_DEFAULTS.sidebar)}
+      />
     {/if}
 
     <!-- Editor area -->
@@ -331,11 +433,28 @@
       {:else}
         <Tabs />
         <div class="min-h-0 flex-1"><Editor /></div>
-        {#if showTerminal && ide.connectionState === 'connected'}
-          <div class="flex h-[35%] min-h-[140px] flex-col border-t border-vs-line bg-vs-bg">
+        <!-- The panel stays MOUNTED once opened and is only hidden, so closing
+             it keeps the xterm buffer, scrollback and live socket. Destroying
+             it lost the scrollback even though tmux kept the shell running. -->
+        {#if terminalMounted && ide.connectionState === 'connected'}
+          {#if showTerminal}
+            <Resizer
+              bind:size={panelHeight}
+              side="top"
+              min={120}
+              max={640}
+              onreset={() => (panelHeight = SIZE_DEFAULTS.panel)}
+            />
+          {/if}
+          <div
+            class="flex shrink-0 flex-col border-t border-vs-border bg-vs-bg"
+            style="height: {panelHeight}px"
+            hidden={!showTerminal}
+          >
             <div class="flex items-center gap-2 border-b border-vs-border px-3 py-1 text-[11px] tracking-wide uppercase">
               <SquareTerminal size={13} /> Terminal
-              <button class="ml-auto rounded-sm p-0.5 hover:bg-vs-hover" title="Close panel" aria-label="Close terminal panel"
+              <span class="text-vs-muted normal-case">{ide.connection?.label || ''}</span>
+              <button class="ml-auto rounded-sm p-0.5 hover:bg-vs-hover" title="Hide panel" aria-label="Hide terminal panel"
                 onclick={() => (showTerminal = false)}><X size={14} /></button>
             </div>
             <div class="min-h-0 flex-1">
@@ -350,7 +469,17 @@
 
     <!-- Secondary side bar: AI chat -->
     {#if showChat}
-      <aside class="flex w-80 shrink-0 flex-col overflow-hidden border-l border-vs-border bg-vs-panel">
+      <Resizer
+        bind:size={chatWidth}
+        side="left"
+        min={260}
+        max={760}
+        onreset={() => (chatWidth = SIZE_DEFAULTS.chat)}
+      />
+      <aside
+        class="flex shrink-0 flex-col overflow-hidden border-l border-vs-border bg-vs-panel"
+        style="width: {chatWidth}px"
+      >
         <div class="flex items-center gap-2 border-b border-vs-border px-3 py-1.5">
           <MessageSquare size={13} />
           <span class="flex-1 text-[11px] font-semibold tracking-wide uppercase">Chat</span>

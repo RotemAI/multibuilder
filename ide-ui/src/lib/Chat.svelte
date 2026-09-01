@@ -2,12 +2,10 @@
   import { onDestroy } from 'svelte'
   import { ide } from './store.svelte.js'
   import { api } from './api.js'
-  import { Send, Loader } from 'lucide-svelte'
+  import { ArrowUp, Loader, Bot, Check, ChevronDown, Square } from 'lucide-svelte'
 
   // Codex and Claude are both agents running inside a tmux session, so the
-  // "provider" is really which session the prompt is delivered to. There is no
-  // separate Claude API here; sending to a Claude-backed session is what routes
-  // the question to Claude.
+  // "provider" is really which session the prompt is delivered to.
   let { sessions = [], session = '', rootPath = '' } = $props()
 
   let question = $state('')
@@ -16,10 +14,27 @@
   let messages = $state([])
   let error = $state('')
   let listEl = $state(null)
+  let textareaEl = $state(null)
   let timer = null
 
-  // Replies appear in the agent's pane, so the panel polls the session's
-  // message store instead of only showing what the user typed.
+  // Agent / model / effort for the target session, served in one call.
+  let config = $state({ agent: 'codex', available: [], model: '', effort: '', models: [], efforts: [] })
+  let menu = $state('')          // '' | 'agent' | 'model' | 'effort'
+  let switching = $state('')
+
+  const modelLabel = $derived(
+    (config.models.find((m) => m[0] === config.model) || [])[1] || config.model || 'default',
+  )
+
+  async function loadConfig() {
+    if (!target) return
+    try {
+      config = { ...config, ...(await api.sessionAgent(target)) }
+    } catch {
+      /* controls stay on their last known values */
+    }
+  }
+
   async function loadMessages() {
     if (!target) return
     try {
@@ -39,16 +54,62 @@
   }
 
   $effect(() => {
-    // Re-poll whenever the target session changes.
     const current = target
     messages = []
     if (timer) clearInterval(timer)
     if (!current) return
     loadMessages()
+    loadConfig()
     timer = setInterval(loadMessages, 3000)
   })
 
   onDestroy(() => { if (timer) clearInterval(timer) })
+
+  async function pickAgent(agent) {
+    menu = ''
+    if (agent === config.agent) return
+    switching = 'agent'
+    try {
+      await api.setSessionAgent(target, agent)
+      // The pane is relaunching; re-read rather than trusting the optimistic value.
+      await loadConfig()
+      ide.setStatus(`Switched to ${agent}`)
+    } catch (exc) {
+      ide.setStatus(exc.message || 'Could not switch agent')
+    } finally {
+      switching = ''
+    }
+  }
+
+  async function pickModel(model) {
+    menu = ''
+    if (model === config.model) return
+    switching = 'model'
+    try {
+      await api.setSessionModel(target, model)
+      config = { ...config, model }
+      ide.setStatus(`Model set to ${model}`)
+    } catch (exc) {
+      ide.setStatus(exc.message || 'Could not change model')
+    } finally {
+      switching = ''
+    }
+  }
+
+  async function pickEffort(effort) {
+    menu = ''
+    if (effort === config.effort) return
+    switching = 'effort'
+    try {
+      await api.setSessionEffort(target, effort)
+      config = { ...config, effort }
+      ide.setStatus(`Reasoning effort set to ${effort}`)
+    } catch (exc) {
+      ide.setStatus(exc.message || 'Could not change effort')
+    } finally {
+      switching = ''
+    }
+  }
 
   function buildPrompt() {
     const c = ide.connection || {}
@@ -57,7 +118,10 @@
     const body = tab
       ? `\nActive file contents (first 12,000 characters):\n${tab.content.slice(0, 12000)}`
       : ''
-    return `[Remote SSH IDE context]\nSSH target: ${c.username || '?'}@${c.host || '?'}\nRemote path: ${where}${body}\n\n${question.trim()}`
+    const targetLine = c.kind === 'local'
+      ? `Local workspace: ${c.workspace_root || '.'}`
+      : `SSH target: ${c.username || '?'}@${c.host || '?'}`
+    return `[Remote IDE context]\n${targetLine}\nPath: ${where}${body}\n\n${question.trim()}`
   }
 
   async function send() {
@@ -77,8 +141,7 @@
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(data.error || 'Could not send')
       question = ''
-      // Show the question immediately; the poll reconciles it with the
-      // server's own copy once the agent records it.
+      if (textareaEl) textareaEl.style.height = 'auto'
       messages = [...messages, { role: 'user', text, ts: Date.now() / 1000, _local: true }]
       queueMicrotask(scrollToEnd)
       setTimeout(loadMessages, 1200)
@@ -90,17 +153,23 @@
   }
 
   function onKey(event) {
-    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+    // Enter sends, Shift+Enter makes a newline — the Claude Code convention.
+    if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
       send()
     }
   }
 
-  // Strip the IDE context preamble so the panel shows what was actually asked.
+  function autoGrow(event) {
+    const el = event.currentTarget
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+  }
+
   function displayText(message) {
     const text = message.full || message.text || ''
     const marker = '\n\n'
-    if (text.startsWith('[Remote SSH IDE context]')) {
+    if (text.startsWith('[Remote IDE context]') || text.startsWith('[Remote SSH IDE context]')) {
       const at = text.lastIndexOf(marker)
       if (at !== -1) return text.slice(at + marker.length)
     }
@@ -108,63 +177,165 @@
   }
 </script>
 
-<div class="chat">
-  <div class="head">
-    <span class="title">AI chat</span>
-    <select bind:value={target} title="Agent session to send to">
+<svelte:window onclick={(e) => { if (!e.target.closest?.('[data-menu]')) menu = '' }} />
+
+<div class="flex h-full min-h-0 flex-col bg-vs-panel">
+  <!-- Session picker -->
+  <div class="flex items-center gap-2 border-b border-vs-border px-3 py-1.5">
+    <Bot size={13} class="shrink-0 text-vs-blue" />
+    <select
+      class="min-w-0 flex-1 rounded-sm border border-vs-line bg-vs-input px-1.5 py-0.5 text-xs outline-none focus:border-vs-accent"
+      bind:value={target}
+      title="Agent session that answers"
+    >
       {#each sessions as name (name)}
         <option value={name}>{name}</option>
       {/each}
     </select>
   </div>
 
-  <div class="messages" bind:this={listEl}>
+  <!-- Transcript -->
+  <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-3 py-3" bind:this={listEl}>
     {#if error}
-      <p class="error">{error}</p>
+      <p class="rounded-sm bg-vs-red/10 px-2 py-1 text-xs text-vs-red">{error}</p>
     {/if}
     {#each messages as message, index (message.ts + ':' + index)}
-      <div class="msg {message.role === 'assistant' ? 'assistant' : 'user'}">
-        {displayText(message)}
-      </div>
+      {#if message.role === 'assistant'}
+        <!-- Assistant turns read as flowing text, not chat bubbles — matching
+             how Claude Code renders replies in its VS Code panel. -->
+        <div class="flex flex-col gap-1">
+          <span class="flex items-center gap-1.5 text-[11px] font-semibold text-vs-blue">
+            <Bot size={11} /> {config.agent === 'claude' ? 'Claude' : 'Codex'}
+          </span>
+          <div class="text-[13px] leading-relaxed whitespace-pre-wrap text-vs-fg">{displayText(message)}</div>
+        </div>
+      {:else}
+        <div class="self-end rounded-md border border-vs-line bg-vs-input px-2.5 py-1.5 text-[13px] whitespace-pre-wrap text-vs-fg max-w-[92%]">
+          {displayText(message)}
+        </div>
+      {/if}
     {:else}
       {#if !error}
-        <p class="empty">
-          Ask about the active remote file. The prompt is delivered to the selected
-          agent session — pick a Codex session or a Claude session to choose which
-          assistant answers, and replies appear here.
-        </p>
+        <div class="m-auto flex max-w-[240px] flex-col items-center gap-2 text-center">
+          <Bot size={28} strokeWidth={1.3} class="text-vs-line" />
+          <p class="text-xs leading-relaxed text-vs-muted">
+            Ask about the file you have open. The prompt goes to the selected session,
+            and the reply appears here.
+          </p>
+        </div>
       {/if}
     {/each}
   </div>
 
-  <div class="compose">
-    <textarea
-      bind:value={question}
-      onkeydown={onKey}
-      placeholder="Ask about the active remote file… (⌘/Ctrl+Enter to send)"
-    ></textarea>
-    <button onclick={send} disabled={sending || !question.trim()}>
-      {#if sending}<Loader size={13} />{:else}<Send size={13} />{/if}
-      {sending ? 'Sending…' : 'Send'}
-    </button>
+  <!-- Composer: input first, controls underneath, like Claude Code -->
+  <div class="border-t border-vs-border p-2">
+    <div class="rounded-md border border-vs-line bg-vs-input focus-within:border-vs-accent">
+      <textarea
+        bind:this={textareaEl}
+        bind:value={question}
+        onkeydown={onKey}
+        oninput={autoGrow}
+        rows="2"
+        class="max-h-[200px] w-full resize-none bg-transparent px-2.5 py-2 text-[13px] text-vs-fg outline-none placeholder:text-vs-muted"
+        placeholder="Ask about this workspace…"
+      ></textarea>
+
+      <div class="flex items-center gap-1 px-1.5 pb-1.5 text-[11px]">
+        <!-- Agent -->
+        <div class="relative" data-menu>
+          <button
+            class="flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-vs-muted hover:bg-vs-hover hover:text-vs-fg"
+            onclick={() => (menu = menu === 'agent' ? '' : 'agent')}
+            title="Agent"
+          >
+            {config.agent === 'claude' ? 'Claude' : 'Codex'}
+            <ChevronDown size={11} />
+          </button>
+          {#if menu === 'agent'}
+            <div class="absolute bottom-full left-0 z-20 mb-1 min-w-[150px] rounded-md border border-vs-line bg-vs-panel py-1 shadow-2xl">
+              {#each (config.available.length ? config.available : ['codex']) as name (name)}
+                <button
+                  class="flex w-full items-center gap-2 px-2.5 py-1 text-left text-xs text-vs-fg hover:bg-vs-hover"
+                  onclick={() => pickAgent(name)}
+                >
+                  <span class="w-3">{#if name === config.agent}<Check size={11} />{/if}</span>
+                  {name === 'claude' ? 'Claude' : 'Codex'}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        {#if config.models.length}
+          <!-- Model: Codex model ids, or Claude's aliases (fable/opus/sonnet) -->
+          <div class="relative" data-menu>
+            <button
+              class="flex max-w-[120px] items-center gap-1 rounded-sm px-1.5 py-0.5 text-vs-muted hover:bg-vs-hover hover:text-vs-fg"
+              onclick={() => (menu = menu === 'model' ? '' : 'model')}
+              title="Model"
+            >
+              <span class="truncate">{modelLabel}</span>
+              <ChevronDown size={11} class="shrink-0" />
+            </button>
+            {#if menu === 'model'}
+              <div class="absolute bottom-full left-0 z-20 mb-1 max-h-[260px] min-w-[190px] overflow-y-auto rounded-md border border-vs-line bg-vs-panel py-1 shadow-2xl">
+                {#each config.models as row (row[0])}
+                  <button
+                    class="flex w-full items-center gap-2 px-2.5 py-1 text-left text-xs text-vs-fg hover:bg-vs-hover"
+                    onclick={() => pickModel(row[0])}
+                  >
+                    <span class="w-3">{#if row[0] === config.model}<Check size={11} />{/if}</span>
+                    <span class="truncate">{row[1]}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+
+        {/if}
+
+        {#if config.efforts.length}
+          <!-- Reasoning effort: gated separately from the model list so it
+               still shows when an agent exposes one but not the other. -->
+          <div class="relative" data-menu>
+            <button
+              class="flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-vs-muted hover:bg-vs-hover hover:text-vs-fg"
+              onclick={() => (menu = menu === 'effort' ? '' : 'effort')}
+              title="Reasoning effort"
+            >
+              {config.effort || 'effort'}
+              <ChevronDown size={11} />
+            </button>
+            {#if menu === 'effort'}
+              <div class="absolute bottom-full left-0 z-20 mb-1 min-w-[130px] rounded-md border border-vs-line bg-vs-panel py-1 shadow-2xl">
+                {#each config.efforts as level (level)}
+                  <button
+                    class="flex w-full items-center gap-2 px-2.5 py-1 text-left text-xs text-vs-fg hover:bg-vs-hover"
+                    onclick={() => pickEffort(level)}
+                  >
+                    <span class="w-3">{#if level === config.effort}<Check size={11} />{/if}</span>
+                    {level}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        {#if switching}
+          <Loader size={11} class="animate-spin text-vs-muted" />
+        {/if}
+
+        <button
+          class="ml-auto flex h-6 w-6 items-center justify-center rounded-md bg-vs-status text-white disabled:opacity-40"
+          onclick={send}
+          disabled={sending || !question.trim()}
+          title="Send (Enter)"
+          aria-label="Send"
+        >
+          {#if sending}<Square size={11} />{:else}<ArrowUp size={13} />{/if}
+        </button>
+      </div>
+    </div>
   </div>
 </div>
-
-<style>
-  .chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-  .head { display: flex; align-items: center; gap: 6px; padding: 8px; border-bottom: 1px solid var(--ide-border); }
-  .title { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ide-muted); font-weight: 650; }
-  select, textarea { background: var(--ide-input); border: 1px solid var(--ide-border); color: var(--ide-fg); border-radius: 3px; font-size: 12px; }
-  select { flex: 1; min-width: 0; padding: 3px 4px; }
-  .messages { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
-  .msg { padding: 7px 9px; border-radius: 7px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 92%; }
-  .msg.user { background: #3e3d32; color: var(--ide-fg); align-self: flex-end; }
-  .msg.assistant { background: var(--ide-input); color: var(--ide-fg); align-self: flex-start; border: 1px solid var(--ide-border); }
-  .error { color: #f92672; font-size: 12px; padding: 4px; margin: 0; }
-  .msg .meta { font-size: 10px; color: var(--ide-muted); margin-bottom: 3px; }
-  .empty { color: var(--ide-muted); font-size: 12px; line-height: 1.5; padding: 4px; }
-  .compose { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--ide-border); }
-  .compose textarea { flex: 1; min-height: 54px; max-height: 160px; resize: vertical; padding: 6px; font: inherit; font-size: 12px; }
-  .compose button { display: inline-flex; align-items: center; gap: 5px; background: var(--ide-accent); border: 0; color: #272822; border-radius: 3px; cursor: pointer; padding: 0 12px; font-weight: 600; }
-  .compose button:disabled { opacity: .5; cursor: default; }
-</style>
