@@ -1126,6 +1126,43 @@ class TestSshIdeSafety:
         assert _valid_git_branch("feature/remote-ide")
         assert not _valid_git_branch("feature/../secret")
 
+    def test_patching_a_service_sibling_on_app_reaches_the_service(self):
+        """Intra-service calls must honour a patch applied on app.
+
+        The autonomous phase functions call siblings such as
+        _away_send_and_wait through their own module globals. When only a
+        hand-listed subset of names was forwarded, patching that sibling on app
+        rebound a copy the service never read, so the phase function called the
+        REAL agent wait and the test suite hung rather than failing. Forwarding
+        covers every service name for exactly this reason.
+        """
+        import app
+        from services import autonomous as autonomous_service
+
+        original = autonomous_service._away_send_and_wait
+        marker = object()
+        try:
+            app._away_send_and_wait = marker
+            assert autonomous_service._away_send_and_wait is marker
+        finally:
+            app._away_send_and_wait = original
+            autonomous_service._away_send_and_wait = original
+
+    def test_service_forwarding_covers_every_public_service_name(self):
+        """A hand-maintained subset silently rots; assert the sets are complete."""
+        import app
+
+        for module, names in (
+            (app.ssh_service, app._SSH_FORWARDED_NAMES),
+            (app.browser_service, app._BROWSER_FORWARDED_NAMES),
+            (app.autonomous_service, app._AUTONOMOUS_FORWARDED_NAMES),
+        ):
+            missing = [
+                n for n in dir(module)
+                if not n.startswith("__") and n not in names
+            ]
+            assert not missing, f"{module.__name__} names not forwarded: {missing[:5]}"
+
     def test_dashboard_template_is_loaded_and_substituted(self):
         """The page moved to templates/dashboard.html; substitution must survive.
 
