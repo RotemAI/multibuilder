@@ -1126,6 +1126,26 @@ class TestSshIdeSafety:
         assert _valid_git_branch("feature/remote-ide")
         assert not _valid_git_branch("feature/../secret")
 
+    def test_dashboard_template_is_loaded_and_substituted(self):
+        """The page moved to templates/dashboard.html; substitution must survive.
+
+        __ROOT_PATH__ and __BRAND__ are replaced at import, and __SIMPLE__ at
+        request time. A template read that skipped the substitutions would serve
+        a page with literal placeholders in its JavaScript.
+        """
+        import app
+        from core.config import TEMPLATES_DIR
+
+        assert (TEMPLATES_DIR / "dashboard.html").is_file()
+        assert (TEMPLATES_DIR / "login.html").is_file()
+        # Import-time substitutions are done.
+        assert "__ROOT_PATH__" not in app.HTML_PAGE
+        assert "__BRAND__" not in app.HTML_PAGE
+        # The per-request one is deliberately still present.
+        assert "__SIMPLE__" in app.HTML_PAGE
+        assert app.HTML_PAGE.startswith("<!doctype html>")
+        assert len(app.HTML_PAGE) > 400_000
+
     def test_ssh_service_identity_follows_a_patched_app_current_user(self):
         """The connection ownership gate must honour `patch("app._current_user")`.
 

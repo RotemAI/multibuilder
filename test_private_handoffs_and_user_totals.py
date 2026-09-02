@@ -14,7 +14,13 @@ from fastapi.testclient import TestClient
 import app as dashboard
 
 
-SOURCE = Path(dashboard.__file__).read_text()
+# The dashboard markup moved from an inline HTML_PAGE constant into
+# templates/dashboard.html; these assertions scan both so they keep covering the
+# page whichever file a given fragment now lives in.
+SOURCE = (
+    Path(dashboard.__file__).read_text()
+    + (Path(dashboard.__file__).parent / "templates" / "dashboard.html").read_text()
+)
 
 
 def _section(start: str, end: str) -> str:

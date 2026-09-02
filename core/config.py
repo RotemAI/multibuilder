@@ -20,6 +20,9 @@ from pathlib import Path
 # which would silently resolve them inside core/.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Static page templates extracted from app.py; read at import.
+TEMPLATES_DIR = REPO_ROOT / "templates"
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CODEX_API_FALLBACK_ENABLED = os.environ.get(
     "TMUX_DASH_CODEX_API_FALLBACK_ENABLED",

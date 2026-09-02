@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>__BRAND__ Dashboard — Login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:340px}
+.login-box h2{color:#f0f6fc;margin-bottom:8px;font-size:1.2rem}
+.login-box p{color:#8b949e;font-size:.85rem;margin-bottom:20px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:.8rem;color:#8b949e;margin-bottom:4px}
+.field input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:10px 12px;font-size:.95rem;outline:none}
+.field input:focus{border-color:#58a6ff}
+.err{color:#f85149;font-size:.8rem;margin-bottom:10px;display:none}
+.login-btn{width:100%;background:#1f6feb;color:#fff;border:none;padding:10px;border-radius:6px;cursor:pointer;font-size:.95rem;font-weight:500}
+.login-btn:hover{background:#388bfd}
+.gbtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#fff;color:#1f1f1f;border:1px solid #dadce0;border-radius:6px;padding:10px;font-size:.92rem;font-weight:500;text-decoration:none;margin-bottom:6px}
+.gbtn:hover{background:#f4f4f4}
+.ghint{color:#6e7681;font-size:.72rem;text-align:center;margin-bottom:16px}
+.sep{display:flex;align-items:center;gap:10px;color:#6e7681;font-size:.72rem;margin:0 0 16px}
+.sep:before,.sep:after{content:"";flex:1;height:1px;background:#30363d}
+</style></head><body>
+<!-- Root-absolute, not relative: this page is also served for deep links like
+     /browser/<sid>/vnc.html, where action="login" POSTed to
+     /browser/<sid>/login and the sign-in silently did nothing. -->
+<form class="login-box" method="POST" action="__ROOT_PATH__/login">
+  <h2>__BRAND__ Dashboard</h2>
+  <p>Log in to continue.</p>
+  <div class="err" id="err">Invalid username or password.</div>
+__GOOGLE_BTN__
+__PASSWORD_LOGIN__
+  <input type="hidden" name="next" id="next">
+</form>
+<script>
+var q=new URLSearchParams(location.search),e=document.getElementById('err');
+if(q.get('err')==='1'){e.style.display='block';}
+/* Google sign-in rejections come back as ?gerr=<reason> so the user sees why. */
+var GERR={domain:'That Google account is not allowed. Use your company Google account.',
+          denied:'Google sign-in was cancelled.',
+          state:'Sign-in link expired — please try again.',
+          config:'Google sign-in is not configured on this server.',
+          failed:'Google sign-in failed — please try again.'};
+if(q.get('gerr')){e.textContent=GERR[q.get('gerr')]||GERR.failed;e.style.display='block';}
+/* Carry the deep link through the login so signing in from e.g. a noVNC viewer
+   URL lands back on the viewer instead of the dashboard home. */
+var nxt=location.pathname+location.search;
+document.getElementById('next').value=nxt;
+var g=document.getElementById('gbtn');
+if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
+</script>
+</body></html>

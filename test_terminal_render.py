@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-APP = Path(__file__).parent / "app.py"
+APP = Path(__file__).parent / "templates" / "dashboard.html"
 NODE = shutil.which("node")
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -69,15 +69,14 @@ x-user-u_36f0/advisor-token 2>/dev/null)" env -u OPENAI_API_KEY codex --yolo; fi
   gpt-5.6-sol max · /tmp/termqa
 """
 
-# The harness: pull the terminal half of the inline script out of app.py, run it
-# with just enough DOM to load, and answer one question per call. The triple
-# quote that opens HTML_PAGE is assembled rather than written out, so that this
-# file can hold the pattern that matches it.
+# The harness: pull the terminal half of the page script out of the dashboard
+# template, run it with just enough DOM to load, and answer one question per
+# call. The template used to be an inline HTML_PAGE constant in app.py, which
+# this harness matched with a regex; now that it is a real file, it is read
+# directly.
 DRIVER = r"""
 const fs=require('fs'), vm=require('vm');
-const src=fs.readFileSync(process.argv[2],'utf8');
-const Q='"'.repeat(3);
-const html=src.match(new RegExp('^HTML_PAGE = r'+Q+'([\\s\\S]*?)^'+Q,'m'))[1];
+const html=fs.readFileSync(process.argv[2],'utf8');
 const js=html.match(/<script[^>]*>([\s\S]*?)<\/script>/)[1];
 const region=js.slice(js.indexOf('function getCleanViewPref(){'), js.indexOf('// ── Freeze ─'));
 const noop=()=>{};
