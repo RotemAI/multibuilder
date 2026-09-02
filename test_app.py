@@ -1126,6 +1126,50 @@ class TestSshIdeSafety:
         assert _valid_git_branch("feature/remote-ide")
         assert not _valid_git_branch("feature/../secret")
 
+    def test_config_paths_anchor_to_the_repository_root(self):
+        """core/config.py lives one level down, so __file__ must not anchor paths.
+
+        Writing `Path(__file__).parent / "static"` inside core/ silently resolves
+        to core/static -- the exact bug this extraction introduced and which
+        value-comparison against app.py caught.
+        """
+        import core.config as config
+
+        assert config.REPO_ROOT.name == "multibuilder"
+        assert (config.REPO_ROOT / "app.py").is_file()
+        for name in ("IDE_BUNDLE_DIR", "QA_OUTPUT_DIR", "GOOGLE_MCP_SCRIPT"):
+            value = getattr(config, name)
+            assert "core" not in value.parts[-3:], f"{name} resolved inside core/: {value}"
+
+    def test_app_reexports_every_config_constant(self):
+        """Existing `from app import X` must keep working after the extraction."""
+        import app
+        import core.config as config
+
+        exported = [
+            n for n in dir(config)
+            if n.isupper() and not n.startswith("__") and n != "REPO_ROOT"
+        ]
+        assert len(exported) > 50, "config module looks empty"
+        missing = [n for n in exported if not hasattr(app, n)]
+        assert not missing, f"app.py no longer re-exports: {missing}"
+        # And the values must be the same object, not a divergent copy.
+        for name in exported:
+            assert getattr(app, name) == getattr(config, name), name
+
+    def test_auth_secret_is_not_defined_in_config_module(self):
+        """A per-process generated secret must have exactly one definition.
+
+        With TMUX_DASH_SECRET unset it falls back to secrets.token_hex(); if both
+        app.py and core/config.py defined it they would generate different values
+        and signed cookies would stop validating.
+        """
+        import core.config as config
+        from pathlib import Path
+
+        assert not hasattr(config, "AUTH_SECRET")
+        assert "AUTH_SECRET" not in Path("core/config.py").read_text()
+
     def test_alembic_revisions_form_a_single_linear_chain(self):
         """Every revision must chain to exactly one parent, with one root.
 

@@ -54,6 +54,76 @@ from pydantic import BaseModel, Field
 
 import db_store
 import google_policy
+
+# Configuration constants now live in core/config.py. They are re-exported
+# here unchanged so existing imports (`from app import ROOT_PATH`, and the
+# test suite's 223 such imports) keep working while the split proceeds.
+from core.config import (  # noqa: E402
+    _CLAUDE_API_KEYS_MD,
+    _CODEX_DEFAULT_MODEL,
+    _CODEX_MIN_CLI_VERSION,
+    _CONTEXT_FILES,
+    _DEFAULT_BROWSER_SESSION,
+    _DISABLE_STALLED_OPENAI_DOCS_MCP,
+    _GO_NUTS_SKILLS_DIR,
+    _INFRA_DETAIL_DIRS,
+    _LOGIN_STATE_FILE,
+    _SANDBOX_HOOK_SCRIPT,
+    _SKILLS_DIR,
+    ADMIN_APPROVAL_EMAIL,
+    ADMIN_GOOGLE_EMAIL,
+    ADVISOR_ADMIN_TOKEN_FILE,
+    ADVISOR_BASE_URL,
+    ADVISOR_HOST_NAME,
+    AUTH_COOKIE,
+    AUTH_PASS,
+    AUTH_USER,
+    AUTO_AUTH_ENABLED,
+    AUTO_SUMMARIZER_ENABLED,
+    BRAND_NAME,
+    BROWSER_LAUNCHER,
+    BROWSER_LEASE_TTL,
+    BROWSER_PARK_AFTER,
+    BROWSER_POLICY_FILE,
+    CB_ROOT,
+    CLAUDE_SESSION_CMD,
+    CODEX_API_FALLBACK_ENABLED,
+    CODEX_HOME,
+    CONTROLLER_SOCKET,
+    DASH_LOCAL_URL,
+    DOCVAULT_MCP_KEY,
+    DOCVAULT_MCP_SCRIPT,
+    DOCVAULT_MCP_URL,
+    GIT_EMAIL_DOMAIN,
+    GOOGLE_DWD_SERVICE_ACCOUNT_FILE,
+    GOOGLE_LOGIN_DOMAINS,
+    GOOGLE_LOGIN_EMAILS,
+    GOOGLE_MCP_SCRIPT,
+    IDE_BUNDLE_DIR,
+    MAIL_FROM,
+    MESSAGES_DIR,
+    MODELS_FILE,
+    NEW_SESSION_CMD,
+    OPENAI_API_KEY,
+    PLAYWRIGHT_MCP_CLI,
+    PORT,
+    PROCESS_ROLE,
+    PROJECTS_ROOT,
+    PUBLIC_BASE_URL,
+    QA_OUTPUT_DIR,
+    RESEND_API_KEY,
+    ROOT_PATH,
+    SAVED_INFO_ENABLED,
+    SAVED_INFO_MODEL,
+    SESSION_LIFECYCLE_INTERVAL,
+    SESSION_PARK_AFTER,
+    SHARED_CREDENTIALS,
+    SSH_CONTROL_DIR,
+    SSH_KNOWN_HOSTS,
+    TEAM_EFFORT,
+    TEAM_MODE,
+    TEAM_MODEL,
+)
 from runtime_control import (
     BrowserLeaseStore,
     LockedJsonStore,
@@ -64,32 +134,8 @@ from runtime_control import (
     user_systemd_argv,
 )
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-CODEX_API_FALLBACK_ENABLED = os.environ.get(
-    "TMUX_DASH_CODEX_API_FALLBACK_ENABLED",
-    "",
-).lower() in ("1", "true", "yes", "on")
-PORT = int(os.environ.get("TMUX_DASH_PORT", "8505"))
-ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/codex")
-PROCESS_ROLE = os.environ.get("TMUX_DASH_PROCESS_ROLE", "combined").strip().lower()
 if PROCESS_ROLE not in {"combined", "api", "controller"}:
     PROCESS_ROLE = "combined"
-# Default launch command for codex sessions. config.toml already sets
-# sandbox_mode=danger-full-access and approval_policy=never so bare `codex`
-# is non-interactive; we still pass the explicit flag for safety on hosts that
-# haven't been pre-configured.
-NEW_SESSION_CMD = os.environ.get(
-    "TMUX_DASH_NEW_SESSION_CMD",
-    "codex --dangerously-bypass-approvals-and-sandbox",
-)
-# Where the codex CLI keeps its state. Mirrors $CODEX_HOME.
-CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-# Codex runtime, model, and reasoning defaults.
-_CODEX_MIN_CLI_VERSION = os.environ.get("TMUX_DASH_MIN_CODEX_VERSION", "0.145.0").strip()
-_CODEX_DEFAULT_MODEL = os.environ.get(
-    "TMUX_DASH_DEFAULT_MODEL",
-    os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol"),
-).strip() or "gpt-5.6-sol"
 _CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 _CODEX_REASONING_EFFORT_ALIASES = {
     "ultra": "max",
@@ -107,17 +153,9 @@ _CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
 if _CODEX_DEFAULT_REASONING_EFFORT not in _CODEX_REASONING_EFFORTS:
     _CODEX_DEFAULT_REASONING_EFFORT = "max"
 
-# Codex 0.146 can leave its TUI blocked in MCP startup for minutes when the
-# OpenAI developer-docs HTTP server is configured. Dashboard sessions have web
-# access for documentation lookups, so keep that optional MCP out of the
-# interactive startup path unless an operator explicitly opts back in.
-_DISABLE_STALLED_OPENAI_DOCS_MCP = os.environ.get(
-    "TMUX_DASH_DISABLE_OPENAI_DOCS_MCP", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
 
 # Compatibility name retained for the newer Grabo frontend and API payloads.
 DEFAULT_MODEL = _CODEX_DEFAULT_MODEL
-MODELS_FILE = Path.home() / ".tmux-dashboard" / "codex-models.json"
 _SEED_MODEL_CATALOG = [
     ["gpt-5.6-sol", "GPT-5.6 Sol"],
     ["gpt-5.6", "GPT-5.6 (Sol alias)"],
@@ -327,12 +365,6 @@ def _launch_codex_cmd(
     return out
 
 
-# Agents the dashboard can launch in a session. Codex remains the default; the
-# value is stored per session so relaunch/resume keeps the same agent.
-CLAUDE_SESSION_CMD = os.environ.get(
-    "TMUX_DASH_CLAUDE_SESSION_CMD",
-    "claude --dangerously-skip-permissions",
-)
 # Persisted per session: uvicorn runs several workers, so an in-memory dict
 # would let the worker that answers a read disagree with the one that handled
 # the write — the agent picker showed the old value after a successful switch.
@@ -634,57 +666,16 @@ def _model_flag_for_relaunch(session_name: str) -> str:
         model = DEFAULT_MODEL
     return f" --model {shlex.quote(model)}" if model else ""
 
-# --- Team mode ------------------------------------------------------------
-# When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
-# simplified UI, shared Codex authentication, per-user context, OAuth connections,
-# and a soft sandbox (cross-server actions are blocked and logged). Gated behind
-# env so the shared codebase is unchanged for the personal
-# single-admin dashboards (instance-3, builder) that never set these vars.
-TEAM_MODE = os.environ.get("TMUX_DASH_TEAM_MODE", "") == "1"
-BRAND_NAME = os.environ.get("TMUX_DASH_BRAND", "tmux")
-ADMIN_APPROVAL_EMAIL = os.environ.get("TMUX_DASH_ADMIN_EMAIL", "nimrod.rotem@gmail.com")
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-MAIL_FROM = os.environ.get("TMUX_DASH_MAIL_FROM", f"{BRAND_NAME} <dev@grabo.cc>")
-PUBLIC_BASE_URL = os.environ.get("TMUX_DASH_PUBLIC_URL", "")  # e.g. https://dianaotech.com
 PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH  # external base incl. the ROOT_PATH subpath (e.g. .../build)
-DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
-# Team-mode default model + reasoning effort, pinned into every session's config.
-TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", _CODEX_DEFAULT_MODEL)
-TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "max")
-# Email domain used for per-user git commit identity (commits are AUTHORED by the
-# member even though everyone shares one OS user).
-GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "grabo.tech")
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Auto-summarizer (LLM session title/description/progress/notes + realtime fallback).
-AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() in ("1", "true", "yes")
-SAVED_INFO_ENABLED = os.environ.get(
-    "TMUX_DASH_SAVED_INFO",
-    "1",
-).lower() not in ("0", "false", "no", "off")
-SAVED_INFO_MODEL = os.environ.get(
-    "TMUX_DASH_SAVED_INFO_MODEL",
-    os.environ.get("TMUX_DASH_LLM_MODEL", "gpt-4o-mini"),
-).strip()
 SAVED_INFO_PROMPT_VERSION = "v4"
 
-# Keep Grabo's established dashboard state directory so users, history, browser
-# sessions, and settings survive the runtime migration.
-MESSAGES_DIR = Path.home() / ".tmux-dashboard"
-CONTROLLER_SOCKET = Path(
-    os.environ.get("TMUX_DASH_CONTROLLER_SOCKET", str(MESSAGES_DIR / "controller.sock"))
-)
 BROWSER_LEASES_FILE = MESSAGES_DIR / "browser-leases.json"
 BROWSER_RUNTIME_FILE = MESSAGES_DIR / "browser-runtime.json"
 SESSION_LIFECYCLE_FILE = MESSAGES_DIR / "session-lifecycle.json"
 CONTROLLER_SNAPSHOT_FILE = MESSAGES_DIR / "controller-runtime.json"
-BROWSER_LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
-BROWSER_PARK_AFTER = max(300, int(os.environ.get("TMUX_DASH_BROWSER_PARK_AFTER", "1200")))
-SESSION_PARK_AFTER = max(3600, int(os.environ.get("TMUX_DASH_SESSION_PARK_AFTER", "86400")))
-SESSION_LIFECYCLE_INTERVAL = max(
-    30, int(os.environ.get("TMUX_DASH_LIFECYCLE_INTERVAL", "300"))
-)
 _browser_leases = BrowserLeaseStore(BROWSER_LEASES_FILE)
 _browser_runtime = LockedJsonStore(
     BROWSER_RUNTIME_FILE, lambda: {"version": 1, "browsers": {}}
@@ -706,31 +697,6 @@ _controller_snapshot = LockedJsonStore(
 )
 OPENAI_KEY_FILE = MESSAGES_DIR / "openai_api_key"
 GOOGLE_MCP_PYTHON = MESSAGES_DIR / "mcp" / "venv" / "bin" / "python"
-GOOGLE_MCP_SCRIPT = Path(__file__).resolve().with_name("google_workspace_mcp.py")
-PLAYWRIGHT_MCP_CLI = Path(
-    os.environ.get(
-        "TMUX_DASH_PLAYWRIGHT_MCP_CLI",
-        str(
-            Path.home()
-            / ".claude-browser"
-            / "node_modules"
-            / "@playwright"
-            / "mcp"
-            / "cli.js"
-        ),
-    )
-).expanduser()
-GOOGLE_DWD_SERVICE_ACCOUNT_FILE = Path(
-    os.environ.get(
-        "GOOGLE_WORKSPACE_DWD_SERVICE_ACCOUNT_FILE",
-        str(Path.home() / ".gworkspace-admin" / "sa-key.json"),
-    )
-).expanduser()
-DOCVAULT_MCP_URL = os.environ.get(
-    "DOCVAULT_MCP_URL", "https://grabo.cc/docvault-mcp/mcp"
-)
-DOCVAULT_MCP_KEY = os.environ.get("DOCVAULT_MCP_KEY", "")
-DOCVAULT_MCP_SCRIPT = Path(__file__).resolve().with_name("docvault_mcp.py")
 _stored_openai_key: str = ""
 
 
@@ -1271,10 +1237,6 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
 
-# The Svelte Remote IDE bundle is built by `make ide` into static/ide/. Mounted
-# only when present so a checkout without a build still starts; the IDE route
-# reports the missing build rather than serving a blank page.
-IDE_BUNDLE_DIR = Path(__file__).resolve().parent / "static" / "ide"
 IDE_BUNDLE_ENTRY = IDE_BUNDLE_DIR / "ide.js"
 if IDE_BUNDLE_DIR.is_dir():
     app.mount("/static/ide", StaticFiles(directory=str(IDE_BUNDLE_DIR)), name="ide-bundle")
@@ -1291,14 +1253,7 @@ async def request_validation_error_handler(_request: Request, exc: RequestValida
     message = errors[0].get("msg", "Invalid request") if errors else "Invalid request"
     return JSONResponse({"error": message}, status_code=422)
 
-# --- Auth ---
-AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")
-AUTH_PASS = os.environ.get("TMUX_DASH_PASS", "")
 AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
-# Cookie name must be UNIQUE per dashboard instance, else two dashboards on the
-# same domain (e.g. knowva.ai/tmux + /codex) collide: both set "tmux_auth" at
-# Path=/, so logging into one overwrites/invalidates the other's cookie.
-AUTH_COOKIE = os.environ.get("TMUX_DASH_COOKIE", "tmux_auth")
 _USER_ONLINE_WINDOW_SECONDS = 120
 _user_presence: dict[str, float] = {}
 
@@ -2448,27 +2403,6 @@ async def do_logout(request: Request):
     return resp
 
 
-# --- Google sign-in --------------------------------------------------------
-# One-click login for company Google accounts. Employees at the allowed domains
-# get an account provisioned on first sign-in; everyone else is rejected before
-# any account is created. Uses the same OAuth client as the Drive/Gmail
-# connections feature (`_google_client()`), so a single client ID configured via
-# GOOGLE_OAUTH_CLIENT_ID/SECRET or ~/.tmux-dashboard/google_oauth_client.json
-# covers both. `_sign_state`/`_verify_state` live further down the module with
-# the connections code; they're only called at request time so the forward
-# reference is fine.
-GOOGLE_LOGIN_DOMAINS = [
-    d.strip().lower().lstrip("@")
-    for d in os.environ.get("TMUX_DASH_GOOGLE_DOMAINS", "grabo.com,nemopowertools.com").split(",")
-    if d.strip()
-]
-# Individual addresses allowed on top of the domains (e.g. a personal Gmail that
-# should map onto an existing account). Comma-separated.
-GOOGLE_LOGIN_EMAILS = [
-    e.strip().lower() for e in os.environ.get("TMUX_DASH_GOOGLE_EMAILS", "").split(",") if e.strip()
-]
-# Google address that signs in as the built-in admin (id="admin").
-ADMIN_GOOGLE_EMAIL = os.environ.get("TMUX_DASH_ADMIN_GOOGLE_EMAIL", "").strip().lower()
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GOOGLE_WORKSPACE_REQUIRED_SCOPES = (
@@ -3259,7 +3193,6 @@ async def api_unimpersonate(request: Request):
 import urllib.error
 
 API_REGISTRY_FILE = MESSAGES_DIR / "api_registry.json"
-_CLAUDE_API_KEYS_MD = Path.home() / "CLAUDE_API_KEYS.md"
 
 # Metadata-only seed (NO secret values). key_label is a substring hint used to
 # pick the right value when one env var appears multiple times in the md file.
@@ -4100,7 +4033,6 @@ async def api_me(request: Request):
 import urllib.parse
 import urllib.request
 
-SHARED_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 SHARED_CODEX_AUTH = CODEX_HOME / "auth.json"
 GLOBAL_CONTEXT_FILE = MESSAGES_DIR / "global-context.md"
 SANDBOX_HOOK_PATH = MESSAGES_DIR / "hooks" / "sandbox_guard.py"
@@ -4109,7 +4041,6 @@ CONNECTIONS_DIR = MESSAGES_DIR / "connections"
 # so an admin can review access without shelling into the box.
 GOOGLE_MCP_AUDIT_FILE = MESSAGES_DIR / google_policy.AUDIT_FILE_NAME
 GOOGLE_OAUTH_CLIENT_FILE = MESSAGES_DIR / "google_oauth_client.json"
-BROWSER_POLICY_FILE = Path.home() / ".tmux-dashboard" / "context" / "browser-policy.md"
 
 _GLOBAL_CTX_BEGIN = "<!-- TEAM GLOBAL CONTEXT (managed — edits below are overwritten) -->"
 _GLOBAL_CTX_END = "<!-- END TEAM GLOBAL CONTEXT -->"
@@ -4828,73 +4759,6 @@ def _prime_claude_config(cfg_dir: Path) -> bool:
     return marker.exists()
 
 
-_SANDBOX_HOOK_SCRIPT = r'''#!/usr/bin/env python3
-# Soft-sandbox guard (auto-generated; do not edit).
-# PreToolUse hook: blocks actions that touch OTHER servers / cloud resources and
-# logs them on the dashboard. Local changes on this server are allowed.
-import sys, json, os, re, urllib.request
-
-DASH_URL = os.environ.get("DASH_URL", "__DASH_URL__")
-
-BLOCK_PATTERNS = [
-    r"\bgcloud\b", r"\bgsutil\b", r"\bbq\b", r"\bkubectl\b", r"\bhelm\b",
-    r"\bssh\b", r"\bscp\b", r"\bsftp\b", r"\bsshpass\b", r"\bmosh\b",
-    r"\bdoctl\b", r"\baws\b", r"\baz\b", r"\bterraform\b",
-    r"169\.254\.169\.254", r"metadata\.google\.internal",
-    r"\brsync\b[^\n]*::", r"\brsync\b[^\n]*@",
-]
-BLOCK_RE = [re.compile(p, re.I) for p in BLOCK_PATTERNS]
-
-
-def extract_text(tool_input):
-    if not isinstance(tool_input, dict):
-        return ""
-    parts = []
-    for k in ("command", "cmd", "script", "url"):
-        v = tool_input.get(k)
-        if isinstance(v, str):
-            parts.append(v)
-    return "\n".join(parts)
-
-
-def main():
-    try:
-        data = json.load(sys.stdin)
-    except Exception:
-        sys.exit(0)
-    tool_name = data.get("tool_name", "")
-    text = extract_text(data.get("tool_input", {}))
-    if not text or not any(rx.search(text) for rx in BLOCK_RE):
-        sys.exit(0)
-    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    uid = ""
-    if ".claude-user-" in cfg:
-        uid = cfg.split(".claude-user-", 1)[1].strip("/").split("/")[0]
-    payload = json.dumps({
-        "user_id": uid, "tool": tool_name,
-        "command": text[:4000], "cwd": data.get("cwd", os.getcwd()),
-    }).encode()
-    try:
-        req = urllib.request.Request(
-            DASH_URL.rstrip("/") + "/api/sandbox/check",
-            data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            resp = json.load(r)
-    except Exception:
-        print("__BRAND__ sandbox: cross-server action blocked (guard service "
-              "unreachable). This server only — other servers are off-limits.",
-              file=sys.stderr)
-        sys.exit(2)
-    if resp.get("decision") == "allow":
-        sys.exit(0)
-    print(resp.get("reason") or
-          "__BRAND__ sandbox: this targets another server and is blocked. "
-          "Do not attempt to bypass it.", file=sys.stderr)
-    sys.exit(2)
-
-
-main()
-'''
 
 
 def _write_sandbox_hook_script():
@@ -5347,18 +5211,8 @@ async def api_save_global_context(request: Request):
 # ===========================================================================
 GROUPS_FILE = MESSAGES_DIR / "groups.json"
 GROUPS_DIR = MESSAGES_DIR / "groups"
-PROJECTS_ROOT = Path.home() / "web-projects"
 _GROUP_CTX_BEGIN = "<!-- TEAM PERMISSION GROUP (managed; edits inside are overwritten) -->"
 _GROUP_CTX_END = "<!-- END TEAM GROUP CONTEXT -->"
-ADVISOR_BASE_URL = os.environ.get(
-    "TMUX_DASH_ADVISOR_URL",
-    "https://advisor.rotem.ai",
-).rstrip("/")
-ADVISOR_ADMIN_TOKEN_FILE = Path.home() / ".advisor-token"
-ADVISOR_HOST_NAME = os.environ.get(
-    "TMUX_DASH_ADVISOR_HOST",
-    os.uname().nodename,
-).strip()
 
 
 PERMISSION_GROUPS = {
@@ -6051,7 +5905,6 @@ async def _proxy_to_port(request: Request, port: int, subpath: str):
         )
 
 
-QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
 
 @app.get("/qa-output/{filepath:path}")
 async def serve_qa_output(filepath: str):
@@ -10226,58 +10079,7 @@ class ContextFileBody(BaseModel):
     content: str
 
 
-#
-# There is one primary AGENTS.md plus a handful of reference docs it points at.
-# This registry is fixed on purpose: the UI edits these files in place and offers
-# no way to create arbitrary sidecar context files. Every extra file either costs
-# context on every session or quietly drifts because nothing ever reads it.
-#
-# "auto" files are injected into every session's context; "ondemand" files cost
-# nothing until AGENTS.md sends a session to them.
-_CONTEXT_FILES = [
-    {"id": "codex-agents", "paths": [CODEX_HOME / "AGENTS.md"], "load": "auto",
-     "label": "$CODEX_HOME/AGENTS.md",
-     "note": "Global Codex instructions loaded for sessions owned by this account."},
-    {"id": "home-agents", "paths": [Path.home() / "AGENTS.md"], "load": "auto",
-     "label": "~/AGENTS.md",
-     "note": "Project-tree instructions for sessions whose working directory is under home."},
-    {"id": "github-rules", "paths": [
-        Path.home() / "CODEX_GITHUB_RULES.md",
-        Path.home() / "CLAUDE_GITHUB_RULES.md",
-    ], "load": "ondemand",
-     "note": "Git and GitHub rules."},
-    {"id": "api-keys", "paths": [
-        Path.home() / "CODEX_API_KEYS.md",
-        Path.home() / "CLAUDE_API_KEYS.md",
-    ], "load": "ondemand",
-     "secret": True,
-     "note": "Raw API key file. Prefer Settings → APIs, which also shows live usage."},
-    {"id": "full-context", "paths": [
-        Path.home() / "CODEX_FULL_CONTEXT.md",
-        Path.home() / "CLAUDE_FULL_CONTEXT.md",
-    ], "load": "ondemand", "secret": True,
-     "note": "Complete generated environment, development-system, and settings snapshot."},
-    {"id": "infra-index", "paths": [
-        CODEX_HOME / "vm_projects_dir.md",
-        Path.home() / ".claude" / "vm_projects_dir.md",
-    ], "load": "ondemand",
-     "note": "Infrastructure index: VMs, domains, and pointers to the per-host detail files."},
-    {"id": "droplets", "paths": [Path.home() / "claude_droplets_access.md"], "load": "ondemand",
-     "note": "SSH access to the legacy DigitalOcean droplets."},
-    {"id": "infra-keeper", "paths": [
-        MESSAGES_DIR / "skills" / "_global" / "infra-directory-keeper.md",
-    ],
-     "load": "ondemand", "note": "Rules for keeping the infrastructure index current."},
-    {"id": "browser-qa", "paths": [
-        MESSAGES_DIR / "skills" / "_global" / "browser-qa.md",
-    ],
-     "load": "ondemand", "note": "agent-browser QA procedure to run after a large change."},
-    {"id": "legacy-claude", "paths": [Path.home() / "CLAUDE.md"], "load": "legacy",
-     "label": "~/CLAUDE.md (legacy)",
-     "note": "Legacy Claude context retained for migration reference; Codex does not auto-load it."},
-]
 
-_INFRA_DETAIL_DIRS = [CODEX_HOME / "infra", Path.home() / ".claude" / "infra"]
 
 
 def _first_existing_path(paths: list[Path]) -> Path:
@@ -11033,10 +10835,6 @@ SSH_VAULT_KEY_FILE = MESSAGES_DIR / "ssh-vault.key"
 SSH_IDE_STATE_FILE = MESSAGES_DIR / "ssh-ide-state.json"
 SSH_IDE_AUDIT_FILE = MESSAGES_DIR / "ssh-ide-audit.jsonl"
 _ssh_ide_audit_lock = threading.Lock()
-# Keep UNIX-domain socket paths short enough for OpenSSH on macOS and Linux.
-# The socket identifies a dashboard session + SSH profile but contains neither
-# name, host, nor credential material.
-SSH_CONTROL_DIR = Path("/tmp") / f"nssh-{os.getuid()}"
 SSH_MAX_FILE_BYTES = 1_000_000
 # Unsaved buffers are convenience state, not storage: cap what one workspace
 # may park in the dashboard state directory.
@@ -11468,7 +11266,6 @@ def _valid_git_commit_ref(value: str) -> bool:
     return bool(ref and re.fullmatch(r"[0-9a-fA-F]{4,64}", ref))
 
 
-SSH_KNOWN_HOSTS = Path.home() / ".ssh" / "known_hosts"
 
 
 def _ssh_host_is_known(host: str, port: int = 22) -> bool:
@@ -13875,7 +13672,6 @@ def _account_identity(config_dir) -> dict:
     return ident
 
 
-_LOGIN_STATE_FILE = Path.home() / ".tmux-dashboard" / "login_state.json"
 
 
 def _load_login_state() -> dict:
@@ -14043,7 +13839,6 @@ async def api_legacy_claude_auth_removed(request: Request):
 # pre-existing systemd browser on display :99 / port 6080.
 BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
 BROWSER_AUDIT_ROOT = MESSAGES_DIR / "browser-audit"
-BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 _browser_starting: dict[str, float] = {}
 _browser_sessions_lock = threading.Lock()
 BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
@@ -14052,17 +13847,6 @@ BROWSER_AUDIT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 BROWSER_AUDIT_MAX_EVENTS = 120
 _browser_audit_lock = threading.Lock()
 _browser_capture_state: dict[str, dict] = {}
-# Auto-auth: drive the OAuth click-through in the designated login browser and
-# type the code back.
-#
-# DEFAULT OFF for the watchdog. claude.ai's consent page stalls when the
-# Authorize button is driven programmatically (verified with a JS click, trusted
-# CDP mouse events and a real X11 click), so the automated path can never
-# actually finish a /login — it can only get in the way. Left on, the watchdog
-# saw a HUMAN's /login as "a login flow to finish", typed into their pane and
-# interrupted them. Set TMUX_DASH_AUTO_AUTH=1 to re-enable if claude.ai ever
-# stops blocking it. The manual button/endpoint works regardless.
-AUTO_AUTH_ENABLED = os.environ.get("TMUX_DASH_AUTO_AUTH", "0") == "1"
 
 # The launcher is self-bootstrapped (write-if-missing) so the feature is portable
 # and doesn't depend on a hand-placed file. Mirrors the pre-existing default
@@ -14167,22 +13951,6 @@ def _ensure_browser_launcher():
             logger.info("Browser launcher script written to %s", p)
     except Exception:
         logger.debug("Failed to write browser launcher", exc_info=True)
-# The default session's ports are host-dependent: 5900/6080 is the convention,
-# but on builder the ups-audit app owns that pair on the SAME display :99 (nginx
-# maps /ups-vnc/ -> 6080) with a password-protected x11vnc, so this dashboard's
-# viewer landed on UPS's RFB and hung on a VNC password prompt. There the
-# claude-vnc unit runs on 5902/6082 and these env vars point us at it.
-_DEFAULT_BROWSER_SESSION = {
-    "id": "default", "name": "Main browser", "slot": 0, "display": 99,
-    "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
-    "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
-    "cdp_port": int(os.environ.get("CB_DEFAULT_CDP_PORT") or 9222),
-    "managed": False,
-    "lifecycle_managed": True,
-    "systemd_unit": os.environ.get("CB_DEFAULT_SYSTEMD_UNIT", "claude-vnc.service"),
-    "owner_id": "admin",
-    "account_browser": True,
-}
 
 
 def _load_browser_sessions() -> list:
@@ -14935,13 +14703,6 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
     return JSONResponse({"ok": True, "session": row})
 
 
-# --- Residential proxy + fingerprint ----------------------------------------
-# Every browser goes out through a loopback port served by the proxy relay
-# (~/.claude-browser/bin/proxy_relay.py), which attaches the residential
-# provider's credentials. Each browser has its OWN port => its own sticky exit
-# IP, so two browsers look like two different people. Config + credentials live
-# in ~/.claude-browser/proxy.json (mode 600); this dashboard only edits it.
-CB_ROOT = Path.home() / ".claude-browser"
 BROWSER_PROXY_CONF = CB_ROOT / "proxy.json"
 BROWSER_PROXY_USAGE = CB_ROOT / "state" / "proxy-usage.json"
 BROWSER_FINGERPRINT_TOOL = CB_ROOT / "bin" / "fingerprint-audit.py"
@@ -20574,9 +20335,6 @@ async def _away_send_and_wait(session_name: str, prompt: str, state: dict,
     return summary
 
 
-# --- Phase implementations ---
-# Skills are installed at ~/.codex/away-mode-skills/XX-name/SKILL.md
-_SKILLS_DIR = str(Path.home() / ".codex" / "away-mode-skills")
 
 _PHASE1_PROMPT = f"""I'm putting you in Away Mode. You are autonomous — the user is not present. Every action must be safe, verifiable, and revertible. You cannot ask questions — make decisions and document reasoning.
 
@@ -20958,7 +20716,6 @@ async def api_away_mode_status(session_name: str):
 # Autonomous feature-building mode: discovers the project, generates a feature backlog,
 # then continuously builds features, tests, and improves the project in a loop.
 
-_GO_NUTS_SKILLS_DIR = str(Path.home() / ".codex" / "go-nuts-mode-skills")
 _GO_NUTS_LOG_CAP = 200
 
 def _go_nuts_log(state: dict, action: str):
