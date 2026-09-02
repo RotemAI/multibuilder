@@ -361,3 +361,100 @@ CB_ROOT = Path.home() / ".claude-browser"
 _SKILLS_DIR = str(Path.home() / ".codex" / "away-mode-skills")
 
 _GO_NUTS_SKILLS_DIR = str(Path.home() / ".codex" / "go-nuts-mode-skills")
+
+
+# --- Multi-user store ---
+# Each user record:
+#   { id, username, password_hash, password_salt, role ("admin"|"user"),
+#     created_at, last_login }
+# Admin (id="admin") is bootstrapped from TMUX_DASH_USER / TMUX_DASH_PASS env vars
+# on first run, then writable via the admin UI. Per-user data lives at
+# ~/.tmux-dashboard/users/<id>/  (the admin keeps the legacy paths to preserve
+# existing messages.json / notes.json / uploads). Per-user Codex config lives
+# at ~/.codex-user-<id>/ for non-admin users; admin still uses ~/.codex.
+USERS_FILE = MESSAGES_DIR / "users.json"
+
+
+PERMISSION_GROUPS = {
+    "managers": {
+        "name": "Managers",
+        "summary": "May see all company and system data, but not personal identity documents or the Ramp card estate, and may not take destructive actions or change permissions.",
+        "advisor_can_see": "admin,payments,financial,hr,tax,sales,expenses,salaries,income,bank",
+        "advisor_cannot_see": "destructive,permissions.write,identity,identity_docs,ramp",
+        "advisor_scopes": "secrets,infra,memories.write,payments",
+        "instructions": """# Permission group: Managers
+
+You may read and analyze all company, financial, people, credential, and system data needed for the task.
+
+Personal identity documents (passports, ID cards, dates of birth, tax and
+insurance numbers for the owner and his family) are not company data and are
+not available to this group, nor is the Ramp card estate. Ask an administrator
+for a specific figure if a task genuinely needs one.
+
+You must not take destructive actions. This includes deleting or retiring systems, databases, domains, user data, production resources, or credentials; rewriting shared history; revoking access; or making an irreversible change. You must not create, remove, or modify permissions, roles, groups, authentication policy, or another person's access. Stop and ask an administrator to perform those actions. Non-destructive work and reversible updates remain allowed.
+""",
+    },
+    "engineers": {
+        "name": "Engineers",
+        "summary": "Engineering access with all company financial, sales, expense, payment, and salary data denied.",
+        "advisor_can_see": "systems",
+        "advisor_cannot_see": "payments,ramp,people,identity,identity_docs,financial,sales,expenses,salaries,income,bank",
+        "advisor_scopes": "secrets,infra,memories.write",
+        "instructions": """# Permission group: Engineers
+
+You may perform ordinary engineering work, but you must refuse any request for company financial data, sales data, expenses, payments, bank information, income, revenue, compensation, payroll, or salaries. Do not search for, infer, summarize, expose, copy, or route around a denial for that data. You may work on financial-system code only with synthetic or fully redacted fixtures that reveal no real company figures.
+""",
+    },
+    "accounting-cn": {
+        "name": "Accounting-CN",
+        "summary": "Read-only finance, HR, and tax access for mainland China entities only.",
+        "advisor_can_see": "payments,entities,contacts,financial,hr,tax,entity:cn",
+        "advisor_cannot_see": "ramp,people,identity,identity_docs,secrets,memories,transactions.write,systems.write,permissions.write,entity:non-cn,destructive",
+        "advisor_scopes": "memories.write,payments",
+        "instructions": """# Permission group: Accounting-CN
+
+You may read and analyze general financial data, HR data, and tax data only for companies and entities in mainland China. Confirm the entity and jurisdiction before disclosing data. Hong Kong, Macau, Taiwan, and every non-China entity are outside this permission and must be refused.
+
+You must not initiate, approve, schedule, or make transactions or payments. You must not delete data, modify systems, change credentials, or create, remove, or modify permissions. Work is read-only except for producing new reports or drafts that do not alter source records.
+""",
+    },
+    "accounting-all": {
+        "name": "Accounting-all",
+        "summary": "Read-only finance, HR, and tax access for all companies and entities.",
+        "advisor_can_see": "payments,identity,entities,contacts,people,financial,hr,tax",
+        "advisor_cannot_see": "ramp,identity,identity_docs,secrets,memories,transactions.write,systems.write,permissions.write,destructive",
+        "advisor_scopes": "memories.write,payments",
+        "instructions": """# Permission group: Accounting-all
+
+You may read and analyze general financial data, HR data, and tax data for all companies and entities.
+
+You must not initiate, approve, schedule, or make transactions or payments. You must not delete data, modify systems, change credentials, or create, remove, or modify permissions. Work is read-only except for producing new reports or drafts that do not alter source records.
+""",
+    },
+    "dev": {
+        "name": "Dev",
+        "summary": "May modify systems, but cannot transact or view protected company financial data.",
+        "advisor_can_see": "systems,systems.write",
+        "advisor_cannot_see": "payments,ramp,financial,expenses,salaries,income,bank,transactions.write,identity",
+        "advisor_scopes": "secrets,infra,memories.write",
+        "instructions": """# Permission group: Dev
+
+You may create and modify applications, infrastructure, configuration, and live systems when the requested engineering work calls for it.
+
+You must not initiate, approve, schedule, or make transactions or payments. You must not view, search for, infer, summarize, expose, or copy sensitive bank data, salaries, payroll, expenses, income, revenue, or real company financial figures. You may change code that handles those subjects only with synthetic or fully redacted data.
+""",
+    },
+    "limited-dev": {
+        "name": "Limited-Dev",
+        "summary": "Junior developer access with the Dev data restrictions and extra care for live changes.",
+        "advisor_can_see": "systems,systems.write",
+        "advisor_cannot_see": "payments,ramp,financial,expenses,salaries,income,bank,transactions.write,identity",
+        "advisor_scopes": "secrets,infra,memories.write",
+        "instructions": """# Permission group: Limited-Dev
+
+This account belongs to a junior developer. Apply the same data restrictions as Dev: do not make transactions or payments, and do not view, search for, infer, summarize, expose, or copy sensitive bank data, salaries, payroll, expenses, income, revenue, or real company financial figures.
+
+Consider every modification to a live system more carefully than an ordinary development edit. Inspect dependencies and blast radius first, preserve rollback paths, and use proportionate tests. If the request is risky, likely to break other systems, requires a significant redesign, or depends on architectural judgment, push back with the concrete risks and suggest consulting a senior developer or choosing a smaller, safer plan before making the change.
+""",
+    },
+}

@@ -1126,6 +1126,152 @@ class TestSshIdeSafety:
         assert _valid_git_branch("feature/remote-ide")
         assert not _valid_git_branch("feature/../secret")
 
+    def test_ssh_service_identity_follows_a_patched_app_current_user(self):
+        """The connection ownership gate must honour `patch("app._current_user")`.
+
+        services/ssh.py originally imported _current_user directly, which froze
+        the pre-patch function: the per-connection gate then ran as the real
+        user while the test believed it was another tenant, and a cross-tenant
+        access test failed. Identity is injected for exactly this reason.
+        """
+        from unittest.mock import patch
+
+        import app
+        from services import ssh as ssh_service
+
+        sentinel = {"id": "probe-user", "role": "member"}
+        with patch.object(app, "_current_user", return_value=sentinel):
+            assert ssh_service._current_user(None) is sentinel
+
+    def test_ssh_service_does_not_import_the_application(self):
+        """services/ssh.py must stay injectable, not import app."""
+        import re
+        from pathlib import Path
+
+        source = Path("services/ssh.py").read_text()
+        for line in re.findall(r"^\s*(?:from|import)\s+\S+", source, re.M):
+            root = line.split()[-1].split(".")[0]
+            assert root != "app", f"services/ssh.py imports the application: {line}"
+
+    def test_patching_ssh_paths_on_app_reaches_the_service(self):
+        """`monkeypatch.setattr(app, "SSH_...")` must reach services/ssh.py.
+
+        The vault and connection files moved; without attribute forwarding a
+        patch would rebind a name nothing reads, and tests would assert against
+        app.py while the service quietly used the real paths.
+        """
+        from pathlib import Path
+
+        import app
+        from services import ssh as ssh_service
+
+        original = ssh_service.SSH_VAULT_KEY_FILE
+        try:
+            app.SSH_VAULT_KEY_FILE = Path("/tmp/probe-vault.key")
+            assert ssh_service.SSH_VAULT_KEY_FILE == Path("/tmp/probe-vault.key")
+        finally:
+            app.SSH_VAULT_KEY_FILE = original
+            ssh_service.SSH_VAULT_KEY_FILE = original
+
+    def test_user_lookups_follow_a_patched_app_load_users(self):
+        """Extraction must not break the `app._load_users` monkeypatch seam.
+
+        Routes call _find_user_by_id, which lives in core/users.py. If that
+        module called its own _load_users global directly, patching
+        app._load_users would stop steering lookups and handlers would silently
+        read the real users file -- which is exactly what broke six tests when
+        this module was first extracted.
+        """
+        from unittest.mock import patch
+
+        import app
+
+        fake = [{"id": "u_probe", "username": "probe", "role": "user"}]
+        with patch.object(app, "_load_users", return_value=fake):
+            found = app._find_user_by_id("u_probe")
+        assert found is not None and found["username"] == "probe"
+
+    def test_users_module_does_not_import_the_application(self):
+        """core/users.py must stay a leaf: injection, not a back-import."""
+        import re
+        from pathlib import Path
+
+        source = Path("core/users.py").read_text()
+        for line in re.findall(r"^\s*(?:from|import)\s+\S+", source, re.M):
+            root = line.split()[-1].split(".")[0]
+            assert root != "app", f"core/users.py imports the application: {line}"
+
+    def test_token_signing_stays_backward_compatible(self):
+        """Extracted signing must not invalidate cookies already in browsers.
+
+        The primitives moved to core/tokens.py; if the output changed, every
+        signed-in user would be silently logged out on deploy.
+        """
+        import base64
+        import hashlib
+        import hmac
+
+        import app
+
+        secret = app.AUTH_SECRET
+
+        def legacy_token(user_id):
+            sig = hmac.new(
+                secret.encode(), user_id.encode(), hashlib.sha256
+            ).hexdigest()[:24]
+            return f"{user_id}:{sig}"
+
+        def legacy_state(payload):
+            sig = hmac.new(
+                secret.encode(), payload.encode(), hashlib.sha256
+            ).hexdigest()[:24]
+            return base64.urlsafe_b64encode((payload + "|" + sig).encode()).decode()
+
+        for user_id in ("admin", "member", ""):
+            assert app._make_token(user_id) == legacy_token(user_id)
+            assert app._check_token(legacy_token(user_id)) is True
+        for payload in ("state", "a|b", ""):
+            assert app._sign_state(payload) == legacy_state(payload)
+            assert app._verify_state(legacy_state(payload)) == payload
+
+    def test_auth_secret_has_exactly_one_definition(self):
+        """core/tokens.py must take the secret as an argument, never define it."""
+        from pathlib import Path
+
+        # Check code, not prose: the module docstring explains AUTH_SECRET, so
+        # match only an actual assignment or import of it.
+        import re
+
+        source = Path("core/tokens.py").read_text()
+        assert not re.search(r"^\s*AUTH_SECRET\s*=", source, re.M)
+        assert not re.search(r"^\s*(?:from|import).*AUTH_SECRET", source, re.M)
+        assert not re.search(r"^\s*\w+\s*=.*token_hex\(", source, re.M)
+
+    def test_extracted_helpers_are_not_redefined_in_app(self):
+        """A leftover definition would shadow the import and silently diverge."""
+        import re
+        from pathlib import Path
+
+        source = Path("app.py").read_text()
+        for name in (
+            "_is_admin", "_is_valid_session_name", "_tmux_safe_label",
+            "_valid_git_branch", "_valid_git_commit_ref", "_valid_git_pathspec",
+        ):
+            found = re.findall(rf"^def {name}\b", source, re.M)
+            assert not found, f"{name} is still defined in app.py"
+
+    def test_validators_module_is_dependency_free(self):
+        """It must import nothing from the app, or it cannot be a leaf module."""
+        from pathlib import Path
+
+        import re
+
+        source = Path("core/validators.py").read_text()
+        imports = re.findall(r"^\s*(?:from|import)\s+\S+", source, re.M)
+        for line in imports:
+            assert "app" not in line.split()[-1].split(".")[0], line
+            assert "core.config" not in line, line
+
     def test_config_paths_anchor_to_the_repository_root(self):
         """core/config.py lives one level down, so __file__ must not anchor paths.
 
@@ -1277,7 +1423,7 @@ class TestSshIdeSafety:
         import tempfile
         from pathlib import Path
 
-        source = Path("app.py").read_text()
+        source = Path("services/ssh.py").read_text()
         script = re.search(r'_SSH_GIT_SCRIPT = """(.*?)"""', source, re.S).group(1)
         with tempfile.TemporaryDirectory() as folder:
             subprocess.run(["git", "init", "-q", folder], check=True)
@@ -1300,7 +1446,7 @@ class TestSshIdeSafety:
         import tempfile
         from pathlib import Path
 
-        source = Path("app.py").read_text()
+        source = Path("services/ssh.py").read_text()
         script = re.search(r'_SSH_GIT_SCRIPT = """(.*?)"""', source, re.S).group(1)
         with tempfile.TemporaryDirectory() as folder:
             def run(*argv):
