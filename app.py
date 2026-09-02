@@ -376,6 +376,62 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_MODEL_ALIASES = ("fable", "opus", "sonnet")
 
 
+def _agent_pane_target(session_name: str) -> str:
+    """The tmux target for the pane the AGENT runs in.
+
+    Bare "<session>" resolves to whichever window is ACTIVE, and the IDE's own
+    terminal windows (ssh-… / local-…) become active as soon as a browser
+    terminal attaches. Prompts meant for the agent were then typed into that SSH
+    shell instead. Find the agent's window explicitly and fall back to the
+    session only when no agent pane can be identified.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-s", "-t", session_name, "-F",
+             "#{window_index}\t#{pane_current_command}\t#{pane_pid}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return session_name
+        rows = []
+        for line in (result.stdout or "").splitlines():
+            index, _, rest = line.strip().partition("\t")
+            command, _, pid = rest.partition("\t")
+            if index:
+                rows.append((index, command, pid))
+        # Prefer a pane whose own command is the agent.
+        for index, command, _pid in rows:
+            if command in _AGENT_PROCESS_NAMES:
+                return f"{session_name}:{index}"
+        # Otherwise look for one with an agent somewhere in its process tree.
+        children, commands = _process_tree_snapshot()
+        for index, _command, pid in rows:
+            if not pid.isdigit():
+                continue
+            pending, seen = [pid], set()
+            while pending and len(seen) < 5000:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                if commands.get(current) in _AGENT_PROCESS_NAMES:
+                    return f"{session_name}:{index}"
+                pending.extend(children.get(current, ()))
+        # No agent found: prefer a window the IDE did not create.
+        for index, _command, _pid in rows:
+            name = subprocess.run(
+                ["tmux", "display-message", "-t", f"{session_name}:{index}", "-p", "#{window_name}"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.strip()
+            if not name.startswith(("ssh-", "local-", "ssh:", "local:")):
+                return f"{session_name}:{index}"
+    except Exception:  # noqa: BLE001 - resolution is best-effort
+        # Never let pane resolution break the caller: falling back to the bare
+        # session name reproduces the previous behaviour rather than failing.
+        logger.debug("Agent pane resolution failed for %s", session_name, exc_info=True)
+    return session_name
+
+
 def _agent_quit_command(session_name: str) -> str:
     """The slash command that exits this session's agent.
 
@@ -6758,9 +6814,13 @@ def _session_is_codex(name: str) -> bool:
     if cached and now - cached[1] < _CODEX_DASH_VISIBILITY_TTL:
         return cached[0]
     try:
+        # Every pane in the session, not just the ACTIVE window's. The IDE adds
+        # its own terminal windows (ssh:… / local:…), and once one of those was
+        # focused this check looked at `ssh` instead of the agent and hid the
+        # whole session — every route for it then 404'd.
         pp = subprocess.run(
             [
-                "tmux", "display-message", "-t", name, "-p",
+                "tmux", "list-panes", "-s", "-t", name, "-F",
                 "#{pane_pid}\t#{pane_current_command}",
             ],
             capture_output=True, text=True, timeout=3,
@@ -6768,12 +6828,24 @@ def _session_is_codex(name: str) -> bool:
         if pp.returncode != 0:
             _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
             return False
-        pane_pid, _, pane_command = (pp.stdout or "").strip().partition("\t")
-        if not pane_pid.isdigit():
+        rows = [r for r in (pp.stdout or "").splitlines() if r.strip()]
+        if not rows:
+            _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
+            return False
+        pane_pids = []
+        pane_commands = []
+        for row in rows:
+            pid, _, command = row.strip().partition("\t")
+            if pid.isdigit():
+                pane_pids.append(pid)
+                pane_commands.append(command)
+        if not pane_pids:
             _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
             return False
         children, commands = _process_tree_snapshot()
-        to_check = [pane_pid]
+        # Search from EVERY pane: the agent may be in a window other than the
+        # one that happens to be active.
+        to_check = list(pane_pids)
         seen: set[str] = set()
         has_codex = False
         while to_check and len(seen) < 10000:
@@ -6785,9 +6857,8 @@ def _session_is_codex(name: str) -> bool:
                 has_codex = True
                 break
             to_check.extend(children.get(current, ()))
-        decision = has_codex or pane_command.lower() in {
-            "bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh",
-        }
+        shells = {"bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh"}
+        decision = has_codex or any(c.lower() in shells for c in pane_commands)
     except Exception:
         decision = False
     _CODEX_DASH_VISIBILITY_CACHE[name] = (decision, now)
@@ -6889,7 +6960,7 @@ def capture_pane_full(session_name: str) -> str:
         # -J joins terminal-wrap continuation lines so long strings (e.g. OAuth
         # login URLs) come back intact instead of split at pane width.
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-J", "-S", "-"],
+            ["tmux", "capture-pane", "-t", _agent_pane_target(session_name), "-p", "-J", "-S", "-"],
             capture_output=True, text=True, timeout=10
         )
         return result.stdout if result.returncode == 0 else ""
@@ -6898,9 +6969,16 @@ def capture_pane_full(session_name: str) -> str:
 
 
 def capture_pane_recent(session_name: str, lines: int = 80) -> str:
+    """Recent output from the AGENT's pane.
+
+    Targeting the bare session reads whichever window is active, which becomes
+    the IDE's SSH terminal as soon as a browser terminal attaches — activity
+    detection and chat-reply capture then watched a shell instead of the agent.
+    """
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-J", "-S", f"-{lines}"],
+            ["tmux", "capture-pane", "-t", _agent_pane_target(session_name),
+             "-p", "-J", "-S", f"-{lines}"],
             capture_output=True, text=True, timeout=5
         )
         return result.stdout if result.returncode == 0 else ""
@@ -7155,7 +7233,7 @@ def _detect_activity_raw(session_name: str) -> dict:
         # tmux capture-pane without -S captures just the visible area.
         try:
             vis = subprocess.run(
-                ["tmux", "capture-pane", "-t", session_name, "-p"],
+                ["tmux", "capture-pane", "-t", _agent_pane_target(session_name), "-p"],
                 capture_output=True, text=True, timeout=5
             )
             visible = vis.stdout if vis.returncode == 0 else ""
@@ -8443,7 +8521,7 @@ def _visible_pane_hash(session_name: str) -> str:
     """
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p"],
+            ["tmux", "capture-pane", "-t", _agent_pane_target(session_name), "-p"],
             capture_output=True, text=True, timeout=3,
         )
         if result.returncode == 0:
@@ -11469,11 +11547,23 @@ def _tmux_window_suffix(profile: dict) -> str:
     return str(profile.get("id") or "")[:8]
 
 
+def _tmux_safe_label(raw: str, fallback: str) -> str:
+    """Sanitise a label for use inside a tmux target string.
+
+    tmux parses targets as "session:window.pane", so a DOT in a window name is
+    read as a pane separator: a label like "tofik@136.114.173.71" made tmux hunt
+    for pane "114.173.71-..." and every attach failed. Colons split the session
+    off, so both characters have to go.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", str(raw or "")).strip("-")
+    return cleaned or fallback
+
+
 def _ssh_tmux_window_name(profile: dict) -> str:
     if _is_local_profile(profile):
         return _local_tmux_window_name(profile)
-    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile.get("label") or "remote")).strip("-.")
-    return f"ssh:{(label or 'remote')[:28]}-{_tmux_window_suffix(profile)}"
+    label = _tmux_safe_label(profile.get("label"), "remote")
+    return f"ssh-{label[:28]}-{_tmux_window_suffix(profile)}"
 
 
 def _ssh_tmux_window_exists(profile: dict, session_name: str) -> bool:
@@ -11529,7 +11619,7 @@ def _ssh_focus_tmux_window(profile: dict, session_name: str) -> str:
         raise RuntimeError("tmux is not installed on the dashboard host")
     window_name = _ssh_tmux_window_name(profile)
     result = subprocess.run(
-        ["tmux", "select-window", "-t", f"{session_name}:{window_name}"],
+        ["tmux", "select-window", "-t", f"{session_name}:={window_name}"],
         capture_output=True,
         timeout=8,
     )
@@ -11648,8 +11738,8 @@ def _local_run(
 
 
 def _local_tmux_window_name(profile: dict) -> str:
-    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile.get("label") or "local")).strip("-.")
-    return f"local:{(label or 'local')[:28]}-{_tmux_window_suffix(profile)}"
+    label = _tmux_safe_label(profile.get("label"), "local")
+    return f"local-{label[:28]}-{_tmux_window_suffix(profile)}"
 
 
 def _local_open_tmux_window(profile: dict, session_name: str) -> str:
@@ -11947,7 +12037,7 @@ def _ssh_terminal_argv(profile: dict, session_name: str) -> list[str]:
     return [
         "tmux",
         "attach-session",
-        "-t", f"{session_name}:{window_name}",
+        "-t", f"{session_name}:={window_name}",
     ]
 
 
@@ -17387,6 +17477,10 @@ async def api_resume_session(session_name: str):
 
 @app.post("/api/sessions/{session_name}/send")
 async def api_send_command(request: Request, session_name: str, body: SendCommand):
+    # Aim at the AGENT's pane, not the session's active window: the IDE's
+    # terminal window becomes active when a browser terminal attaches, and
+    # prompts were being typed into that SSH shell instead of the agent.
+    agent_target = await asyncio.to_thread(_agent_pane_target, session_name)
     """Send keystrokes to a tmux session, as if typed at the terminal."""
     _, sess = _find_session_for_user(session_name, _current_user(request))
     if not sess:
@@ -17417,7 +17511,7 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
             # bracketed paste), then pasting, then waiting long enough for
             # the terminal to render before pressing Enter.
             await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-H",
+                ["tmux", "send-keys", "-t", agent_target, "-H",
                  "1b", "5b", "3f", "32", "30", "30", "34", "6c"],  # \e[?2004l
                 capture_output=True, text=True, timeout=5
             )
@@ -17431,7 +17525,7 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
                     capture_output=True, text=True, timeout=5
                 )
                 await asyncio.to_thread(subprocess.run,
-                    ["tmux", "paste-buffer", "-t", session_name],
+                    ["tmux", "paste-buffer", "-t", agent_target],
                     capture_output=True, text=True, timeout=5
                 )
             finally:
@@ -17442,7 +17536,7 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
             await asyncio.sleep(wait_secs)
             # C-m is an explicit carriage return, which Codex treats as submit.
             await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "C-m"],
+                ["tmux", "send-keys", "-t", agent_target, "C-m"],
                 capture_output=True, text=True, timeout=5
             )
             # Belt-and-braces: if a bracketed paste preview is still showing
@@ -17455,7 +17549,7 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
                 tail = await asyncio.to_thread(capture_pane_recent, session_name, 6)
                 if "Pasted text" in tail or "[Pasted" in tail:
                     await asyncio.to_thread(subprocess.run,
-                        ["tmux", "send-keys", "-t", session_name, "C-m"],
+                        ["tmux", "send-keys", "-t", agent_target, "C-m"],
                         capture_output=True, text=True, timeout=5
                     )
             except Exception:
@@ -17465,13 +17559,13 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
             # render tick before Enter. Sending text and Enter back-to-back can
             # leave the text visibly parked in the input box without submitting.
             await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l", cmd_text],
+                ["tmux", "send-keys", "-t", agent_target, "-l", cmd_text],
                 capture_output=True, text=True, timeout=5
             )
             await asyncio.sleep(0.25)
             # Submit as a separate, explicit carriage-return key event.
             await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "C-m"],
+                ["tmux", "send-keys", "-t", agent_target, "C-m"],
                 capture_output=True, text=True, timeout=5
             )
         # Record user message in chat history

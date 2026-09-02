@@ -2663,7 +2663,16 @@ class TestSendCommandEndpoint:
         mock_sleep.assert_awaited_once_with(0.25)
         # The send path scrolls the pane back into view first, and submits with
         # C-m rather than the "Enter" key name; both reach tmux identically.
-        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["-40", "echo hello", "C-m"]
+        # Look only at the keystroke/scroll calls: the send path first resolves
+        # which window the agent is in (tmux list-panes, ps), so the prompt is
+        # not typed into the IDE's own terminal window when it is active.
+        sent = [
+            call.args[0][-1]
+            for call in mock_run.call_args_list
+            if call.args[0][:1] == ["tmux"]
+            and any(k in call.args[0] for k in ("send-keys", "copy-mode", "capture-pane"))
+        ]
+        assert sent == ["-40", "echo hello", "C-m"]
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
