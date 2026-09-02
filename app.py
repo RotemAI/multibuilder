@@ -181,15 +181,22 @@ from runtime_control import (
     scoped_codex_command,
     user_systemd_argv,
 )
+from services import autonomous as autonomous_service  # noqa: E402
+from services import browser as browser_service  # noqa: E402
+
+# config.toml editing and CLI readiness now live in services/codex_config.py.
+from services import codex_config as codex_config_service  # noqa: E402
+from services import ssh as ssh_service  # noqa: E402
+from services import tmux as tmux_service  # noqa: E402
 
 # The Remote SSH IDE service now lives in services/ssh.py. Route handlers
 # stay here; everything they call is re-exported below so call sites and
 # the test suite's patch points keep working unchanged.
 # Browser sessions now live in services/browser.py; route handlers stay here.
 # Away / Go Nuts autonomous modes now live in services/autonomous.py.
-from services import autonomous as autonomous_service  # noqa: E402
-from services import browser as browser_service  # noqa: E402
-from services import ssh as ssh_service  # noqa: E402
+# tmux inspection and agent activity detection now live in services/tmux.py.
+# Usage accounting (tokens, cost, prompt audit) now lives in services/usage.py.
+from services import usage as usage_service  # noqa: E402
 from services.autonomous import (  # noqa: E402
     _AWAY_PING_PROMPT,
     _GN_PHASE1_PROMPT,
@@ -304,6 +311,15 @@ from services.browser import (  # noqa: E402
     _tenant_browser_id,
     _user_can_access_browser,
 )
+from services.codex_config import (  # noqa: E402
+    _codex_cli_readiness,
+    _merge_top_level_toml_keys,
+    _rewrite_top_level_toml,
+    _set_toml_table_bool,
+    _strip_toml_sections,
+    _toml_basic_string,
+    _toml_escape,
+)
 from services.ssh import (  # noqa: E402
     _SSH_BROWSE_SCRIPT,
     _SSH_FILESYSTEM_SCRIPT,
@@ -394,6 +410,92 @@ from services.ssh import (  # noqa: E402
     _valid_ssh_host,
     _WorkspaceCommand,
 )
+from services.tmux import (  # noqa: E402
+    _AGENT_PROCESS_NAMES,
+    _CODEX_CONVERSATION_RE,
+    _CODEX_DASH_VISIBILITY_CACHE,
+    _CODEX_DASH_VISIBILITY_TTL,
+    _CODEX_LAUNCH_LINE_RE,
+    _CODEX_START_FAILURE_RE,
+    _CODEX_WELCOME_RE,
+    _CRASH_OOM_RE,
+    _CRASH_SIGNATURE_RE,
+    _PANE_RESIDUE_RE,
+    _PROCESS_TREE_CACHE,
+    _PROCESS_TREE_TTL,
+    _RE_COMPLETION,
+    _RE_COMPLETION_MSG,
+    _RE_IDLE_PROMPT,
+    _RE_RUNNING_TASK,
+    _RE_SHELL_PROMPT,
+    _RE_SPINNER_INLINE,
+    _RE_SPINNER_START,
+    _RE_THOUGHT,
+    _RE_TIP_CODEX,
+    _SHELL_CONTINUATION_RE,
+    _SHELL_PROMPT_RE,
+    _SPINNER_ICONS,
+    IDLE_CONFIRM_COUNT,
+    _activity_state,
+    _agent_pane_target,
+    _all_pane_pids_by_session,
+    _codex_is_down_recoverably,
+    _codex_launch_was_attempted,
+    _detect_activity_raw,
+    _detect_interactive_prompt,
+    _find_session,
+    _is_pane_residue,
+    _looks_like_bare_shell,
+    _looks_like_codex_start_failure,
+    _looks_like_crash,
+    _looks_like_fresh_claude_session,
+    _looks_like_stuck_shell,
+    _pane_is_dead,
+    _pane_is_recoverable_shell,
+    _pane_stability,
+    _pane_text,
+    _process_tree_snapshot,
+    _session_is_codex,
+    _shell_has_pending_input,
+    _visible_pane_hash,
+    async_detect_activity,
+    capture_pane_full,
+    capture_pane_recent,
+    detect_activity,
+    get_pane_position,
+    get_pane_width,
+    get_session_cwd,
+    get_tmux_sessions,
+)
+from services.usage import (  # noqa: E402
+    PROMPT_AUDIT_FILE,
+    _advisor_admin_token,
+    _check_token,
+    _codex_turn_cost,
+    _decode_id_token,
+    _estimate_cost,
+    _fetch_api_usage_sync,
+    _find_session_jsonl_files,
+    _iter_jsonl_reverse,
+    _load_longlived_token,
+    _make_token,
+    _parse_session_stats,
+    _parse_usage_file,
+    _pct_status,
+    _prompt_audit_lock,
+    _prompt_audit_summary,
+    _prompt_audit_summary_cache,
+    _prompt_counts_by_user,
+    _rollout_lifetime_cache,
+    _rollout_lifetime_usage,
+    _session_stats_cache,
+    _subscription_token_valid,
+    _token_usage_for_home,
+    _usage_by_account,
+    _usage_err,
+    _usage_na,
+    _user_lifetime_stats,
+)
 
 if PROCESS_ROLE not in {"combined", "api", "controller"}:
     PROCESS_ROLE = "combined"
@@ -480,29 +582,6 @@ if DEFAULT_MODEL not in ALLOWED_SESSION_MODELS:
 MODEL_CHECK_INTERVAL = 24 * 3600
 
 
-def _codex_cli_readiness() -> tuple[bool, str, dict]:
-    """Check that a compatible Codex CLI is available before starting a pane."""
-    binary = shutil.which("codex")
-    details = {"binary": binary or "", "minimum": _CODEX_MIN_CLI_VERSION, "version": ""}
-    if not binary:
-        return False, "the codex CLI is not installed", details
-    try:
-        result = subprocess.run(
-            [binary, "--version"], capture_output=True, text=True, timeout=10
-        )
-        text = ((result.stdout or "") + " " + (result.stderr or "")).strip()
-        match = re.search(r"(\d+\.\d+\.\d+)", text)
-        version = match.group(1) if match else ""
-        details["version"] = version
-        if result.returncode != 0 or not version:
-            return False, "the codex CLI version could not be determined", details
-        current = tuple(int(part) for part in version.split("."))
-        minimum = tuple(int(part) for part in _CODEX_MIN_CLI_VERSION.split("."))
-        if current < minimum:
-            return False, f"codex {version} is older than required {_CODEX_MIN_CLI_VERSION}", details
-    except Exception as exc:
-        return False, f"codex CLI check failed: {type(exc).__name__}", details
-    return True, "ready", details
 
 
 async def _refresh_model_catalog(force: bool = False) -> bool:
@@ -673,60 +752,6 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_MODEL_ALIASES = ("fable", "opus", "sonnet")
 
 
-def _agent_pane_target(session_name: str) -> str:
-    """The tmux target for the pane the AGENT runs in.
-
-    Bare "<session>" resolves to whichever window is ACTIVE, and the IDE's own
-    terminal windows (ssh-… / local-…) become active as soon as a browser
-    terminal attaches. Prompts meant for the agent were then typed into that SSH
-    shell instead. Find the agent's window explicitly and fall back to the
-    session only when no agent pane can be identified.
-    """
-    try:
-        result = subprocess.run(
-            ["tmux", "list-panes", "-s", "-t", session_name, "-F",
-             "#{window_index}\t#{pane_current_command}\t#{pane_pid}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
-            return session_name
-        rows = []
-        for line in (result.stdout or "").splitlines():
-            index, _, rest = line.strip().partition("\t")
-            command, _, pid = rest.partition("\t")
-            if index:
-                rows.append((index, command, pid))
-        # Prefer a pane whose own command is the agent.
-        for index, command, _pid in rows:
-            if command in _AGENT_PROCESS_NAMES:
-                return f"{session_name}:{index}"
-        # Otherwise look for one with an agent somewhere in its process tree.
-        children, commands = _process_tree_snapshot()
-        for index, _command, pid in rows:
-            if not pid.isdigit():
-                continue
-            pending, seen = [pid], set()
-            while pending and len(seen) < 5000:
-                current = pending.pop()
-                if current in seen:
-                    continue
-                seen.add(current)
-                if commands.get(current) in _AGENT_PROCESS_NAMES:
-                    return f"{session_name}:{index}"
-                pending.extend(children.get(current, ()))
-        # No agent found: prefer a window the IDE did not create.
-        for index, _command, _pid in rows:
-            name = subprocess.run(
-                ["tmux", "display-message", "-t", f"{session_name}:{index}", "-p", "#{window_name}"],
-                capture_output=True, text=True, timeout=3,
-            ).stdout.strip()
-            if not name.startswith(("ssh-", "local-", "ssh:", "local:")):
-                return f"{session_name}:{index}"
-    except Exception:  # noqa: BLE001 - resolution is best-effort
-        # Never let pane resolution break the caller: falling back to the bare
-        # session name reproduces the previous behaviour rather than failing.
-        logger.debug("Agent pane resolution failed for %s", session_name, exc_info=True)
-    return session_name
 
 
 def _agent_quit_command(session_name: str) -> str:
@@ -1471,15 +1496,8 @@ async def request_validation_error_handler(_request: Request, exc: RequestValida
 AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
 
 
-# The signing primitives live in core/tokens.py; AUTH_SECRET stays here so it
-# keeps exactly one definition (it is generated per process when
-# TMUX_DASH_SECRET is unset) and is passed in rather than imported.
-def _make_token(user_id: str) -> str:
-    return core_tokens.make_token(AUTH_SECRET, user_id)
 
 
-def _check_token(token: str) -> bool:
-    return core_tokens.check_token(AUTH_SECRET, token)
 
 
 
@@ -1609,96 +1627,12 @@ def _member_session_project_dir(user: dict, session_name: str) -> Path:
     return project_dir
 
 
-def _rewrite_top_level_toml(existing: str, values: dict[str, str | None]) -> str:
-    """Replace or remove selected top-level keys without touching TOML tables."""
-    out: list[str] = []
-    written: set[str] = set()
-    in_section = False
-    for line in existing.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            if not in_section:
-                for key, value in values.items():
-                    if value is not None and key not in written:
-                        out.append(f"{key} = {value}")
-                        written.add(key)
-            in_section = True
-            out.append(line)
-            continue
-        if not in_section and "=" in stripped and not stripped.startswith("#"):
-            key = stripped.split("=", 1)[0].strip()
-            if key in values:
-                if values[key] is not None and key not in written:
-                    out.append(f"{key} = {values[key]}")
-                    written.add(key)
-                continue
-        out.append(line)
-    if not in_section:
-        if out and out[-1].strip():
-            out.append("")
-        for key, value in values.items():
-            if value is not None and key not in written:
-                out.append(f"{key} = {value}")
-    return "\n".join(out).rstrip() + "\n"
 
 
-def _toml_basic_string(value: str) -> str:
-    """Render one TOML basic string with JSON-compatible escaping."""
-    return json.dumps(value or "", ensure_ascii=False)
 
 
-def _strip_toml_sections(existing: str, prefixes: tuple[str, ...]) -> str:
-    """Remove complete TOML tables whose dotted names match a prefix."""
-    out: list[str] = []
-    skipping = False
-    for line in existing.splitlines():
-        match = re.match(r"^\s*\[([^\[\]]+)\]\s*$", line)
-        if match:
-            section = match.group(1).strip()
-            skipping = any(
-                section == prefix or section.startswith(prefix + ".")
-                for prefix in prefixes
-            )
-        if not skipping:
-            out.append(line)
-    return "\n".join(out).rstrip() + "\n"
 
 
-def _set_toml_table_bool(existing: str, section: str, key: str, value: bool) -> str:
-    """Upsert one boolean in an existing or new TOML table."""
-    lines = existing.splitlines()
-    header = f"[{section}]"
-    start = next(
-        (index for index, line in enumerate(lines) if line.strip() == header),
-        None,
-    )
-    rendered = f"{key} = {'true' if value else 'false'}"
-    if start is None:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.extend((header, rendered))
-        return "\n".join(lines).rstrip() + "\n"
-    end = next(
-        (
-            index
-            for index in range(start + 1, len(lines))
-            if lines[index].strip().startswith("[")
-            and lines[index].strip().endswith("]")
-        ),
-        len(lines),
-    )
-    matches = [
-        index
-        for index in range(start + 1, end)
-        if re.match(rf"^\s*{re.escape(key)}\s*=", lines[index])
-    ]
-    if matches:
-        lines[matches[0]] = rendered
-        for duplicate in reversed(matches[1:]):
-            del lines[duplicate]
-    else:
-        lines.insert(start + 1, rendered)
-    return "\n".join(lines).rstrip() + "\n"
 
 
 def _member_developer_instructions(user: dict) -> str:
@@ -2548,19 +2482,6 @@ def _google_email_allowed(email: str) -> bool:
     return email.split("@", 1)[1] in GOOGLE_LOGIN_DOMAINS
 
 
-def _decode_id_token(id_token: str) -> dict:
-    """Return the claims of a Google ID token.
-
-    No signature check: the token is read straight off Google's HTTPS token
-    endpoint in response to a request authenticated with our client secret, which
-    is the case Google explicitly documents as not needing local verification.
-    The claims below (aud/iss/exp) are still checked by the caller.
-    """
-    parts = id_token.split(".")
-    if len(parts) != 3:
-        raise ValueError("malformed id_token")
-    payload = parts[1] + "=" * (-len(parts[1]) % 4)
-    return json.loads(base64.urlsafe_b64decode(payload.encode()))
 
 
 def _google_login_user(email: str, name: str) -> dict | None:
@@ -2800,24 +2721,6 @@ def _last_human_activity(user: dict) -> float:
     return latest
 
 
-def _user_lifetime_stats(users: list[dict]) -> dict[str, dict[str, int]]:
-    """Return lightweight retained prompt/token totals for the Users table."""
-    prompt_totals = _prompt_audit_summary()
-    stats = {}
-    for user in users:
-        user_id = str(user.get("id") or "")
-        if not user_id:
-            continue
-        tokens = _token_usage_for_home(
-            _user_codex_config_dir(user), {"all": ""}
-        )["all"]
-        stats[user_id] = {
-            "total_prompts": int(
-                (prompt_totals.get(user_id) or {}).get("count") or 0
-            ),
-            "total_tokens": int(tokens.get("totalTokens") or 0),
-        }
-    return stats
 
 
 @app.get("/api/admin/users")
@@ -3426,246 +3329,12 @@ def _api_http(url, headers=None, timeout=15, method="GET", data=None):
         return 0, str(e), {}
 
 
-def _pct_status(pct):
-    if pct is None:
-        return "ok"
-    if pct >= 90:
-        return "err"
-    if pct >= 75:
-        return "warn"
-    return "ok"
 
 
-def _usage_na(msg="No live usage endpoint — open the dashboard"):
-    return {"ok": False, "status": "na", "summary": msg,
-            "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
 
 
-def _usage_err(st, body):
-    return {"ok": False, "status": "err", "summary": f"HTTP {st}" if st else "request failed",
-            "used": None, "limit": None, "remaining": None, "pct": None,
-            "detail": (body or "")[:200]}
 
 
-def _fetch_api_usage_sync(entry: dict) -> dict:
-    prov = (entry.get("usage_provider") or "").lower()
-    key = entry.get("key") or ""
-    if entry.get("status") == "revoked":
-        return {"ok": False, "status": "na", "summary": "Revoked — not checked",
-                "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
-    if prov in ("", "exa", "valyu", "vertex", "twilio") or (not key and prov not in ("vertex", "twilio")):
-        if prov == "vertex":
-            return _usage_na("Service-account auth — usage in GCP console")
-        if prov == "twilio":
-            return _usage_na("Token lives on builder VM — usage in Twilio console")
-        if not key:
-            return _usage_na("No key set")
-        return _usage_na()
-    try:
-        if prov == "serpapi":
-            st, body, _ = _api_http("https://serpapi.com/account?api_key=" + urllib.parse.quote(key))
-            if st == 200:
-                d = json.loads(body)
-                limit = d.get("searches_per_month")
-                used = d.get("this_month_usage")
-                left = d.get("total_searches_left")
-                pct = (used / limit * 100) if (limit and used is not None) else None
-                return {"ok": True, "status": _pct_status(pct),
-                        "summary": f"{used:,} / {limit:,} used · {left:,} left" if limit is not None else "OK",
-                        "used": used, "limit": limit, "remaining": left, "pct": pct,
-                        "detail": f"{d.get('plan_name','')} · ${d.get('plan_monthly_price','?')}/mo · renews {d.get('plan_renewal_date','?')} · {d.get('this_hour_searches','?')}/{d.get('account_rate_limit_per_hour','?')} this hr"}
-            return _usage_err(st, body)
-
-        if prov == "scrapingbee":
-            st, body, _ = _api_http("https://app.scrapingbee.com/api/v1/usage?api_key=" + urllib.parse.quote(key))
-            if st == 200:
-                d = json.loads(body)
-                limit = d.get("max_api_credit")
-                used = d.get("used_api_credit")
-                rem = (limit - used) if (limit is not None and used is not None) else None
-                pct = (used / limit * 100) if limit else None
-                return {"ok": True, "status": _pct_status(pct),
-                        "summary": f"{used:,} / {limit:,} credits used",
-                        "used": used, "limit": limit, "remaining": rem, "pct": pct,
-                        "detail": f"concurrency {d.get('current_concurrency','?')}/{d.get('max_concurrency','?')} · renews {str(d.get('renewal_subscription_date',''))[:10]}"}
-            return _usage_err(st, body)
-
-        if prov == "firecrawl":
-            st, body, _ = _api_http("https://api.firecrawl.dev/v1/team/credit-usage",
-                                    headers={"Authorization": "Bearer " + key})
-            if st == 200:
-                d = (json.loads(body) or {}).get("data", {}) or {}
-                limit = d.get("plan_credits")
-                rem = d.get("remaining_credits")
-                used = (limit - rem) if (limit is not None and rem is not None) else None
-                pct = (used / limit * 100) if limit else None
-                return {"ok": True, "status": _pct_status(pct),
-                        "summary": f"{used:,} / {limit:,} credits used · {rem:,} left" if limit is not None else "OK",
-                        "used": used, "limit": limit, "remaining": rem, "pct": pct,
-                        "detail": f"period {str(d.get('billing_period_start',''))[:10]} → {str(d.get('billing_period_end',''))[:10]}"}
-            return _usage_err(st, body)
-
-        if prov == "brave":
-            st, body, hdrs = _api_http(
-                "https://api.search.brave.com/res/v1/web/search?q=ping&count=1",
-                headers={"X-Subscription-Token": key, "Accept": "application/json"})
-
-            def _last(s):
-                parts = [p.strip() for p in (s or "").split(",") if p.strip() != ""]
-                return parts[-1] if parts else ""
-            lim = hdrs.get("x-ratelimit-limit", "")
-            rem = hdrs.get("x-ratelimit-remaining", "")
-            mlim, mrem = _last(lim), _last(rem)
-            if st == 402:
-                return {"ok": True, "status": "err",
-                        "summary": "402 — free quota exhausted / plan inactive",
-                        "used": None, "limit": None, "remaining": None, "pct": None,
-                        "detail": f"monthly limit {mlim or '?'} · remaining {mrem or '?'}"}
-            if st == 200:
-                try:
-                    L = int(mlim)
-                    R = int(mrem)
-                    U = L - R
-                    pct = (U / L * 100) if L else None
-                    return {"ok": True, "status": _pct_status(pct),
-                            "summary": (f"{U:,} / {L:,} used this month · {R:,} left" if L else "Key valid"),
-                            "used": (U if L else None), "limit": (L or None),
-                            "remaining": (R if L else None), "pct": pct,
-                            "detail": f"per-second cap {(lim or '').split(',')[0].strip()}"}
-                except Exception:
-                    return {"ok": True, "status": "ok", "summary": "Key valid",
-                            "used": None, "limit": None, "remaining": None, "pct": None,
-                            "detail": f"limit {lim} · remaining {rem}"}
-            return _usage_err(st, body)
-
-        if prov == "linkup":
-            st, body, _ = _api_http("https://api.linkup.so/v1/credits/balance",
-                                    headers={"Authorization": "Bearer " + key})
-            if st == 200:
-                bal = (json.loads(body) or {}).get("balance")
-                low = isinstance(bal, (int, float)) and bal <= 5
-                return {"ok": True, "status": "warn" if low else "ok",
-                        "summary": f"{bal} credits remaining",
-                        "used": None, "limit": None, "remaining": bal, "pct": None, "detail": ""}
-            return _usage_err(st, body)
-
-        if prov == "jina":
-            u = "https://embeddings-dashboard-api.jina.ai/api/v1/api_key/user?api_key=" + urllib.parse.quote(key)
-            st, body, _ = _api_http(u, headers={"Authorization": "Bearer " + key})
-            if st == 200:
-                w = (json.loads(body) or {}).get("wallet", {}) or {}
-                bal = w.get("total_balance")
-                neg = isinstance(bal, (int, float)) and bal < 0
-                summ = (f"balance {bal:,} tokens" if isinstance(bal, (int, float)) else "Key valid")
-                if neg:
-                    summ += " (depleted / negative)"
-                return {"ok": True, "status": "err" if neg else "ok", "summary": summ,
-                        "used": None, "limit": None, "remaining": bal, "pct": None, "detail": ""}
-            return _usage_err(st, body)
-
-        if prov == "tavily":
-            st, body, _ = _api_http("https://api.tavily.com/usage",
-                                    headers={"Authorization": "Bearer " + key})
-            if st == 200:
-                try:
-                    d = json.loads(body)
-                    acct = d.get("account", {}) or {}
-                    k = d.get("key", {}) or {}
-                    limit = acct.get("plan_limit") or k.get("limit")
-                    used = acct.get("plan_usage") if acct.get("plan_usage") is not None else k.get("usage")
-                    if limit and used is not None:
-                        pct = used / limit * 100
-                        return {"ok": True, "status": _pct_status(pct),
-                                "summary": f"{used:,} / {limit:,} used",
-                                "used": used, "limit": limit, "remaining": limit - used,
-                                "pct": pct, "detail": ""}
-                    return {"ok": True, "status": "ok", "summary": "Key valid",
-                            "used": None, "limit": None, "remaining": None, "pct": None,
-                            "detail": json.dumps(d)[:180]}
-                except Exception:
-                    return {"ok": True, "status": "ok", "summary": "Key valid",
-                            "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
-            return _usage_err(st, body)
-
-        if prov == "openai":
-            st, body, _ = _api_http("https://api.openai.com/v1/models",
-                                    headers={"Authorization": "Bearer " + key})
-            if st == 200:
-                n = len((json.loads(body) or {}).get("data", []))
-                return {"ok": True, "status": "ok",
-                        "summary": f"Key valid ({n} models) — $/usage on dashboard",
-                        "used": None, "limit": None, "remaining": None, "pct": None,
-                        "detail": "Cost/usage numbers need an Admin API key; open the dashboard."}
-            if st == 429:
-                return {"ok": True, "status": "warn", "summary": "429 — rate/quota limited",
-                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
-            if st == 401:
-                return {"ok": True, "status": "err", "summary": "401 — invalid/expired key",
-                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
-            return _usage_err(st, body)
-
-        if prov == "anthropic":
-            st, body, _ = _api_http("https://api.anthropic.com/v1/models",
-                                    headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
-            if st == 200:
-                n = len((json.loads(body) or {}).get("data", []))
-                return {"ok": True, "status": "ok",
-                        "summary": f"Key valid ({n} models) — $/usage on dashboard",
-                        "used": None, "limit": None, "remaining": None, "pct": None,
-                        "detail": "Cost/usage report needs an Admin API key (sk-ant-admin…)."}
-            if st == 429:
-                return {"ok": True, "status": "warn", "summary": "429 — rate/quota limited",
-                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
-            if st in (401, 403):
-                return {"ok": True, "status": "err", "summary": f"{st} — invalid/expired key",
-                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
-            return _usage_err(st, body)
-
-        if prov == "gemini":
-            st, body, _ = _api_http(
-                "https://generativelanguage.googleapis.com/v1beta/models?key=" + urllib.parse.quote(key))
-            if st == 200:
-                n = len((json.loads(body) or {}).get("models", []))
-                return {"ok": True, "status": "ok",
-                        "summary": f"Key valid ({n} models) — usage in GCP console",
-                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
-            return _usage_err(st, body)
-
-        if prov == "mistral":
-            st, body, _ = _api_http("https://api.mistral.ai/v1/models",
-                                    headers={"Authorization": "Bearer " + key})
-            if st == 200:
-                n = len((json.loads(body) or {}).get("data", []))
-                return {"ok": True, "status": "ok",
-                        "summary": f"Key valid ({n} models) — usage on dashboard",
-                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
-            return _usage_err(st, body)
-
-        if prov == "resend":
-            st, body, _ = _api_http("https://api.resend.com/domains",
-                                    headers={"Authorization": "Bearer " + key})
-            if st == 200:
-                data = (json.loads(body) or {}).get("data", [])
-                doms = ", ".join(d.get("name", "") for d in data) if isinstance(data, list) else ""
-                return {"ok": True, "status": "ok",
-                        "summary": f"Key valid — {len(data) if isinstance(data, list) else 0} domain(s)",
-                        "used": None, "limit": None, "remaining": None, "pct": None,
-                        "detail": (doms or "Free tier: 100/day · 3,000/mo")}
-            # Resend returns 400/401 for a bad key, 403 for a valid but
-            # permission-restricted (send-only) key — the latter is not an error.
-            if st in (400, 401):
-                return {"ok": True, "status": "err", "summary": f"{st} — invalid key",
-                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
-            if st == 403:
-                return {"ok": True, "status": "ok", "summary": "Key valid — restricted (send-only)",
-                        "used": None, "limit": None, "remaining": None, "pct": None,
-                        "detail": "Key lacks domains:read; used by mail relays. Free tier: 100/day · 3,000/mo"}
-            return _usage_err(st, body)
-    except Exception as e:
-        logger.debug("usage fetch failed for %s", entry.get("id"), exc_info=True)
-        return {"ok": False, "status": "err", "summary": "fetch error: " + str(e)[:120],
-                "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
-    return _usage_na()
 
 
 class ApiEntryBody(BaseModel):
@@ -4479,14 +4148,6 @@ def _apply_api_key_auth(cfg_dir: Path):
     _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
 
 
-def _subscription_token_valid() -> bool:
-    """True when the shared admin subscription token (~/.claude/.credentials.json)
-    exists and isn't expired — i.e. the Max/Pro PLAN is usable for members."""
-    try:
-        o = json.loads(SHARED_CREDENTIALS.read_text()).get("claudeAiOauth", {})
-        return bool(o) and int(o.get("expiresAt") or 0) > int(time.time() * 1000)
-    except Exception:
-        return False
 
 
 def _remove_api_key_helper(cfg_dir: Path):
@@ -5104,11 +4765,6 @@ def _sync_group_skills_into(cfg_dir: Path, group_id: str):
         logger.debug("Failed to clean retired group skill links", exc_info=True)
 
 
-def _advisor_admin_token() -> str:
-    try:
-        return ADVISOR_ADMIN_TOKEN_FILE.read_text().strip()
-    except OSError:
-        return ""
 
 
 def _advisor_live_sync_enabled() -> bool:
@@ -5980,9 +5636,7 @@ cache: dict[str, dict] = {}
 # users get ~/.tmux-dashboard/users/<id>/messages.json and notes.json.
 MESSAGES_FILE = MESSAGES_DIR / "messages.json"
 NOTES_FILE = MESSAGES_DIR / "notes.json"
-PROMPT_AUDIT_FILE = MESSAGES_DIR / "prompt-history.jsonl"
 PROMPT_AUDIT_BACKFILL_MARKER = MESSAGES_DIR / "prompt-history-backfill-v1.json"
-_prompt_audit_lock = threading.Lock()
 
 
 def _append_prompt_audit(
@@ -6084,53 +5738,8 @@ def _read_prompt_audit(
     return prompts
 
 
-_prompt_audit_summary_cache: dict = {"signature": None, "data": {}}
 
 
-def _prompt_audit_summary() -> dict[str, dict]:
-    """Count prompts by account, reusing results while the audit file is unchanged."""
-    try:
-        stat = PROMPT_AUDIT_FILE.stat()
-        signature = (stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        return {}
-    if _prompt_audit_summary_cache["signature"] == signature:
-        return {
-            key: dict(value)
-            for key, value in _prompt_audit_summary_cache["data"].items()
-        }
-
-    summary: dict[str, dict] = {}
-    with _prompt_audit_lock:
-        try:
-            with PROMPT_AUDIT_FILE.open(errors="replace") as stream:
-                for raw in stream:
-                    try:
-                        entry = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    user_id = str(entry.get("user_id", ""))
-                    if not user_id:
-                        continue
-                    row = summary.setdefault(
-                        user_id,
-                        {"count": 0, "last_ts": 0, "last_direct_ts": 0},
-                    )
-                    row["count"] += 1
-                    row["last_ts"] = max(
-                        float(row["last_ts"]),
-                        float(entry.get("ts", 0) or 0),
-                    )
-                    if not entry.get("impersonated_by_id"):
-                        row["last_direct_ts"] = max(
-                            float(row["last_direct_ts"]),
-                            float(entry.get("ts", 0) or 0),
-                        )
-        except OSError:
-            return {}
-    _prompt_audit_summary_cache["signature"] = signature
-    _prompt_audit_summary_cache["data"] = summary
-    return {key: dict(value) for key, value in summary.items()}
 
 
 @app.get("/api/admin/prompts")
@@ -6342,185 +5951,16 @@ REALTIME_TTL = 15      # 15 seconds — text extraction is cheap (no LLM call us
 NOTES_TTL = 600        # 10 minutes
 
 
-# Sessions whose pane is running Codex belong in this dashboard. Bare shells are
-# also shown so a crashed/exited Codex session can be restarted from the UI.
-_CODEX_DASH_VISIBILITY_CACHE: dict[str, tuple] = {}
-_CODEX_DASH_VISIBILITY_TTL = 5.0
-_PROCESS_TREE_CACHE: tuple[float, dict[str, list[str]], dict[str, str]] | None = None
-_PROCESS_TREE_TTL = 2.0
 
 
-def _process_tree_snapshot() -> tuple[dict[str, list[str]], dict[str, str]]:
-    """Return the process tree from one ``ps`` call, briefly cached.
-
-    The dashboard used to run ``pgrep -P`` once per descendant for every tmux
-    session. On a busy builder that meant hundreds of full /proc scans while
-    handling a single request. Build the same tree once and walk it in memory.
-    """
-    global _PROCESS_TREE_CACHE
-    now = time.monotonic()
-    cached = _PROCESS_TREE_CACHE
-    if cached and now - cached[0] < _PROCESS_TREE_TTL:
-        return cached[1], cached[2]
-
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid=,ppid=,comm="],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        if result.returncode != 0:
-            raise RuntimeError("ps failed")
-        children: dict[str, list[str]] = {}
-        commands: dict[str, str] = {}
-        for line in (result.stdout or "").splitlines():
-            parts = line.split(None, 2)
-            if len(parts) != 3:
-                continue
-            pid, parent_pid, command = parts
-            commands[pid] = command.lower()
-            children.setdefault(parent_pid, []).append(pid)
-        _PROCESS_TREE_CACHE = (now, children, commands)
-        return children, commands
-    except Exception:
-        # A stale snapshot is safer than hiding all live Codex sessions because
-        # of one transient process-table failure.
-        if cached:
-            return cached[1], cached[2]
-        return {}, {}
 
 
-# Process names that mark a tmux session as belonging to this dashboard. Claude
-# sessions were invisible while this matched only "codex", so a session started
-# with the Claude agent vanished from the list the moment its shell was replaced.
-_AGENT_PROCESS_NAMES = frozenset({"codex", "claude"})
 
 
-def _session_is_codex(name: str) -> bool:
-    """Return True if this tmux session belongs to the codex dashboard.
-
-    A codex process means show it here. A bare shell is also shown because it is
-    the state left behind after Codex exits or crashes. Other active foreground
-    programs are hidden.
-    """
-    now = time.time()
-    cached = _CODEX_DASH_VISIBILITY_CACHE.get(name)
-    if cached and now - cached[1] < _CODEX_DASH_VISIBILITY_TTL:
-        return cached[0]
-    try:
-        # Every pane in the session, not just the ACTIVE window's. The IDE adds
-        # its own terminal windows (ssh:… / local:…), and once one of those was
-        # focused this check looked at `ssh` instead of the agent and hid the
-        # whole session — every route for it then 404'd.
-        pp = subprocess.run(
-            [
-                "tmux", "list-panes", "-s", "-t", name, "-F",
-                "#{pane_pid}\t#{pane_current_command}",
-            ],
-            capture_output=True, text=True, timeout=3,
-        )
-        if pp.returncode != 0:
-            _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
-            return False
-        rows = [r for r in (pp.stdout or "").splitlines() if r.strip()]
-        if not rows:
-            _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
-            return False
-        pane_pids = []
-        pane_commands = []
-        for row in rows:
-            pid, _, command = row.strip().partition("\t")
-            if pid.isdigit():
-                pane_pids.append(pid)
-                pane_commands.append(command)
-        if not pane_pids:
-            _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
-            return False
-        children, commands = _process_tree_snapshot()
-        # Search from EVERY pane: the agent may be in a window other than the
-        # one that happens to be active.
-        to_check = list(pane_pids)
-        seen: set[str] = set()
-        has_codex = False
-        while to_check and len(seen) < 10000:
-            current = to_check.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            if commands.get(current) in _AGENT_PROCESS_NAMES:
-                has_codex = True
-                break
-            to_check.extend(children.get(current, ()))
-        shells = {"bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh"}
-        decision = has_codex or any(c.lower() in shells for c in pane_commands)
-    except Exception:
-        decision = False
-    _CODEX_DASH_VISIBILITY_CACHE[name] = (decision, now)
-    return decision
 
 
-def get_tmux_sessions() -> list[dict]:
-    try:
-        result = subprocess.run(
-            ["tmux", "list-sessions", "-F",
-             "#{session_name}:#{session_windows}:#{session_created}:#{session_attached}"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode != 0:
-            result.stdout = ""
-        sessions = []
-        for line in result.stdout.strip().split("\n"):
-            if not line:
-                continue
-            parts = line.split(":")
-            name = parts[0]
-            if name.startswith("__") and name.endswith("__"):
-                continue  # Skip internal sessions (e.g. __auth_login_tmp__)
-            if not _session_is_codex(name):
-                continue  # Hide non-Codex tmux sessions from the codex dashboard
-            sessions.append({
-                "name": name,
-                "windows": parts[1] if len(parts) > 1 else "?",
-                "created": parts[2] if len(parts) > 2 else "",
-                "attached": parts[3] == "1" if len(parts) > 3 else False,
-            })
-        live_names = {session["name"] for session in sessions}
-        lifecycle_rows = _session_lifecycle.snapshot().get("sessions", {})
-        for name, row in lifecycle_rows.items():
-            if (
-                name in live_names
-                or not row.get("parked")
-                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", str(name))
-            ):
-                continue
-            sessions.append(
-                {
-                    "name": name,
-                    "windows": "0",
-                    "created": str(int(row.get("parked_at") or 0)),
-                    "attached": False,
-                    "virtual": bool(row.get("virtual")),
-                }
-            )
-        return sessions
-    except Exception:
-        return []
 
 
-def _find_session(session_name: str) -> tuple:
-    """Look up a tmux session by name.
-
-    Returns (sessions_list, session_dict) if found, or (sessions_list, None) if not.
-    """
-    # Reject control characters and tmux target syntax before invoking tmux.
-    if not _is_valid_session_name(session_name):
-        return [], None
-    sessions = get_tmux_sessions()
-    for s in sessions:
-        if s["name"] == session_name:
-            return sessions, s
-    return sessions, None
 
 
 def _filter_sessions_for_user(sessions: list, user: dict | None) -> list:
@@ -6597,6 +6037,18 @@ _AUTONOMOUS_FORWARDED_NAMES = frozenset(
     }
 )
 
+_CODEX_CONFIG_FORWARDED_NAMES = frozenset(
+    name for name in dir(codex_config_service) if not name.startswith("__")
+)
+
+_USAGE_FORWARDED_NAMES = frozenset(
+    name for name in dir(usage_service) if not name.startswith("__")
+)
+
+_TMUX_FORWARDED_NAMES = frozenset(
+    name for name in dir(tmux_service) if not name.startswith("__")
+)
+
 _BROWSER_FORWARDED_NAMES = frozenset(
     name for name in dir(browser_service) if not name.startswith("__")
 )
@@ -6615,41 +6067,20 @@ class _AppModule(type(_sys.modules[__name__])):
             setattr(browser_service, name, value)
         if name in _AUTONOMOUS_FORWARDED_NAMES:
             setattr(autonomous_service, name, value)
+        if name in _TMUX_FORWARDED_NAMES:
+            setattr(tmux_service, name, value)
+        if name in _USAGE_FORWARDED_NAMES:
+            setattr(usage_service, name, value)
+        if name in _CODEX_CONFIG_FORWARDED_NAMES:
+            setattr(codex_config_service, name, value)
         super().__setattr__(name, value)
 
 
 _sys.modules[__name__].__class__ = _AppModule
 
 
-def capture_pane_full(session_name: str) -> str:
-    try:
-        # -J joins terminal-wrap continuation lines so long strings (e.g. OAuth
-        # login URLs) come back intact instead of split at pane width.
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", _agent_pane_target(session_name), "-p", "-J", "-S", "-"],
-            capture_output=True, text=True, timeout=10
-        )
-        return result.stdout if result.returncode == 0 else ""
-    except Exception:
-        return ""
 
 
-def capture_pane_recent(session_name: str, lines: int = 80) -> str:
-    """Recent output from the AGENT's pane.
-
-    Targeting the bare session reads whichever window is active, which becomes
-    the IDE's SSH terminal as soon as a browser terminal attaches — activity
-    detection and chat-reply capture then watched a shell instead of the agent.
-    """
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", _agent_pane_target(session_name),
-             "-p", "-J", "-S", f"-{lines}"],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.stdout if result.returncode == 0 else ""
-    except Exception:
-        return ""
 
 
 _CODEX_MODEL_LOADING_RE = re.compile(
@@ -6690,71 +6121,15 @@ async def _wait_for_codex_input_ready(
     return True
 
 
-def get_pane_width(session_name: str) -> int:
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_width}"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
-    except Exception:
-        pass
-    return 80
 
 
-def get_pane_position(session_name: str) -> dict:
-    """Get current pane line-count metadata (cheap, no content capture).
-
-    Uses history_size + pane_height (not cursor_y) so the count only changes
-    when new content actually scrolls up, not when the cursor moves within
-    the visible area (status bar updates, etc.).  This prevents false deltas
-    that cause duplicate lines in the terminal view.
-    """
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p",
-             "#{history_size}:#{pane_height}"],
-            capture_output=True, text=True, timeout=3
-        )
-        if result.returncode == 0:
-            parts = result.stdout.strip().split(":")
-            history_size = int(parts[0])
-            pane_height = int(parts[1])
-            return {"total_lines": history_size + pane_height}
-    except Exception:
-        logger.debug("Failed to get pane position for '%s'", session_name, exc_info=True)
-    return {"total_lines": 0}
 
 
 # Track auto-approve state to avoid re-triggering
 _auto_approve_sent: dict[str, float] = {}
 
-# Content stability tracking for idle detection
-# Stores (hash, first_seen_time, consecutive_count) per session
-_pane_stability: dict[str, tuple] = {}
 
-# Hysteresis for activity detection — prevents rapid busy/idle flickering.
-# Stores per session: {"status": str, "since": float, "consecutive_idle": int, "raw": str}
-_activity_state: dict[str, dict] = {}
-# Require N consecutive idle readings before switching from busy → idle.
-# At 10s polling interval, 3 readings = ~30 seconds of consistent idle signal.
-IDLE_CONFIRM_COUNT = 3
 
-# Pre-compiled regexes for activity detection (hot path — called every ~10s per session)
-_SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
-_RE_COMPLETION = re.compile(
-    r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
-    r'(?:Done|Completed|[A-Z][a-zé]+(?:ed|d)\s+for\s+\d+[hms])'
-)
-_RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
-_RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
-_RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
-_RE_THOUGHT = re.compile(r'\(thought for \d+')
-_RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
-_RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
-_RE_TIP_CODEX = re.compile(r'Tip:.*codex')
-_RE_COMPLETION_MSG = re.compile(r'[A-Z][a-zé]+ for \d+[ms]')
 
 
 _AUTONOMOUS_KEYWORDS = [
@@ -6878,263 +6253,10 @@ def _send_option(session_name: str, downs: int):
         logger.debug("Failed to send option keys to '%s'", session_name, exc_info=True)
 
 
-def _detect_activity_raw(session_name: str) -> dict:
-    """Raw single-snapshot activity detection (no debounce)."""
-    info = {"status": "unknown", "command": "", "detail": ""}
-    try:
-        # Get the foreground command and pane pid
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p",
-             "#{pane_current_command}:#{pane_pid}"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode != 0:
-            return info
-
-        parts = result.stdout.strip().split(":")
-        cmd = parts[0] if parts else ""
-        info["command"] = cmd
-
-        # Capture the very bottom of the visible pane — this is the ground truth.
-        # tmux capture-pane without -S captures just the visible area.
-        try:
-            vis = subprocess.run(
-                ["tmux", "capture-pane", "-t", _agent_pane_target(session_name), "-p"],
-                capture_output=True, text=True, timeout=5
-            )
-            visible = vis.stdout if vis.returncode == 0 else ""
-        except Exception:
-            visible = ""
-
-        # Auto-approve disabled: never type/select on the user's behalf.
-        # _check_auto_approve(session_name, visible)
-
-        all_lines = visible.split("\n")
-        # Strip trailing empty lines to find the real bottom
-        while all_lines and not all_lines[-1].strip():
-            all_lines.pop()
-
-        # Look at the bottom 6 lines to catch prompt + status bar + separators
-        bottom = all_lines[-6:] if len(all_lines) >= 6 else all_lines
-        bottom_text = "\n".join(bottom)
-
-        # --- Step 1: Check "esc to interrupt" — strongest busy signal ---
-        # This appears in Codex's status bar when a task is actively running.
-        has_esc_to_interrupt = "esc to interrupt" in bottom_text
-
-        # --- Step 2: Check for idle prompt indicators in bottom area ---
-        idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CODEX, _RE_COMPLETION_MSG]
-        # Lines containing these phrases override idle — session is still working
-        busy_overrides = [
-            "still running",
-            "agents running",
-            "waiting for completion",
-            "in progress",
-        ]
-        has_idle_prompt = False
-        for pattern in idle_prompt_patterns:
-            for line in bottom:
-                stripped = line.strip()
-                if pattern.search(stripped):
-                    # Check if the same line has a busy override
-                    lower = stripped.lower()
-                    if any(phrase in lower for phrase in busy_overrides):
-                        continue  # not truly idle
-                    has_idle_prompt = True
-                    break
-            if has_idle_prompt:
-                break
-
-        # --- Step 3: Check for active spinners/progress ---
-        # Scan a wider window (bottom 25 lines) because Codex's
-        # spinners and task indicators appear in the content area
-        # *above* the bottom chrome.  This MUST run before we return
-        # idle — the ❯ prompt is always visible even while Codex is
-        # executing tools / thinking / streaming.
-        window = all_lines[-25:] if len(all_lines) >= 25 else all_lines
-
-        # All checks are LINE-BY-LINE.  Start-of-line anchoring is used
-        # where possible to avoid false positives from these patterns
-        # appearing in conversation output text.
-        # (Regexes are pre-compiled at module level: _RE_COMPLETION, etc.)
-        for line in window:
-            stripped = line.strip()
-            # Skip completion markers — these look like spinners but mean "finished"
-            if _RE_COMPLETION.match(stripped):
-                continue
-            # ◼ at start of line (with optional ⎿ tree prefix) = running task
-            if _RE_RUNNING_TASK.match(stripped):
-                info["status"] = "busy"
-                info["detail"] = "Running task"
-                return info
-            # Spinner icon + verb… at START of line
-            if _RE_SPINNER_START.match(stripped):
-                info["status"] = "busy"
-                if '(thinking)' in stripped or 'thought for' in stripped:
-                    info["detail"] = "Thinking"
-                else:
-                    info["detail"] = "Working"
-                return info
-            # Spinner icon + verb… anywhere in line (catches inline spinners)
-            if _RE_SPINNER_INLINE.search(stripped):
-                info["status"] = "busy"
-                if '(thinking)' in stripped or 'thought for' in stripped:
-                    info["detail"] = "Thinking"
-                else:
-                    info["detail"] = "Working"
-                return info
-            # "(thought for Xs)" or "(thinking)" near end of line — strong busy signal
-            if _RE_THOUGHT.search(stripped) or stripped.endswith('(thinking)'):
-                info["status"] = "busy"
-                info["detail"] = "Thinking"
-                return info
-            # "N local agents still running" or "Waiting for completion" = busy
-            lower = stripped.lower()
-            if "still running" in lower or "waiting for completion" in lower:
-                info["status"] = "busy"
-                info["detail"] = "Agents running"
-                return info
-
-        # --- Step 4: Content stability check ---
-        # If the terminal content hasn't changed for 20+ seconds and there's no
-        # "esc to interrupt", the session is idle — real work produces output,
-        # real spinners animate.  This catches cases text patterns miss.
-        content_hash = hashlib.md5(visible.encode()).hexdigest()
-        now = time.time()
-        prev = _pane_stability.get(session_name)
-        if prev and prev[0] == content_hash:
-            # Content unchanged since last check
-            stable_since = prev[1]
-            stable_seconds = now - stable_since
-            _pane_stability[session_name] = (content_hash, stable_since, prev[2] + 1)
-        else:
-            # Content changed — reset
-            stable_seconds = 0
-            _pane_stability[session_name] = (content_hash, now, 1)
-
-        content_is_static = stable_seconds >= 20
-
-        # --- Step 5: If idle prompt + no busy signals → truly idle ---
-        if has_idle_prompt and not has_esc_to_interrupt:
-            info["status"] = "idle"
-            info["detail"] = ""
-            return info
-
-        # "esc to interrupt" without a spinner = background tasks running
-        if has_esc_to_interrupt:
-            info["status"] = "busy"
-            info["detail"] = "Background tasks"
-            return info
-
-        # --- Step 6: Static content override ---
-        # If the terminal hasn't changed in 20+ seconds and the foreground
-        # command is codex/node, it's almost certainly idle — the text-based
-        # checks above may have missed it or the output just looks ambiguous.
-        if content_is_static and cmd.lower() in ("codex", "codex", "node"):
-            info["status"] = "idle"
-            info["detail"] = ""
-            return info
-
-        # --- Step 7: Shell prompt check ---
-        last_line = bottom[-1].strip() if bottom else ""
-        shell_cmds = {"bash", "zsh", "sh", "fish", "tmux"}
-        if cmd.lower() in shell_cmds:
-            if _RE_SHELL_PROMPT.search(last_line) or not last_line:
-                info["status"] = "idle"
-                info["detail"] = "Shell prompt"
-            else:
-                info["status"] = "busy"
-                info["detail"] = cmd
-        elif cmd.lower() in ("codex", "codex", "node"):
-            # Codex with no spinner + no "esc to interrupt" = idle
-            info["status"] = "idle"
-            info["detail"] = ""
-        else:
-            info["status"] = "busy"
-            info["detail"] = cmd
-    except Exception:
-        logger.debug("Activity detection failed for session '%s'", session_name, exc_info=True)
-    return info
 
 
-def detect_activity(session_name: str) -> dict:
-    """Debounced activity detection with asymmetric hysteresis.
-
-    - busy → idle: requires IDLE_CONFIRM_COUNT consecutive idle readings (~30s)
-    - idle → busy: immediate (1 reading)
-
-    This prevents flickering when Codex briefly shows no spinner
-    between tool calls or streaming chunks.
-    """
-    raw = _detect_activity_raw(session_name)
-    now = time.time()
-    prev = _activity_state.get(session_name)
-
-    if prev is None:
-        # First reading — accept as-is
-        _activity_state[session_name] = {
-            "status": raw["status"],
-            "since": now,
-            "consecutive_idle": 1 if raw["status"] == "idle" else 0,
-            "raw": raw,
-        }
-        return raw
-
-    if raw["status"] == "busy":
-        # Busy is always accepted immediately — reset idle counter
-        _activity_state[session_name] = {
-            "status": "busy",
-            "since": now if prev["status"] != "busy" else prev["since"],
-            "consecutive_idle": 0,
-            "raw": raw,
-        }
-        return raw
-
-    if raw["status"] in ("idle", "unknown"):
-        if prev["status"] == "busy":
-            # Trying to transition busy → idle: increment counter but hold busy
-            idle_count = prev["consecutive_idle"] + 1
-            if idle_count >= IDLE_CONFIRM_COUNT:
-                # Enough consecutive idle readings — confirm transition
-                _activity_state[session_name] = {
-                    "status": raw["status"],
-                    "since": now,
-                    "consecutive_idle": idle_count,
-                    "raw": raw,
-                }
-                return raw
-            else:
-                # Not enough yet — stay busy but record the idle reading
-                _activity_state[session_name] = {
-                    "status": "busy",
-                    "since": prev["since"],
-                    "consecutive_idle": idle_count,
-                    "raw": prev["raw"],  # keep last busy details
-                }
-                return prev["raw"]
-        else:
-            # Already idle/unknown — stay idle, keep counting
-            _activity_state[session_name] = {
-                "status": raw["status"],
-                "since": prev["since"],
-                "consecutive_idle": prev["consecutive_idle"] + 1,
-                "raw": raw,
-            }
-            return raw
-
-    # Fallback
-    _activity_state[session_name] = {
-        "status": raw["status"],
-        "since": now,
-        "consecutive_idle": 0,
-        "raw": raw,
-    }
-    return raw
 
 
-async def async_detect_activity(session_name: str) -> dict:
-    """Non-blocking detect_activity — runs in thread pool to avoid blocking the event loop."""
-    return await asyncio.to_thread(detect_activity, session_name)
 
 
 async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200,
@@ -7308,24 +6430,8 @@ async def get_notes(session_name: str, full_output: str, existing_notes: str = "
     )
 
 
-# Pane furniture that reads as prose but is not: a COLLAPSED tool block still
-# starts with `●` and carries no recognisable `Tool(` prefix, so "Called advisor
-# (ctrl+o to expand)" and "Made 1 edit +108 (ctrl+o to expand)" used to land in
-# the Chat tab as if the agent had said them. The `(ctrl+o to expand)` suffix is
-# the reliable tell — Claude Code only prints it on collapsible tool output.
-_PANE_RESIDUE_RE = re.compile(
-    r"\(ctrl\s*\+?\s*o\s+to\s+(expand|view\s+transcript)\)\s*$"
-    r"|^(?:…|\.\.\.)?\s*\+\d+\s+lines?\b"
-    r"|^Shell cwd was reset\b"
-    r"|^Background command\b.*\b(completed|failed)\b"
-    r"|^(Running|Thinking|Working)…?\s*$",
-    re.I,
-)
 
 
-def _is_pane_residue(s: str) -> bool:
-    s = (s or "").strip()
-    return bool(s) and bool(_PANE_RESIDUE_RE.search(s))
 
 
 # Agent CLIs draw their prompt and message bullets with different glyphs across
@@ -8178,23 +7284,6 @@ async def api_raw_output(session_name: str):
     })
 
 
-def _visible_pane_hash(session_name: str) -> str:
-    """Cheap fingerprint of the visible tmux pane (alternate-screen aware).
-
-    capture-pane without -S only returns the visible area, which Codex
-    redraws into via its TUI even when history_size never grows. We hash that
-    so the client can detect TUI redraws as content changes.
-    """
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", _agent_pane_target(session_name), "-p"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if result.returncode == 0:
-            return hashlib.md5(result.stdout.encode("utf-8", "replace")).hexdigest()
-    except Exception:
-        logger.debug("Failed to hash visible pane for '%s'", session_name, exc_info=True)
-    return ""
 
 
 @app.get("/api/sessions/{session_name}/raw-tail")
@@ -8514,17 +7603,6 @@ def _session_has_autonomous_work(session_name: str) -> bool:
     return bool(saved.get("away_mode") or saved.get("go_nuts_mode"))
 
 
-def _pane_is_dead(session_name: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_dead}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return result.returncode == 0 and (result.stdout or "").strip() == "1"
-    except Exception:
-        return False
 
 
 def _archive_tmux_scrollback(session_name: str) -> str:
@@ -9461,18 +8539,6 @@ async def api_delete_session(request: Request, session_name: str):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-def get_session_cwd(session_name: str) -> str:
-    """Get the current working directory of a tmux session's active pane."""
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_current_path}"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        logger.debug("Failed to get CWD for session '%s'", session_name, exc_info=True)
-    return ""
 
 
 UPLOADS_DIR = MESSAGES_DIR / "uploads"
@@ -9670,6 +8736,19 @@ def _session_config_base(session_name: str) -> Path:
     if owner and not _is_admin(owner):
         return _user_codex_config_dir(owner)
     return CODEX_HOME
+
+
+# Wire services/usage.py once its helpers exist. AUTH_SECRET and DEFAULT_MODEL
+# are passed as current values here and kept in step by the module-level
+# attribute forwarding below, which is what tests patch through.
+usage_service.configure(
+    _api_http=_api_http,
+    _iter_prompt_audit_reverse=_iter_prompt_audit_reverse,
+    _session_config_base=_session_config_base,
+    _user_codex_config_dir=_user_codex_config_dir,
+    AUTH_SECRET=AUTH_SECRET,
+    DEFAULT_MODEL=DEFAULT_MODEL,
+)
 
 
 def _session_memory_dir(session_name: str) -> tuple[Path, str]:
@@ -10326,8 +9405,6 @@ async def api_list_builtin_skills():
 # All sessions use their owner's one CODEX_HOME, with no per-session config mapping.
 
 
-def _toml_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _backup_before_dashboard_write(path: Path):
@@ -10355,47 +9432,6 @@ browser_service.configure(
 )
 
 
-def _merge_top_level_toml_keys(existing: str, managed: dict) -> str:
-    """Merge dashboard-managed top-level TOML keys without touching sections."""
-    managed_keys = ("model", "model_reasoning_effort", "sandbox_mode", "approval_policy")
-    updates = {key: str(managed[key]) for key in managed_keys if managed.get(key)}
-    if not updates:
-        return existing if existing.endswith("\n") else existing + "\n"
-
-    def render_line(key: str) -> str:
-        return f'{key} = "{_toml_escape(updates[key])}"'
-
-    out: list[str] = []
-    written: set[str] = set()
-    in_section = False
-    inserted_before_sections = False
-    for line in existing.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            if not inserted_before_sections:
-                for key in managed_keys:
-                    if key in updates and key not in written:
-                        out.append(render_line(key))
-                        written.add(key)
-                inserted_before_sections = True
-            in_section = True
-            out.append(line)
-            continue
-        if not in_section and "=" in stripped and not stripped.startswith("#"):
-            key = stripped.split("=", 1)[0].strip()
-            if key in updates:
-                out.append(render_line(key))
-                written.add(key)
-                continue
-        out.append(line)
-    if not inserted_before_sections:
-        if out and out[-1].strip():
-            out.append("")
-        for key in managed_keys:
-            if key in updates and key not in written:
-                out.append(render_line(key))
-                written.add(key)
-    return "\n".join(out).rstrip() + "\n"
 
 
 def _ensure_codex_project_trust(existing: str, project_dir: str) -> str:
@@ -12070,21 +11106,6 @@ def _build_proc_tree() -> tuple:
     return children, comm
 
 
-def _all_pane_pids_by_session() -> dict:
-    """One `tmux list-panes -a` call -> {session_name: [pane_pid, ...]}."""
-    m: dict = {}
-    try:
-        res = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_pid}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in (res.stdout or "").splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                m.setdefault(parts[0], []).append(parts[1])
-    except Exception:
-        pass
-    return m
 
 
 def _claude_pids_under(roots, children: dict, comm: dict) -> list:
@@ -12270,9 +11291,6 @@ def _auth_admin_ok(request: Request) -> bool:
     return bool(user and _is_admin(user))
 
 
-def _load_longlived_token() -> str:
-    """Compatibility shim for retired Claude browser-auth paths."""
-    return ""
 
 
 def _codex_auth_status_dict(codex_home: Path = CODEX_HOME) -> dict:
@@ -12901,14 +11919,6 @@ _AUTO_AUTH_MAX_FAILS = 2
 _pending_auth: dict = {}
 
 
-def _pane_text(session_name: str, lines: int = 60) -> str:
-    """Pane text with wrapped lines joined (-J), so a long URL is captured whole."""
-    try:
-        return subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-J", "-S", f"-{lines}"],
-            capture_output=True, text=True, timeout=10).stdout or ""
-    except Exception:
-        return ""
 
 
 async def _send_line(session_name: str, text: str):
@@ -14028,340 +13038,27 @@ async def api_codex_usage():
     return JSONResponse(data)
 
 
-def _parse_usage_file(path: str | Path, date_prefix: str) -> tuple[int, int, int, int, int]:
-    """Parse one Codex rollout's token deltas and assistant-message count.
-
-    ``token_count`` events contain both cumulative totals and the last turn's
-    delta; only ``last_token_usage`` is summed so repeated snapshots do not
-    inflate usage.
-    """
-    input_tok = output_tok = cache_read = reasoning_tok = msg_count = 0
-    with open(path) as stream:
-        for line in stream:
-            try:
-                event = json.loads(line)
-            except Exception:
-                continue
-            if not str(event.get("timestamp", "")).startswith(date_prefix):
-                continue
-            if event.get("type") != "event_msg":
-                continue
-            payload = event.get("payload", {}) or {}
-            if payload.get("type") == "agent_message":
-                msg_count += 1
-                continue
-            if payload.get("type") != "token_count":
-                continue
-            last = (payload.get("info", {}) or {}).get("last_token_usage", {}) or {}
-            input_tok += int(last.get("input_tokens", 0) or 0)
-            output_tok += int(last.get("output_tokens", 0) or 0)
-            cache_read += int(last.get("cached_input_tokens", 0) or 0)
-            reasoning_tok += int(last.get("reasoning_output_tokens", 0) or 0)
-    return input_tok, output_tok, cache_read, reasoning_tok, msg_count
 
 
 _stats_usage_cache: dict = {"ts": 0, "data": {}}
 
-def _estimate_cost(inp: int, out: int, cr: int, cc: int, model: str) -> float:
-    """Estimate cost in USD from one turn's Codex token counts.
-
-    Delegates to :func:`_codex_turn_cost` so every usage view on the dashboard
-    prices a turn the same way. ``cc`` (reasoning output) is accepted for the
-    callers that still pass it but deliberately ignored: it is a subset of
-    ``out``, so adding it again charged reasoning twice.
-    """
-    return _codex_turn_cost(inp, out, cr, model)
 
 
 _user_usage_cache: dict = {"ts": 0, "data": {}}
 
 
-def _prompt_counts_by_user(cutoffs: dict[str, float]) -> dict[str, dict[str, int]]:
-    """Count audited human prompts per account for each named time window."""
-    counts: dict[str, dict[str, int]] = {}
-    oldest = min(cutoffs.values()) if cutoffs else 0
-    # Scanned in full rather than stopping at the first old record: the audit is
-    # append-only in real time, but `_backfill_prompt_audit` appends historical
-    # rows, so the file is not reliably sorted. It is one line per human prompt,
-    # so a full pass is cheap and the result is cached for two minutes anyway.
-    for entry in _iter_prompt_audit_reverse() or ():
-        timestamp = float(entry.get("ts") or 0)
-        if timestamp < oldest:
-            continue
-        user_id = str(entry.get("user_id") or "")
-        if not user_id:
-            continue
-        row = counts.setdefault(user_id, {key: 0 for key in cutoffs})
-        for window, cutoff in cutoffs.items():
-            if timestamp >= cutoff:
-                row[window] += 1
-    return counts
 
 
-def _codex_turn_cost(inp: int, out: int, cached: int, model: str) -> float:
-    """List-price estimate for one Codex turn.
-
-    ``cached_input_tokens`` is a SUBSET of ``input_tokens`` and
-    ``reasoning_output_tokens`` a subset of ``output_tokens`` — Codex's own
-    ``total_tokens`` is exactly ``input + output``. So the cached part is billed
-    at the cache rate and only the remainder at the full input rate; reasoning
-    is already inside ``output`` and must not be added again.
-    """
-    rate_in, rate_out, rate_cached = 1.25, 10.0, 0.125
-    name = (model or "").lower()
-    if "o3" in name and "mini" not in name:
-        rate_in, rate_out, rate_cached = 2.0, 8.0, 0.5
-    elif any(tag in name for tag in ("o3-mini", "o4-mini", "gpt-5-mini", "gpt-5.4-mini")):
-        rate_in, rate_out, rate_cached = 0.25, 2.0, 0.025
-    elif "gpt-4o-mini" in name:
-        rate_in, rate_out, rate_cached = 0.15, 0.6, 0.075
-    elif "gpt-4o" in name:
-        rate_in, rate_out, rate_cached = 2.5, 10.0, 1.25
-    fresh = max(0, inp - cached)
-    return (fresh * rate_in + cached * rate_cached + out * rate_out) / 1e6
 
 
-_rollout_lifetime_cache: dict[str, dict] = {}
 
 
-def _iter_jsonl_reverse(path: Path, chunk_size: int = 64 * 1024):
-    """Yield a JSONL file's raw lines newest-first without loading it in memory."""
-    with path.open("rb") as stream:
-        stream.seek(0, os.SEEK_END)
-        position = stream.tell()
-        carry = b""
-        while position > 0:
-            size = min(chunk_size, position)
-            position -= size
-            stream.seek(position)
-            parts = (stream.read(size) + carry).split(b"\n")
-            carry = parts[0]
-            for raw in reversed(parts[1:]):
-                if raw:
-                    yield raw
-        if carry:
-            yield carry
 
 
-def _rollout_lifetime_usage(path: str | Path) -> dict[str, int]:
-    """Read one rollout's final cumulative token counter efficiently.
-
-    Codex writes ``total_token_usage`` as a running total alongside every turn
-    delta. The newest counter is therefore the rollout's lifetime total. Reading
-    backward avoids rescanning very large transcripts merely to show an all-time
-    figure. Old-format rollouts without a cumulative counter fall back to summing
-    their deltas once.
-    """
-    rollout = Path(path)
-    blank = {
-        "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
-        "reasoningTokens": 0, "totalTokens": 0,
-    }
-    try:
-        stat = rollout.stat()
-    except OSError:
-        return blank
-    signature = (stat.st_mtime_ns, stat.st_size)
-    key = str(rollout)
-    cached = _rollout_lifetime_cache.get(key)
-    if cached and cached.get("signature") == signature:
-        return dict(cached["usage"])
-
-    usage = None
-    try:
-        for raw in _iter_jsonl_reverse(rollout):
-            if b'"token_count"' not in raw:
-                continue
-            try:
-                event = json.loads(raw)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if event.get("type") != "event_msg":
-                continue
-            payload = event.get("payload") or {}
-            if payload.get("type") != "token_count":
-                continue
-            total = (payload.get("info") or {}).get("total_token_usage") or {}
-            if not total:
-                continue
-            try:
-                inp = int(total.get("input_tokens") or 0)
-                out = int(total.get("output_tokens") or 0)
-                cached_input = int(total.get("cached_input_tokens") or 0)
-                reasoning = int(total.get("reasoning_output_tokens") or 0)
-            except (TypeError, ValueError):
-                continue
-            usage = {
-                "inputTokens": inp,
-                "outputTokens": out,
-                "cacheReadTokens": cached_input,
-                "reasoningTokens": reasoning,
-                "totalTokens": inp + out,
-            }
-            break
-    except OSError:
-        return blank
-
-    if usage is None:
-        try:
-            inp, out, cached_input, reasoning, _ = _parse_usage_file(rollout, "")
-            usage = {
-                "inputTokens": inp,
-                "outputTokens": out,
-                "cacheReadTokens": cached_input,
-                "reasoningTokens": reasoning,
-                "totalTokens": inp + out,
-            }
-        except OSError:
-            usage = blank
-
-    _rollout_lifetime_cache[key] = {"signature": signature, "usage": dict(usage)}
-    if len(_rollout_lifetime_cache) > 2048:
-        _rollout_lifetime_cache.pop(next(iter(_rollout_lifetime_cache)), None)
-    return dict(usage)
 
 
-def _token_usage_for_home(codex_home: Path, cutoffs: dict[str, str]) -> dict[str, dict]:
-    """Sum a CODEX_HOME's rollout token deltas into each named time window.
-
-    ``token_count`` events carry both a running total and that turn's delta;
-    only ``last_token_usage`` is summed so repeated snapshots cannot inflate the
-    figures. Cutoffs are ISO-8601 strings compared against each record's own
-    timestamp, so a thread spanning midnight lands in the right day.
-
-    The reserved ``all`` window uses each rollout's final cumulative counter,
-    which avoids rescanning multi-hundred-megabyte transcripts. Other windows
-    sum timestamped deltas. ``totalTokens`` is ``input + output``, matching
-    Codex's own ``total_tokens``; cached input and reasoning output are reported
-    alongside as subsets, never added on top.
-    """
-    blank = {
-        "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
-        "reasoningTokens": 0, "totalTokens": 0, "turns": 0, "estimatedCost": 0.0,
-    }
-    totals = {window: dict(blank) for window in cutoffs}
-    sessions_dir = codex_home / "sessions"
-    if not sessions_dir.exists():
-        return totals
-    active_cutoffs = {
-        window: cutoff for window, cutoff in cutoffs.items() if window != "all"
-    }
-    oldest = min(active_cutoffs.values()) if active_cutoffs else ""
-    for path in sessions_dir.rglob("rollout-*.jsonl"):
-        try:
-            if "all" in totals:
-                lifetime = _rollout_lifetime_usage(path)
-                for field in (
-                    "inputTokens", "outputTokens", "cacheReadTokens",
-                    "reasoningTokens", "totalTokens",
-                ):
-                    totals["all"][field] += lifetime[field]
-            if not active_cutoffs:
-                continue
-            # Cheap skip: a file untouched since before the widest window can
-            # hold nothing inside it.
-            mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-            if mtime.isoformat() < oldest:
-                continue
-            model = DEFAULT_MODEL
-            with open(path, errors="replace") as stream:
-                for line in stream:
-                    try:
-                        event = json.loads(line)
-                    except Exception:
-                        continue
-                    if event.get("type") == "turn_context":
-                        model = (event.get("payload") or {}).get("model") or model
-                        continue
-                    if event.get("type") != "event_msg":
-                        continue
-                    payload = event.get("payload") or {}
-                    if payload.get("type") != "token_count":
-                        continue
-                    timestamp = str(event.get("timestamp") or "")
-                    last = (payload.get("info") or {}).get("last_token_usage") or {}
-                    inp = int(last.get("input_tokens") or 0)
-                    out = int(last.get("output_tokens") or 0)
-                    cached = int(last.get("cached_input_tokens") or 0)
-                    reasoning = int(last.get("reasoning_output_tokens") or 0)
-                    if not (inp or out):
-                        continue
-                    cost = _codex_turn_cost(inp, out, cached, model)
-                    for window, cutoff in active_cutoffs.items():
-                        if timestamp < cutoff:
-                            continue
-                        bucket = totals[window]
-                        bucket["inputTokens"] += inp
-                        bucket["outputTokens"] += out
-                        bucket["cacheReadTokens"] += cached
-                        bucket["reasoningTokens"] += reasoning
-                        bucket["totalTokens"] += inp + out
-                        bucket["turns"] += 1
-                        bucket["estimatedCost"] += cost
-        except Exception:
-            logger.debug("Failed to parse rollout '%s' for usage", path, exc_info=True)
-    for bucket in totals.values():
-        bucket["estimatedCost"] = round(bucket["estimatedCost"], 2)
-    return totals
 
 
-def _usage_by_account() -> dict:
-    """Prompts and tokens per dashboard account, including retained history."""
-    now_dt = datetime.now(timezone.utc)
-    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_start = now_dt - timedelta(days=7)
-    ts_cutoffs = {"today": today_start.timestamp(), "week": week_start.timestamp()}
-    iso_cutoffs = {
-        "today": today_start.isoformat(), "week": week_start.isoformat(), "all": "",
-    }
-
-    prompt_counts = _prompt_counts_by_user(ts_cutoffs)
-    prompt_totals = _prompt_audit_summary()
-    rows = []
-    totals = {
-        "promptsToday": 0, "promptsWeek": 0, "promptsTotal": 0,
-        "tokensToday": 0, "tokensWeek": 0, "tokensTotal": 0,
-        "costToday": 0.0, "costWeek": 0.0,
-    }
-    for user in _load_users():
-        if not user:
-            continue
-        user_id = str(user.get("id") or "")
-        tokens = _token_usage_for_home(_user_codex_config_dir(user), iso_cutoffs)
-        prompts = prompt_counts.get(user_id, {"today": 0, "week": 0})
-        row = {
-            "user_id": user_id,
-            "username": str(user.get("username") or ""),
-            "role": str(user.get("role") or "user"),
-            "promptsToday": prompts.get("today", 0),
-            "promptsWeek": prompts.get("week", 0),
-            "promptsTotal": int((prompt_totals.get(user_id) or {}).get("count") or 0),
-            "today": tokens["today"],
-            "week": tokens["week"],
-            "all": tokens["all"],
-        }
-        rows.append(row)
-        totals["promptsToday"] += row["promptsToday"]
-        totals["promptsWeek"] += row["promptsWeek"]
-        totals["promptsTotal"] += row["promptsTotal"]
-        totals["tokensToday"] += tokens["today"]["totalTokens"]
-        totals["tokensWeek"] += tokens["week"]["totalTokens"]
-        totals["tokensTotal"] += tokens["all"]["totalTokens"]
-        totals["costToday"] += tokens["today"]["estimatedCost"]
-        totals["costWeek"] += tokens["week"]["estimatedCost"]
-    totals["costToday"] = round(totals["costToday"], 2)
-    totals["costWeek"] = round(totals["costWeek"], 2)
-    rows.sort(
-        key=lambda row: (row["week"]["totalTokens"], row["promptsWeek"]),
-        reverse=True,
-    )
-    return {
-        "generatedAt": now_dt.timestamp(),
-        "todayStart": today_start.isoformat(),
-        "weekStart": week_start.isoformat(),
-        "users": rows,
-        "totals": totals,
-    }
 
 
 @app.get("/api/stats/usage-by-user")
@@ -14578,7 +13275,6 @@ async def api_stats_usage():
 
 # --- Per-session token stats & rate tracking ---
 
-_session_stats_cache: dict[str, dict] = {}
 _session_model_cache: dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
 # Model switches requested via the header dropdown, not yet confirmed by the
 # transcript (the JSONL only shows the new model on the NEXT assistant reply).
@@ -14663,226 +13359,8 @@ def _get_session_model(session_name: str) -> str:
     return model
 
 
-def _find_session_jsonl_files(session_name: str) -> list:
-    """Find codex rollout JSONL files whose recorded cwd matches the tmux session's cwd.
-
-    Codex sessions are stored at ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
-    and the cwd is recorded in the session_meta event at line 1.
-    """
-    cwd = get_session_cwd(session_name)
-    if not cwd:
-        return []
-    cwd_norm = cwd.rstrip("/")
-    sessions_home = _session_config_base(session_name)
-    sessions_dir = sessions_home / "sessions"
-    if not sessions_dir.exists():
-        return []
-    matches = []
-    # Look back up to 30 days for performance.
-    for fpath in sessions_dir.rglob("rollout-*.jsonl"):
-        try:
-            mtime = fpath.stat().st_mtime
-            if time.time() - mtime > 30 * 86400:
-                continue
-            with open(fpath) as f:
-                first = f.readline()
-            if not first:
-                continue
-            try:
-                meta = json.loads(first)
-            except Exception:
-                continue
-            if meta.get("type") != "session_meta":
-                continue
-            mcwd = (meta.get("payload", {}) or {}).get("cwd", "").rstrip("/")
-            if mcwd == cwd_norm:
-                matches.append(str(fpath))
-        except Exception:
-            logger.debug("Failed to peek rollout %s", fpath, exc_info=True)
-    return matches
 
 
-def _parse_session_stats(session_name: str) -> dict:
-    """Parse JSONL files and compute per-session token stats with rate tracking."""
-    now = time.time()
-    cached = _session_stats_cache.get(session_name)
-    if cached and now - cached.get("_ts", 0) < 15:
-        return cached
-
-    files = _find_session_jsonl_files(session_name)
-    if not files:
-        result = {"available": False, "_ts": now}
-        _session_stats_cache[session_name] = result
-        return result
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    now_epoch = now
-
-    # Collect all assistant messages with usage from today
-    entries = []  # (epoch_seconds, input_tok, output_tok, cache_read, cache_create, model)
-    total_input = 0
-    total_output = 0
-    total_cache_read = 0
-    total_cache_create = 0
-    msg_count = 0
-    models_seen = {}
-    latest_model = "unknown"  # Track the most recently used model
-    latest_model_ts = ""
-    latest_input_tokens = 0
-    latest_context_tokens = 0
-    latest_context_window = 0
-    estimated_cost = 0.0
-
-    for fpath in files:
-        try:
-            mtime = os.path.getmtime(fpath)
-            if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
-                continue
-            current_model = _CODEX_DEFAULT_MODEL
-            with open(fpath) as f:
-                for line in f:
-                    d = json.loads(line)
-                    if d.get("type") == "turn_context":
-                        current_model = d.get("payload", {}).get("model") or current_model
-                        continue
-                    if d.get("type") != "event_msg":
-                        continue
-                    payload = d.get("payload", {}) or {}
-                    if payload.get("type") != "token_count":
-                        continue
-                    ts_str = d.get("timestamp", "")
-                    if not ts_str.startswith(today):
-                        continue
-                    usage = (payload.get("info", {}) or {}).get("last_token_usage", {}) or {}
-                    if not usage:
-                        continue
-                    info = payload.get("info", {}) or {}
-                    inp = usage.get("input_tokens", 0)
-                    out = usage.get("output_tokens", 0)
-                    cr = usage.get("cached_input_tokens", 0)
-                    cc = usage.get("reasoning_output_tokens", 0)
-                    model = current_model
-
-                    total_input += inp
-                    total_output += out
-                    total_cache_read += cr
-                    total_cache_create += cc
-                    msg_count += 1
-                    models_seen[model] = models_seen.get(model, 0) + 1
-                    estimated_cost += _estimate_cost(inp, out, cr, cc, model)
-                    if ts_str >= latest_model_ts:
-                        latest_model_ts = ts_str
-                        latest_model = model
-                        latest_input_tokens = int(usage.get("input_tokens", 0) or 0)
-                        total_usage = info.get("total_token_usage", {}) or {}
-                        latest_context_tokens = int(total_usage.get("total_tokens", 0) or 0)
-                        latest_context_window = int(info.get("model_context_window", 0) or 0)
-
-                    # Parse timestamp to epoch for rate calc
-                    try:
-                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        epoch = dt.timestamp()
-                        entries.append((epoch, inp, out, cr, cc))
-                    except Exception:
-                        logger.debug("Failed to parse timestamp in stats JSONL entry", exc_info=True)
-        except Exception:
-            logger.debug("Failed to read stats JSONL for '%s'", session_name, exc_info=True)
-
-    if not entries:
-        result = {"available": False, "_ts": now}
-        _session_stats_cache[session_name] = result
-        return result
-
-    # Sort by timestamp
-    entries.sort(key=lambda e: e[0])
-
-    # Use the most recently used model for display (cost was accumulated per event).
-    primary_model = latest_model if latest_model != "unknown" else (max(models_seen, key=models_seen.get) if models_seen else "unknown")
-
-    # Rate calculation: bucket into 1-minute windows
-    # Only consider windows with meaningful output (> 10 output tokens = actually streaming)
-    buckets = {}  # minute_epoch -> {input, output, total}
-    for epoch, inp, out, cr, cc in entries:
-        minute = int(epoch // 60) * 60
-        b = buckets.setdefault(minute, {"input": 0, "output": 0, "total": 0})
-        b["input"] += inp
-        b["output"] += out
-        b["total"] += inp + out
-
-    # Active minutes: only windows with meaningful output (streaming, not just tool calls)
-    active_minutes = [m for m, b in buckets.items() if b["output"] > 10]
-    active_minutes.sort()
-
-    # Peak rate: median of top 5 windows (avoid outlier spikes)
-    output_rates = sorted([b["output"] for b in buckets.values() if b["output"] > 10], reverse=True)
-    peak_output_rate = 0
-    if output_rates:
-        top = output_rates[:5]
-        peak_output_rate = top[len(top) // 2]  # median of top 5
-
-    # Recent rate: last 3 active minutes within the past 10 minutes
-    recent_output_rate = 0
-    cutoff = now_epoch - 600  # 10 minutes ago
-    recent_active = [m for m in active_minutes if m >= cutoff]
-    if recent_active:
-        recent_mins = recent_active[-3:]
-        recent_output_rate = int(sum(buckets[m]["output"] for m in recent_mins) / len(recent_mins))
-
-    # Rate limit detection: only meaningful when session is currently busy
-    # and has recent activity (within last 5 minutes)
-    rate_status = "normal"
-    rate_pct = 100
-    activity = detect_activity(session_name)
-    is_busy = activity["status"] == "busy"
-    has_recent = recent_active and (now_epoch - recent_active[-1]) < 300
-
-    if peak_output_rate > 100 and recent_output_rate > 0 and has_recent:
-        rate_pct = min(100, int(recent_output_rate / peak_output_rate * 100))
-        if is_busy and rate_pct < 30:
-            rate_status = "severely_limited"
-        elif is_busy and rate_pct < 60:
-            rate_status = "limited"
-    elif not has_recent:
-        rate_pct = 0  # no recent data
-
-    # Time since last activity
-    last_active = entries[-1][0] if entries else 0
-    secs_since_last = int(now_epoch - last_active) if last_active else -1
-
-    # Session duration (first to last entry)
-    session_start = entries[0][0]
-    session_duration_min = int((entries[-1][0] - session_start) / 60) if len(entries) > 1 else 0
-
-    result = {
-        "available": True,
-        "model": primary_model,
-        "messageCount": msg_count,
-        "totalInput": total_input,
-        "totalOutput": total_output,
-        "cacheRead": total_cache_read,
-        "cacheCreate": total_cache_create,
-        "totalTokens": total_input + total_output,
-        "estimatedCost": round(estimated_cost, 4),
-        "peakOutputRate": peak_output_rate,  # tokens/min
-        "peakTotalRate": peak_output_rate,
-        "recentOutputRate": recent_output_rate,
-        "recentTotalRate": recent_output_rate,
-        "rateStatus": rate_status,  # normal | limited | severely_limited
-        "ratePct": rate_pct,
-        "activeMinutes": len(active_minutes),
-        "sessionDurationMin": session_duration_min,
-        "secsSinceLastActivity": secs_since_last,
-        "modelsUsed": models_seen,
-        "contextPct": (
-            round(latest_context_tokens / latest_context_window * 100, 1)
-            if latest_context_window else 0
-        ),
-        "lastInputTokens": latest_input_tokens,
-        "ctxWindowSize": latest_context_window,
-        "_ts": now,
-    }
-    _session_stats_cache[session_name] = result
-    return result
 
 
 @app.get("/api/sessions/{session_name}/stats")
@@ -15547,64 +14025,6 @@ _AUTO_RESPOND_COOLDOWN = 10     # min seconds between auto-responds per session
 _auto_respond_log: list = []    # recent auto-respond events (for debugging)
 
 
-def _detect_interactive_prompt(visible_text: str) -> str | None:
-    """Check if visible terminal shows a Codex interactive prompt.
-
-    Returns a description of the detected prompt, or None.
-
-    SAFETY: We require the ❯ cursor to sit DIRECTLY on a numbered option
-    line (e.g. "❯ 1. Yes"). If ❯ is followed by free text (e.g.
-    "❯ test it in the browser") that is the user input prompt, not a
-    selection — Enter would submit that text instead of selecting an option,
-    which is the "phantom message" bug we must avoid.
-    """
-    lines = visible_text.strip().split("\n")
-    last_25 = lines[-25:]
-    text = "\n".join(last_25)
-
-    # Must have the ❯ selection cursor
-    if "\u276f" not in text and "❯" not in text:
-        return None
-
-    # Count lines that look like numbered options: "  1. text" or "❯ 1. text"
-    numbered = 0
-    has_selector_on_option = False
-    selector_followed_by_text = False
-    for line in last_25:
-        stripped = line.strip()
-        if re.match(r"^[❯\u276f\s]*\d+\.\s", stripped):
-            numbered += 1
-        if re.match(r"^❯\s*\d+\.", stripped) or re.match(r"^\u276f\s*\d+\.", stripped):
-            has_selector_on_option = True
-        # ❯ followed by non-numeric text = user input prompt with text waiting.
-        # Enter on this would submit that text — never auto-fire here.
-        if re.match(r"^[❯\u276f]\s+\S", stripped) and not re.match(r"^[❯\u276f]\s*\d+\.", stripped):
-            selector_followed_by_text = True
-
-    # Bail if cursor is in the user input box with text waiting.
-    if selector_followed_by_text and not has_selector_on_option:
-        return None
-
-    # Strong signal: specific Codex prompt keywords
-    strong_keywords = [
-        "bypass permissions",
-        "manually approve edits",
-        "shift+tab to approve",
-        "Would you like to proceed",
-        "approve with this feedback",
-    ]
-    has_strong = any(kw in text for kw in strong_keywords)
-
-    # Plan approval / permission prompt — keyword AND cursor on a numbered
-    # option, so Enter selects an option and never submits free text.
-    if has_strong and has_selector_on_option and numbered >= 2:
-        return "plan_approval"
-
-    # Generic Codex selection prompt: ❯ on a numbered option + 2+ options
-    if has_selector_on_option and numbered >= 2:
-        return "selection_prompt"
-
-    return None
 
 
 _MENU_PICK_SYSTEM_PROMPT = (
@@ -16238,77 +14658,17 @@ _CRASH_RECOVERY_MAX_TRANSCRIPT = 60_000_000   # don't scan transcripts larger th
 _crash_recovery_state: dict[str, dict] = {}
 _seen_claude_running: set = set()       # sessions observed running Codex this process
 
-# Crash signatures that mean Codex (node) died and the pane fell back to a shell.
-# Only ever evaluated once the pane is already a bare shell, so false positives are
-# very unlikely. libc/kernel messages are matched as exact-case substrings (NOT
-# anchored to line-end) because on an OOM the "Aborted" is printed OVER leftover
-# TUI text — e.g. it lands mid-line as "Abortedn GRPO…" when Codex's alternate
-# screen wasn't cleared. Case-sensitivity still avoids matching a lowercase
-# "aborted"/"killed" sitting in prose above the shell.
-_CRASH_SIGNATURE_RE = re.compile(
-    r"Aborted|Killed|Segmentation fault|Bus error|"
-    r"Trace/breakpoint trap|Floating point exception|core dumped"
-)
-# V8 / out-of-memory death throes (case-insensitive).
-_CRASH_OOM_RE = re.compile(
-    r"JavaScript heap out of memory|Reached heap limit"
-    r"|FATAL ERROR:[^\n]*(?:heap|memory|allocation)"
-    r"|<--- Last few GCs --->|out of memory",
-    re.I,
-)
 
 
-# Codex also dies *before* the TUI ever draws: a config.toml Codex refuses to
-# load, a rejected credential, an unknown CLI flag. None of those print an
-# OOM/SIGABRT signature, so the two matchers above never fired and the pane sat
-# at a bare shell until a human noticed — the "logged out into the terminal"
-# report. These are the startup failures worth recovering from.
-_CODEX_START_FAILURE_RE = re.compile(
-    r"failed to load configuration"
-    r"|error loading config\.toml"
-    r"|invalid transport"
-    r"|unexpected argument|unknown option|unrecognized option"
-    r"|codex: command not found|command not found: codex"
-    r"|not logged in|please run\s+`?codex login`?|run `?codex login`?"
-    r"|401 unauthorized|invalid_grant|missing required tokens",
-    re.I,
-)
-
-# The dashboard's own launch line, as it stays in the pane's scrollback. Seeing
-# it while no Codex process is alive and the pane is a bare shell means the
-# launch we issued did not survive, whatever the reason.
-_CODEX_LAUNCH_LINE_RE = re.compile(
-    r"CODEX_HOME=\S+[^\n]*\bcodex\b|systemd-run[^\n]*--unit=codex-"
-)
 
 
-def _looks_like_crash(text: str) -> bool:
-    """True if recent pane output shows a process-death signature (OOM/SIGABRT/etc.)."""
-    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text))
 
 
-def _looks_like_codex_start_failure(text: str) -> bool:
-    """True if Codex refused to start (bad config, bad credential, bad flag)."""
-    return bool(_CODEX_START_FAILURE_RE.search(text or ""))
 
 
-def _codex_launch_was_attempted(text: str) -> bool:
-    """True if the pane's scrollback still shows a dashboard Codex launch."""
-    return bool(_CODEX_LAUNCH_LINE_RE.search(text or ""))
 
 
-def _codex_is_down_recoverably(text: str) -> bool:
-    """Decide whether a bare-shell pane is a dead Codex we should relaunch.
 
-    Only ever consulted once the pane is already a shell with no live Codex
-    descendant. Any one of three signals is enough: a process-death signature, a
-    startup failure, or our own launch line sitting in the scrollback.
-    """
-    return (
-        _looks_like_crash(text)
-        or _looks_like_codex_start_failure(text)
-        or _codex_launch_was_attempted(text)
-    )
 
 
 # --- Codex health alerts -----------------------------------------------------
@@ -16495,70 +14855,16 @@ def _repair_member_codex_auth() -> int:
         logger.debug("Member Codex auth repair failed", exc_info=True)
     return repaired
 
-# A user@host:path$ / # / % prompt line. Group 1 = anything typed after it.
-_SHELL_PROMPT_RE = re.compile(r"[\w.\-]+@[\w.\-]+:[^\n]*[$#%>]\s*([^\n]*)$")
 
 
-def _looks_like_bare_shell(visible: str) -> bool:
-    """True if the LAST non-empty line looks like a bash/zsh prompt (no Codex TUI)."""
-    for line in reversed(visible.split("\n")):
-        if not line.strip():
-            continue
-        return bool(_SHELL_PROMPT_RE.search(line.rstrip()))
-    return False
 
 
-def _pane_is_recoverable_shell(text: str) -> bool:
-    """Whether a pane with no live Codex is one we may relaunch into.
-
-    Both watchdogs share this so they cannot drift apart. Three conditions, and
-    all of them matter:
-
-    1. The pane really is a shell — a prompt, or a bash `>` continuation. Codex
-       takes a moment to appear in the process tree after launch, so "no codex
-       process" alone would let a poll fire *into a starting session* and type a
-       second launch line into the TUI.
-    2. Codex died rather than never having been started here: a crash
-       signature, a startup failure, or our own launch line in the scrollback.
-    3. Nothing half-typed on the prompt line that a relaunch would clobber.
-    """
-    if not (text or "").strip():
-        return False
-    if not (_looks_like_bare_shell(text) or _looks_like_stuck_shell(text)):
-        return False
-    if not _codex_is_down_recoverably(text):
-        return False
-    return not _shell_has_pending_input(text)
 
 
-# bash's secondary prompts. A pane sitting on one of these is a shell waiting
-# for the rest of an unterminated command — it happens when a user pastes a
-# prompt containing a quote into a pane that has already dropped out of Codex.
-# It is still a dead session, but `_looks_like_bare_shell` cannot see it because
-# there is no user@host on the line.
-_SHELL_CONTINUATION_RE = re.compile(r"^\s*(?:>|dquote>|quote>|bquote>|cmdsubst>)\s*$")
 
 
-def _looks_like_stuck_shell(visible: str) -> bool:
-    """True if the pane's last line is a bash continuation prompt."""
-    for line in reversed((visible or "").split("\n")):
-        if not line.strip():
-            continue
-        return bool(_SHELL_CONTINUATION_RE.match(line.rstrip()))
-    return False
 
 
-def _shell_has_pending_input(visible: str) -> bool:
-    """True if the user seems to have typed a command at the shell prompt that a
-    relaunch would clobber. An empty prompt → safe to relaunch."""
-    for line in reversed(visible.split("\n")):
-        if not line.strip():
-            continue
-        m = _SHELL_PROMPT_RE.search(line.rstrip())
-        if not m:
-            return False  # last line is command output, not a typed-at prompt
-        return bool(m.group(1).strip())
-    return False
 
 
 def _project_dir_for_cwd(cwd: str) -> Path | None:
@@ -16835,30 +15141,15 @@ def _has_pending_user_input(visible: str) -> bool:
     return False
 
 
-# Codex TUI markers used only by the opt-in full auto-push guard.
-_CODEX_CONVERSATION_RE = re.compile(
-    r"esc to interrupt|Worked for \d|tokens used|You have \d+ weighted tokens left",
-    re.I,
+# Wire services/tmux.py once both dependencies exist.
+tmux_service.configure(
+    _has_pending_user_input=_has_pending_user_input,
+    _session_lifecycle=_session_lifecycle,
 )
-_CODEX_WELCOME_RE = re.compile(r"OpenAI Codex|Codex CLI|gpt-5\.", re.I)
 
 
-def _looks_like_fresh_claude_session(visible: str) -> bool:
-    """True if the pane shows a brand-new Codex session that hasn't started any
-    work: the welcome splash is on screen, the ❯ box is empty, and there is no
-    conversation below it. Such a session has nothing to 'continue' — without this
-    guard the autopilot LLM (hard-biased to keep going) fabricates a first
-    instruction out of nothing and types it into an idle, untouched session."""
-    if not visible:
-        return False
-    if not _CODEX_WELCOME_RE.search(visible):
-        return False
-    # Any sign a turn has happened (even one short exchange) → not fresh; the
-    # watchdog should handle it normally (e.g. answer a trailing question).
-    if _CODEX_CONVERSATION_RE.search(visible):
-        return False
-    # An empty input box confirms the user hasn't even begun a first prompt.
-    return not _has_pending_user_input(visible)
+
+
 
 
 @app.get("/api/sessions/{session_name}/autopush")
