@@ -26,6 +26,15 @@ class IdeStore {
   gitBranch = $state('')
   needsHostKey = $state(false)
   notARepo = $state(false)
+  gitAhead = $state(0)
+  gitBehind = $state(0)
+  gitHasUpstream = $state(false)
+  gitBusy = $state('')
+  // Commit history. Held separately from gitStatus because every action
+  // returns a fresh status, and refreshing the file list must not wipe the
+  // history the user is reading.
+  gitCommits = $state([])
+  gitHistoryLoaded = $state(false)
 
   restoredKey = ''
   persistTimer = null
@@ -76,6 +85,11 @@ class IdeStore {
     this.gitBranch = ''
     this.needsHostKey = false
     this.notARepo = false
+    this.gitAhead = 0
+    this.gitBehind = 0
+    this.gitHasUpstream = false
+    this.gitCommits = []
+    this.gitHistoryLoaded = false
   }
 
   setStatus(status, detail) {
@@ -171,6 +185,37 @@ class IdeStore {
     } catch (error) {
       this.setStatus(error.message || 'Could not expand folder')
     }
+  }
+
+  /** Show a file's diff as a read-only tab, the way VS Code opens changes.
+   *
+   * Keyed separately from the file's own tab so opening a diff never replaces
+   * (or is replaced by) the editable buffer for the same path.
+   */
+  openDiffTab(path, diff) {
+    const key = `${this.connectionId}|diff:${path}`
+    const existing = this.tabs.find((tab) => tab.key === key)
+    if (existing) {
+      existing.content = diff
+      existing.saved = diff
+      this.activeKey = key
+      return existing
+    }
+    const tab = {
+      key,
+      path: `${path} (diff)`,
+      content: diff,
+      saved: diff,
+      dirty: false,
+      readOnly: true,
+      // 'diff' is not among the languages bundled in monaco.js, and naming an
+      // unregistered language silently yields no highlighting at all. Plaintext
+      // keeps the diff fully legible without adding another language chunk.
+      language: 'plaintext',
+    }
+    this.tabs = [...this.tabs, tab]
+    this.activeKey = key
+    return tab
   }
 
   async openFile(path) {
@@ -288,14 +333,32 @@ class IdeStore {
         this.gitStatus = ''
         this.gitBranches = []
         this.gitBranch = ''
+        this.gitCommits = []
+        this.gitHistoryLoaded = false
         this.notARepo = true
         return null
       }
       this.notARepo = false
-      this.gitOutput = data.output || data.status || ''
+      this.gitAhead = data.ahead || 0
+      this.gitBehind = data.behind || 0
+      this.gitHasUpstream = !!data.has_upstream
+      // `log` carries its payload in `commits`, and `show` returns a patch we
+      // render in its own tab -- neither belongs in the output strip, which
+      // would otherwise replace the status text under the file list.
+      if (action === 'log') {
+        this.gitCommits = data.commits || []
+        this.gitHistoryLoaded = true
+      } else if (action !== 'show') {
+        this.gitOutput = data.output || data.status || ''
+      }
       this.gitStatus = data.status || ''
       this.gitBranches = data.branches || []
       this.gitBranch = data.current_branch || ''
+      // A commit, switch, pull or push changes what the history shows, so drop
+      // the cache and let the panel refetch rather than showing a stale log.
+      if (['commit', 'switch', 'create_branch', 'pull', 'push', 'fetch'].includes(action)) {
+        this.gitHistoryLoaded = false
+      }
       return data
     } catch (error) {
       this.gitOutput = error.message || 'Git command failed'

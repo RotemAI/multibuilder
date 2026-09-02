@@ -171,15 +171,31 @@ class BrowserLeaseStore:
 
 
 class SessionLifecycleStore:
-    def __init__(self, path: Path):
-        self.store = LockedJsonStore(path, lambda: {"version": 1, "sessions": {}})
+    """Session lifecycle facts, including the cwd needed to recreate a session.
 
-    def touch(self, session_name: str, *, source: str = "dashboard") -> dict[str, Any]:
+    `store` may be injected so the caller can supply a shared (database-backed)
+    document store with the same read()/update() contract; without one this
+    falls back to the local JSON file, which keeps the class usable on hosts
+    with no database.
+    """
+
+    def __init__(self, path: Path, store=None):
+        self.store = store or LockedJsonStore(
+            path, lambda: {"version": 1, "sessions": {}}
+        )
+
+    def touch(
+        self, session_name: str, *, source: str = "dashboard", cwd: str = ""
+    ) -> dict[str, Any]:
         now = time.time()
 
         def mutate(value: dict[str, Any]) -> dict[str, Any]:
             row = value.setdefault("sessions", {}).setdefault(session_name, {})
             row.update({"last_interaction": now, "last_source": source[:64]})
+            # Only ever set cwd, never clear it: a later touch without one must
+            # not erase the directory a session needs in order to be restored.
+            if cwd:
+                row["cwd"] = cwd[:4096]
             return dict(row)
 
         _value, row = self.store.update(mutate)

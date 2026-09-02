@@ -105,6 +105,8 @@ export const api = {
       body: JSON.stringify({ workspace_root, label }),
     }),
 
+  agentContext: (id) => request(conn(id, '/agent-context')),
+
   hostKey: (id) => request(conn(id, '/host-key')),
 
   trustHost: (id) =>

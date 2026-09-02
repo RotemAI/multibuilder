@@ -677,7 +677,18 @@ _browser_leases = BrowserLeaseStore(BROWSER_LEASES_FILE)
 _browser_runtime = LockedJsonStore(
     BROWSER_RUNTIME_FILE, lambda: {"version": 1, "browsers": {}}
 )
-_session_lifecycle = SessionLifecycleStore(SESSION_LIFECYCLE_FILE)
+# Session lifecycle rides on the shared store so a session's working directory
+# survives a tmux server death -- the metadata is what makes a session
+# restorable, and a host-local JSON file is lost to exactly the teardown that
+# kills the sessions in the first place.
+_session_lifecycle = SessionLifecycleStore(
+    SESSION_LIFECYCLE_FILE,
+    store=_shared_store(
+        "session_lifecycle",
+        SESSION_LIFECYCLE_FILE,
+        lambda: {"version": 1, "sessions": {}},
+    ),
+)
 _controller_snapshot = LockedJsonStore(
     CONTROLLER_SNAPSHOT_FILE, lambda: {"version": 1}
 )
@@ -9622,6 +9633,22 @@ async def api_create_session(request: Request, body: CreateSession):
         else:
             _agent_warning = ""
         _set_session_agent(created, _agent)
+        # Persist the working directory now, while the session exists. The
+        # restore path recreates a session with `tmux new-session -c <cwd>`, so
+        # without this a session that outlives its tmux server comes back in the
+        # wrong directory -- or cannot be identified as restorable at all. Ask
+        # tmux what it actually resolved rather than recomputing the guess.
+        try:
+            _created_cwd = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", f"{created}:", "#{pane_current_path}"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            _created_cwd = ""
+        try:
+            _session_lifecycle.touch(created, source="create", cwd=_created_cwd)
+        except Exception:  # noqa: BLE001 - state is best-effort, never block create
+            logger.warning("Could not record lifecycle for '%s'", created, exc_info=True)
         if _agent == "claude":
             # Claude asks a per-folder trust question on first use of a
             # directory. A detached pane cannot answer it, so pre-accept it for
@@ -11418,6 +11445,17 @@ def _valid_git_branch(value: str) -> bool:
     )
 
 
+def _valid_git_commit_ref(value: str) -> bool:
+    """A commit ref for `show` is a hex object name and nothing else.
+
+    Deliberately narrower than a branch name: this value reaches `git show`,
+    so allowing revision syntax (`..`, `@{`, `-`) would turn a history click
+    into an arbitrary-revision selector.
+    """
+    ref = (value or "").strip()
+    return bool(ref and re.fullmatch(r"[0-9a-fA-F]{4,64}", ref))
+
+
 SSH_KNOWN_HOSTS = Path.home() / ".ssh" / "known_hosts"
 
 
@@ -12033,6 +12071,7 @@ root = os.path.realpath(request['path'])
 if os.path.commonpath((workspace_root, root)) != workspace_root:
     raise RuntimeError('Path is outside the configured workspace root')
 action = request['action']
+commits = []
 def git(*args):
     result = subprocess.run(['git', '-C', root, *args], text=True, capture_output=True, timeout=25)
     if result.returncode:
@@ -12094,8 +12133,26 @@ elif action == 'push':
     output = git('push')
 elif action == 'log':
     # Unit-separated so a subject containing the delimiter cannot split a row.
-    output = git('log', '--max-count=100', '--date=short',
-                 '--pretty=format:%h\x1f%an\x1f%ad\x1f%d\x1f%s')
+    # `git log` fails on a repository with no commits yet ("unknown revision"),
+    # which is an empty history rather than an error, so probe HEAD first.
+    if subprocess.run(['git', '-C', root, 'rev-parse', '--verify', 'HEAD'],
+                      capture_output=True, timeout=25).returncode:
+        commits = []
+    else:
+        raw_log = git('log', '--max-count=100', '--date=short',
+                      '--pretty=format:%H\x1f%h\x1f%an\x1f%ad\x1f%ar\x1f%D\x1f%s')
+        commits = []
+        for line in raw_log.splitlines():
+            parts = line.split('\x1f')
+            if len(parts) == 7:
+                commits.append({'hash': parts[0], 'short': parts[1], 'author': parts[2],
+                                'date': parts[3], 'relative': parts[4],
+                                'refs': parts[5], 'subject': parts[6]})
+    output = ''
+elif action == 'show':
+    # One commit's patch, for the history view's detail pane.
+    output = git('show', '--no-ext-diff', '--stat', '--patch',
+                 '--format=%H%n%an <%ae>%n%ad%n%n%s%n%n%b', request['ref'])
 else:
     raise RuntimeError('Unsupported Git action')
 def counts():
@@ -12111,6 +12168,7 @@ def counts():
 
 behind, ahead, has_upstream = counts()
 print(json.dumps({'ok': True, 'action': action, 'root': root, 'output': output,
+                  'commits': commits,
                   'status': git('status', '--short', '--branch'),
                   'current_branch': git('branch', '--show-current').strip(),
                   'branches': git('branch', '--format=%(refname:short)').splitlines(),
@@ -12231,6 +12289,7 @@ class SSHGitBody(BaseModel):
     files: list[str] = []
     message: str = ""
     branch: str = ""
+    ref: str = ""
 
 
 def _ssh_ide_denied(request: Request) -> JSONResponse | None:
@@ -12403,6 +12462,78 @@ async def ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: s
             await ws.close()
         except Exception:
             pass
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/agent-context")
+async def api_agent_workspace_context(request: Request, session_name: str, connection_id: str):
+    """Context the chat panel prepends so the agent works on the RIGHT machine.
+
+    The agent process runs on the dashboard host, but an SSH workspace lives
+    somewhere else entirely. Without this the agent inspected its own cwd and
+    reported the workspace "not visible" -- correctly, but uselessly.
+
+    For an SSH workspace this hands over the exact `ssh` invocation that reaches
+    it, using the connection's own stored key. That is a real grant of shell
+    access on the remote host, so it is built server-side (the browser never
+    learns the key path) and only for a connection the caller already owns.
+    """
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    root = str(profile.get("workspace_root") or ".")
+    if _is_local_profile(profile):
+        return JSONResponse({
+            "kind": "local",
+            "root": root,
+            "context": f"[IDE workspace]\nLocal folder on this machine: {root}\n",
+        })
+
+    host = str(profile.get("host") or "")
+    username = str(profile.get("username") or "")
+    port = int(profile.get("port") or 22)
+    try:
+        argv = await asyncio.to_thread(_ssh_argv, profile)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    # _ssh_argv ends with user@host; the flags before it are what the agent
+    # needs to authenticate the same way the IDE does.
+    flags = " ".join(shlex.quote(part) for part in argv[1:-1])
+    ssh_cmd = f"ssh {flags} {username}@{host}"
+
+    listing = ""
+    try:
+        # Use the workspace-scoped command so the listing is of the configured
+        # root, not the login directory the bare script would land in.
+        raw = await asyncio.to_thread(
+            _ssh_run, profile, session_name,
+            _ssh_workspace_command(profile, _SSH_LIST_SCRIPT, "."),
+            timeout=20,
+        )
+        entries = json.loads(raw).get("entries", [])
+        names = [e["name"] + ("/" if e.get("is_dir") else "") for e in entries[:60]]
+        listing = "  " + "  ".join(names) if names else "  (empty)"
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+        listing = "  (could not list — the connection may be down)"
+
+    context = (
+        "[IDE workspace — IMPORTANT]\n"
+        f"The files you are being asked about are NOT on this machine. They are on\n"
+        f"{username}@{host}:{port}, in {root}.\n\n"
+        "Run commands there with this exact prefix (the key is already authorised):\n"
+        f"  {ssh_cmd} 'cd {shlex.quote(root)} && <your command>'\n\n"
+        f"Workspace root ({root}) contains:\n{listing}\n"
+    )
+    return JSONResponse({
+        "kind": "ssh",
+        "root": root,
+        "host": host,
+        "username": username,
+        "ssh_command": ssh_cmd,
+        "context": context,
+    })
 
 
 @app.get("/api/sessions/{session_name}/ide/chat")
@@ -13330,6 +13461,7 @@ async def api_manage_ssh_git(
     if body.action not in {
         "status", "diff", "diff_file", "stage", "unstage", "discard",
         "commit", "switch", "create_branch", "fetch", "pull", "push", "log",
+        "show",
     }:
         return JSONResponse({"error": "Unsupported Git action"}, status_code=400)
     remote_path = _normalized_workspace_path(profile, body.path)
@@ -13348,12 +13480,16 @@ async def api_manage_ssh_git(
     branch = body.branch.strip()
     if body.action in {"switch", "create_branch"} and not _valid_git_branch(branch):
         return JSONResponse({"error": "Invalid branch name"}, status_code=400)
+    ref = body.ref.strip()
+    if body.action == "show" and not _valid_git_commit_ref(ref):
+        return JSONResponse({"error": "Invalid commit reference"}, status_code=400)
     payload = json.dumps({
         "action": body.action,
         "path": remote_path,
         "files": files,
         "message": message,
         "branch": branch,
+        "ref": ref,
     })
     try:
         raw = await asyncio.to_thread(

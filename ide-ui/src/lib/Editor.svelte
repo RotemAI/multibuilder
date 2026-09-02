@@ -52,10 +52,14 @@
     }
     if (tab.key !== currentKey) {
       applying = true
-      const model = monaco.editor.createModel(tab.content, languageFor(tab.path))
+      // A tab may name its own language (a Git diff does); otherwise infer it
+      // from the path. Diff tabs are read-only: they are a view of a change,
+      // not an editable buffer.
+      const model = monaco.editor.createModel(tab.content, tab.language || languageFor(tab.path))
       const previous = editor.getModel()
       editor.setModel(model)
       previous?.dispose()
+      editor.updateOptions({ readOnly: !!tab.readOnly })
       currentKey = tab.key
       applying = false
     } else if (editor.getValue() !== tab.content) {

@@ -26,6 +26,27 @@
     (config.models.find((m) => m[0] === config.model) || [])[1] || config.model || 'default',
   )
 
+  let workspaceContext = $state('')
+
+  async function loadWorkspaceContext() {
+    if (!ide.connectionId) {
+      workspaceContext = ''
+      return
+    }
+    try {
+      workspaceContext = (await api.agentContext(ide.connectionId)).context || ''
+    } catch {
+      workspaceContext = ''
+    }
+  }
+
+  // Re-fetch whenever the workspace changes: the context names a specific host
+  // and root, so a stale one would point the agent at the previous machine.
+  $effect(() => {
+    ide.connectionId
+    loadWorkspaceContext()
+  })
+
   async function loadConfig() {
     if (!target) return
     try {
@@ -124,10 +145,14 @@
     const body = tab
       ? `\nActive file contents (first 12,000 characters):\n${tab.content.slice(0, 12000)}`
       : ''
-    const targetLine = c.kind === 'local'
-      ? `Local workspace: ${c.workspace_root || '.'}`
-      : `SSH target: ${c.username || '?'}@${c.host || '?'}`
-    return `[Remote IDE context]\n${targetLine}\nPath: ${where}${body}\n\n${question.trim()}`
+    // The server-built context is what tells the agent WHICH MACHINE the files
+    // are on and how to reach it. Without it the agent inspected its own host
+    // and reported the workspace missing.
+    const header = workspaceContext ||
+      (c.kind === 'local'
+        ? `[IDE workspace]\nLocal folder: ${c.workspace_root || '.'}\n`
+        : `[IDE workspace]\nSSH target: ${c.username || '?'}@${c.host || '?'}\n`)
+    return `${header}\nCurrently open: ${where}${body}\n\n${question.trim()}`
   }
 
   async function send() {
@@ -207,7 +232,8 @@
   function displayText(message) {
     const text = message.full || message.text || ''
     const marker = '\n\n'
-    if (text.startsWith('[Remote IDE context]') || text.startsWith('[Remote SSH IDE context]')) {
+    if (text.startsWith('[IDE workspace') || text.startsWith('[Remote IDE context]')
+        || text.startsWith('[Remote SSH IDE context]')) {
       const at = text.lastIndexOf(marker)
       if (at !== -1) return text.slice(at + marker.length)
     }

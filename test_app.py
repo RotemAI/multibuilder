@@ -1126,6 +1126,125 @@ class TestSshIdeSafety:
         assert _valid_git_branch("feature/remote-ide")
         assert not _valid_git_branch("feature/../secret")
 
+    def test_lifecycle_store_accepts_injected_shared_backend(self):
+        """The lifecycle store must be able to ride the shared (DB) backend.
+
+        A host-local JSON file is destroyed by exactly the user-manager teardown
+        that kills the tmux sessions, so the cwd needed to restore them has to
+        live somewhere shared.
+        """
+        from pathlib import Path
+        from runtime_control import SessionLifecycleStore
+
+        class FakeShared:
+            def __init__(self):
+                self.value = {"version": 1, "sessions": {}}
+
+            def read(self):
+                return self.value
+
+            def update(self, mutate):
+                result = mutate(self.value)
+                return self.value, result
+
+        backing = FakeShared()
+        store = SessionLifecycleStore(Path("/nonexistent/never-written.json"), store=backing)
+        store.touch("s1", source="create", cwd="/srv/project")
+
+        # The injected store received it; no file was touched.
+        assert backing.value["sessions"]["s1"]["cwd"] == "/srv/project"
+        assert store.get("s1")["cwd"] == "/srv/project"
+
+    def test_lifecycle_touch_never_clears_a_recorded_cwd(self):
+        """A later touch without a cwd must not erase the restore directory."""
+        import tempfile
+        from pathlib import Path
+        from runtime_control import SessionLifecycleStore
+
+        with tempfile.TemporaryDirectory() as folder:
+            store = SessionLifecycleStore(Path(folder) / "lifecycle.json")
+            store.touch("s1", source="create", cwd="/srv/project")
+            store.touch("s1", source="poll")
+
+            assert store.get("s1")["cwd"] == "/srv/project"
+            assert store.get("s1")["last_source"] == "poll"
+
+    def test_git_commit_ref_validator_only_accepts_object_names(self):
+        """`show` reaches `git show`, so the ref must not carry revision syntax.
+
+        A branch-shaped validator would allow `HEAD@{1}` or `a..b`, turning a
+        history click into an arbitrary-revision selector; only hex is safe.
+        """
+        from app import _valid_git_commit_ref
+
+        assert _valid_git_commit_ref("20bd0f8")
+        assert _valid_git_commit_ref("ae8a6856e1d1f03e893065e0adce397d1970348d")
+        for bad in (
+            "", "a", "HEAD", "HEAD@{1}", "main..dev", "../../etc/passwd",
+            "20bd0f8;rm -rf /", "--output=/tmp/x", "$(id)",
+        ):
+            assert not _valid_git_commit_ref(bad), bad
+
+    def test_git_script_reports_empty_history_instead_of_failing(self):
+        """`git log` errors on a repo with no commits; that is empty, not broken."""
+        import json
+        import re
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        source = Path("app.py").read_text()
+        script = re.search(r'_SSH_GIT_SCRIPT = """(.*?)"""', source, re.S).group(1)
+        with tempfile.TemporaryDirectory() as folder:
+            subprocess.run(["git", "init", "-q", folder], check=True)
+            result = subprocess.run(
+                ["python3", "-c", script,
+                 json.dumps({"action": "log", "path": ".", "files": [],
+                             "message": "", "branch": "", "ref": ""})],
+                cwd=folder, text=True, capture_output=True, timeout=60,
+            )
+            assert result.returncode == 0, result.stderr
+            payload = json.loads(result.stdout)
+            assert payload["ok"] is True
+            assert payload["commits"] == []
+
+    def test_git_script_log_returns_structured_commits(self):
+        """History must arrive as rows, not as text in the shared output field."""
+        import json
+        import re
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        source = Path("app.py").read_text()
+        script = re.search(r'_SSH_GIT_SCRIPT = """(.*?)"""', source, re.S).group(1)
+        with tempfile.TemporaryDirectory() as folder:
+            def run(*argv):
+                return subprocess.run(argv, cwd=folder, check=True, capture_output=True)
+
+            run("git", "init", "-q", ".")
+            run("git", "config", "user.email", "t@example.com")
+            run("git", "config", "user.name", "Tester")
+            Path(folder, "file.txt").write_text("hello\n")
+            run("git", "add", "file.txt")
+            run("git", "commit", "-qm", "add file")
+            result = subprocess.run(
+                ["python3", "-c", script,
+                 json.dumps({"action": "log", "path": ".", "files": [],
+                             "message": "", "branch": "", "ref": ""})],
+                cwd=folder, text=True, capture_output=True, timeout=60,
+            )
+            assert result.returncode == 0, result.stderr
+            payload = json.loads(result.stdout)
+            assert len(payload["commits"]) == 1
+            entry = payload["commits"][0]
+            assert entry["subject"] == "add file"
+            assert entry["author"] == "Tester"
+            assert len(entry["hash"]) == 40
+            # The status must still be present: history must not replace the
+            # file list the panel renders from.
+            assert "## " in payload["status"]
+
     def test_workspace_paths_are_relative_and_commands_enter_configured_root(self):
         from app import _normalized_workspace_path, _ssh_workspace_command
 
