@@ -353,6 +353,18 @@ def _db_ready() -> bool:
         _DB_BACKEND_OK = db_store.enabled() and db_store.healthy()
         _DB_BACKEND_CHECKED = True
         logger.info("Shared state backend: %s", "postgresql" if _DB_BACKEND_OK else "json files")
+        if _DB_BACKEND_OK:
+            # An unstamped database means migrations have never been run here.
+            # Say so plainly at startup: the alternative is a schema mismatch
+            # surfacing later as an opaque query error.
+            revision = db_store.schema_version()
+            if revision:
+                logger.info("Database schema revision: %s", revision)
+            else:
+                logger.warning(
+                    "Database has no Alembic revision stamp; "
+                    "run 'alembic upgrade head' to bring the schema under migration control"
+                )
     return _DB_BACKEND_OK
 
 

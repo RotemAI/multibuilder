@@ -1126,6 +1126,46 @@ class TestSshIdeSafety:
         assert _valid_git_branch("feature/remote-ide")
         assert not _valid_git_branch("feature/../secret")
 
+    def test_alembic_revisions_form_a_single_linear_chain(self):
+        """Every revision must chain to exactly one parent, with one root.
+
+        A duplicated down_revision (easy to create by writing two revisions off
+        the same head) makes `alembic upgrade head` fail with a multiple-heads
+        error at deploy time rather than in review.
+        """
+        import re
+        from pathlib import Path
+
+        versions = sorted(Path("alembic/versions").glob("*.py"))
+        assert versions, "no Alembic revisions found"
+
+        revisions, parents = {}, []
+        for path in versions:
+            body = path.read_text()
+            rev = re.search(r'^revision = ["\'](.+?)["\']', body, re.M).group(1)
+            down = re.search(r'^down_revision = (.+)$', body, re.M).group(1).strip()
+            revisions[rev] = path.name
+            parents.append(None if down == "None" else down.strip("\"'"))
+
+        roots = [p for p in parents if p is None]
+        assert len(roots) == 1, "expected exactly one base revision"
+        # No two revisions may share a parent, and every parent must exist.
+        named = [p for p in parents if p is not None]
+        assert len(named) == len(set(named)), "two revisions share a down_revision"
+        for parent in named:
+            assert parent in revisions, f"unknown down_revision {parent}"
+
+    def test_alembic_ini_carries_no_database_credentials(self):
+        """The committed ini must not hold a URL; env.py reads the env var."""
+        from pathlib import Path
+
+        ini = Path("alembic.ini").read_text()
+        for line in ini.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("sqlalchemy.url"):
+                raise AssertionError(f"alembic.ini defines a URL: {stripped}")
+        assert "TMUX_DASH_DB_URL" in Path("alembic/env.py").read_text()
+
     def test_lifecycle_store_accepts_injected_shared_backend(self):
         """The lifecycle store must be able to ride the shared (DB) backend.
 

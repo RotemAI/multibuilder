@@ -50,6 +50,13 @@ _pool = None
 _pool_lock = threading.Lock()
 _schema_ready = False
 
+# Schema is owned by Alembic (alembic/versions/), not by this module.
+#
+# This DDL is retained ONLY as the bootstrap for a database that has never had
+# migrations run against it, so a fresh dev host still starts. It is applied
+# once at pool creation and is deliberately identical to the baseline revision.
+# Any CHANGE to the schema must be a new Alembic revision: adding a column here
+# would silently never reach a database whose tables already exist.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     name        TEXT PRIMARY KEY,
@@ -105,6 +112,26 @@ def pool():
                 conn.execute(SCHEMA)
             _schema_ready = True
     return _pool
+
+
+def schema_version() -> str:
+    """The Alembic revision this database is stamped at, or '' if untracked.
+
+    Used to warn on startup when the deployment is running against a schema
+    that migrations have not been applied to -- a mismatch otherwise surfaces
+    as a confusing runtime error rather than a clear operational one.
+    """
+    try:
+        p = pool()
+        if p is None:
+            return ""
+        with p.connection() as conn:
+            row = conn.execute(
+                "SELECT version_num FROM alembic_version LIMIT 1"
+            ).fetchone()
+        return str(row["version_num"]) if row else ""
+    except Exception:  # noqa: BLE001 - an untracked database is not an error
+        return ""
 
 
 def healthy() -> bool:
