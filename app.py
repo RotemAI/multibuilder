@@ -52,6 +52,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import db_store
 import google_policy
 from runtime_control import (
     BrowserLeaseStore,
@@ -335,14 +336,41 @@ CLAUDE_SESSION_CMD = os.environ.get(
 # Persisted per session: uvicorn runs several workers, so an in-memory dict
 # would let the worker that answers a read disagree with the one that handled
 # the write — the agent picker showed the old value after a successful switch.
+# --- Shared state backend -------------------------------------------------
+#
+# Team deployments keep state in PostgreSQL so several people (and, later,
+# several hosts) see the same sessions, workspaces and chat. The JSON files
+# remain the fallback: a dashboard that refuses to start because the database
+# is down would be worse than one running on local files.
+_DB_BACKEND_CHECKED = False
+_DB_BACKEND_OK = False
+
+
+def _db_ready() -> bool:
+    """Is the shared database usable? Probed once, then cached."""
+    global _DB_BACKEND_CHECKED, _DB_BACKEND_OK
+    if not _DB_BACKEND_CHECKED:
+        _DB_BACKEND_OK = db_store.enabled() and db_store.healthy()
+        _DB_BACKEND_CHECKED = True
+        logger.info("Shared state backend: %s", "postgresql" if _DB_BACKEND_OK else "json files")
+    return _DB_BACKEND_OK
+
+
+def _shared_store(name: str, path: Path, default_factory):
+    """A document store backed by Postgres when available, else the JSON file."""
+    if _db_ready():
+        return db_store.PgJsonStore(name, default_factory)
+    return LockedJsonStore(path, default_factory)
+
+
 def _session_agents_file() -> Path:
     # Resolved lazily: this helper is defined above MESSAGES_DIR, and binding
     # the path at import time would fail with an undefined name.
     return MESSAGES_DIR / "session_agents.json"
 
 
-def _session_agents_store() -> LockedJsonStore:
-    return LockedJsonStore(_session_agents_file(), dict)
+def _session_agents_store():
+    return _shared_store("session_agents", _session_agents_file(), dict)
 
 
 def _session_agent_kind(session_name: str) -> str:
@@ -1978,7 +2006,7 @@ def _load_session_owners() -> dict[str, str]:
     read/modify/write updates could overwrite another worker's assignment.
     """
     try:
-        data = LockedJsonStore(SESSION_OWNERS_FILE, dict).read()
+        data = _shared_store("session_owners", SESSION_OWNERS_FILE, dict).read()
         return {str(k): str(v) for k, v in data.items()}
     except Exception:
         logger.debug("Failed to load session owners", exc_info=True)
@@ -1996,14 +2024,14 @@ def _set_session_owner(session_name: str, user_id: str):
     def mutate(owners: dict):
         owners[str(session_name)] = str(user_id)
 
-    LockedJsonStore(SESSION_OWNERS_FILE, dict).update(mutate)
+    _shared_store("session_owners", SESSION_OWNERS_FILE, dict).update(mutate)
 
 
 def _clear_session_owner(session_name: str):
     def mutate(owners: dict):
         owners.pop(str(session_name), None)
 
-    LockedJsonStore(SESSION_OWNERS_FILE, dict).update(mutate)
+    _shared_store("session_owners", SESSION_OWNERS_FILE, dict).update(mutate)
 
 
 def _user_for_session(session_name: str) -> dict | None:
@@ -6719,6 +6747,14 @@ def _backfill_prompt_audit(users: list[dict] | None = None) -> int:
 
 def _save_messages():
     """Persist all session messages to per-user files based on session ownership."""
+    if _db_ready():
+        # Mirror into Postgres so the team sees one transcript. The per-user
+        # files are still written below, which keeps the fallback path warm and
+        # means turning the database off does not lose history.
+        for name, entry in cache.items():
+            msgs = entry.get("messages")
+            if msgs:
+                db_store.replace_messages(name, msgs)
     by_user: dict[str, dict[str, list]] = {}
     for name, entry in cache.items():
         msgs = entry.get("messages")
@@ -6736,7 +6772,16 @@ def _save_messages():
 
 
 def _load_session_messages(session_name: str) -> list:
-    """Get persisted messages for a specific session from its owner's file."""
+    """Persisted messages for one session.
+
+    Reads from the shared database when configured — chat is the state that
+    most needs to be shared across a team and the one that grew without bound
+    in a rewrite-the-whole-file store. Falls back to the owner's JSON file.
+    """
+    if _db_ready():
+        rows = db_store.load_messages(session_name, limit=500)
+        if rows:
+            return rows
     owner = _user_for_session(session_name)
     return _load_messages(owner).get(session_name, [])
 
@@ -11095,8 +11140,10 @@ def _require_ssh_ide_admin(request: Request) -> dict | None:
     return user if _is_admin(user) else None
 
 
-def _ssh_connections_store() -> LockedJsonStore:
-    return LockedJsonStore(SSH_CONNECTIONS_FILE, lambda: {"version": 1, "connections": []})
+def _ssh_connections_store():
+    return _shared_store(
+        "ssh_connections", SSH_CONNECTIONS_FILE, lambda: {"version": 1, "connections": []}
+    )
 
 
 def _ssh_control_socket(session_name: str, connection_id: str) -> Path:
@@ -11290,12 +11337,20 @@ def _ssh_update_profile(session_name: str, connection_id: str, changes: dict) ->
     _harden_ssh_state_file(SSH_CONNECTIONS_FILE)
 
 
-def _ssh_ide_state_store() -> LockedJsonStore:
-    return LockedJsonStore(SSH_IDE_STATE_FILE, lambda: {"version": 1, "workspaces": {}})
+def _ssh_ide_state_store():
+    return _shared_store(
+        "ssh_ide_state", SSH_IDE_STATE_FILE, lambda: {"version": 1, "workspaces": {}}
+    )
 
 
 def _ssh_ide_state_key(session_name: str, connection_id: str) -> str:
-    return f"{session_name}\x00{connection_id}"
+    """Composite key for one session's view of one connection.
+
+    A NUL byte was used as the separator, which PostgreSQL rejects in both text
+    and JSONB. "\x1f" (unit separator) is equally impossible in a session name
+    or a connection id -- both are restricted charsets -- and stores cleanly.
+    """
+    return f"{session_name}\x1f{connection_id}"
 
 
 def _ssh_read_ide_state(session_name: str, connection_id: str) -> dict:
@@ -11971,7 +12026,7 @@ print(json.dumps({'path': root, 'matches': matches, 'truncated': len(matches) >=
 """
 
 _SSH_GIT_SCRIPT = """
-import json, os, subprocess, sys
+import json, os, shutil, subprocess, sys
 request = json.loads(sys.argv[-1])
 workspace_root = os.path.realpath('.')
 root = os.path.realpath(request['path'])
@@ -12006,9 +12061,60 @@ elif action == 'switch':
     output = git('switch', request['branch'])
 elif action == 'create_branch':
     output = git('switch', '-c', request['branch'])
+elif action == 'diff_file':
+    # One file's diff, named in files[0]. Staged changes live in the index, so
+    # ask for both and show whichever has content -- otherwise a staged-only
+    # file looks clean.
+    target_file = request['files'][0]
+    unstaged = git('diff', '--no-ext-diff', '--', target_file)
+    output = unstaged or git('diff', '--no-ext-diff', '--cached', '--', target_file)
+elif action == 'discard':
+    # Restore tracked files; delete untracked ones, which `restore` cannot undo.
+    tracked, untracked = [], []
+    for item in request['files']:
+        probe = subprocess.run(['git', '-C', root, 'ls-files', '--error-unmatch', '--', item],
+                               text=True, capture_output=True, timeout=25)
+        (tracked if probe.returncode == 0 else untracked).append(item)
+    output = ''
+    if tracked:
+        output += git('restore', '--worktree', '--staged', '--', *tracked)
+    for item in untracked:
+        target = os.path.realpath(os.path.join(root, item))
+        if os.path.commonpath((workspace_root, target)) != workspace_root:
+            raise RuntimeError('Refusing to delete outside the workspace root')
+        if os.path.isdir(target):
+            shutil.rmtree(target, ignore_errors=True)
+        elif os.path.exists(target):
+            os.remove(target)
+elif action == 'fetch':
+    output = git('fetch', '--prune')
+elif action == 'pull':
+    output = git('pull', '--ff-only')
+elif action == 'push':
+    output = git('push')
+elif action == 'log':
+    # Unit-separated so a subject containing the delimiter cannot split a row.
+    output = git('log', '--max-count=100', '--date=short',
+                 '--pretty=format:%h\x1f%an\x1f%ad\x1f%d\x1f%s')
 else:
     raise RuntimeError('Unsupported Git action')
-print(json.dumps({'ok': True, 'action': action, 'root': root, 'output': output, 'status': git('status', '--short', '--branch'), 'current_branch': git('branch', '--show-current').strip(), 'branches': git('branch', '--format=%(refname:short)').splitlines()}))
+def counts():
+    # Ahead/behind vs the upstream, for the status bar's sync indicator. A
+    # branch with no upstream simply has nothing to report.
+    probe = subprocess.run(
+        ['git', '-C', root, 'rev-list', '--left-right', '--count', '@{upstream}...HEAD'],
+        text=True, capture_output=True, timeout=25)
+    if probe.returncode:
+        return 0, 0, False
+    parts = (probe.stdout or '').split()
+    return (int(parts[0]), int(parts[1]), True) if len(parts) == 2 else (0, 0, True)
+
+behind, ahead, has_upstream = counts()
+print(json.dumps({'ok': True, 'action': action, 'root': root, 'output': output,
+                  'status': git('status', '--short', '--branch'),
+                  'current_branch': git('branch', '--show-current').strip(),
+                  'branches': git('branch', '--format=%(refname:short)').splitlines(),
+                  'ahead': ahead, 'behind': behind, 'has_upstream': has_upstream}))
 """
 
 _SSH_LSP_STATUS_SCRIPT = """
@@ -13221,7 +13327,10 @@ async def api_manage_ssh_git(
     profile, error = _ssh_profile_or_response(request, session_name, connection_id)
     if error:
         return error
-    if body.action not in {"status", "diff", "stage", "unstage", "commit", "switch", "create_branch"}:
+    if body.action not in {
+        "status", "diff", "diff_file", "stage", "unstage", "discard",
+        "commit", "switch", "create_branch", "fetch", "pull", "push", "log",
+    }:
         return JSONResponse({"error": "Unsupported Git action"}, status_code=400)
     remote_path = _normalized_workspace_path(profile, body.path)
     if remote_path is None:
@@ -13229,8 +13338,10 @@ async def api_manage_ssh_git(
     files = [item.strip() for item in body.files]
     if len(files) > 100 or any(not _valid_git_pathspec(item) for item in files):
         return JSONResponse({"error": "Invalid Git file selection"}, status_code=400)
-    if body.action in {"stage", "unstage"} and not files:
+    if body.action in {"stage", "unstage", "discard"} and not files:
         return JSONResponse({"error": "Select at least one file or folder"}, status_code=400)
+    if body.action == "diff_file" and len(files) != 1:
+        return JSONResponse({"error": "Choose exactly one file to diff"}, status_code=400)
     message = body.message.strip()
     if body.action == "commit" and (not message or len(message) > 1000 or "\x00" in message):
         return JSONResponse({"error": "Enter a commit message up to 1,000 characters"}, status_code=400)

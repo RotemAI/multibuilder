@@ -10,3 +10,5 @@ websockets==15.0.1        # browser WebSocket reverse proxy
 google-auth[requests]==2.56.2  # Workspace domain-wide delegation preflight
 cryptography==50.0.1      # AES-256-GCM at-rest encryption for stored SSH credentials
 tomli==2.4.1; python_version < "3.11"  # stdlib tomllib compatibility
+psycopg[binary]==3.2.3   # PostgreSQL driver for shared team state
+psycopg-pool==3.2.4      # connection pooling for the dashboard workers
