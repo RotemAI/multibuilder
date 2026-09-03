@@ -65,6 +65,43 @@
   let sidebarOpen = $state(storedFlag('sidebar', true))
   let quickOpen = $state(false)
   let showTerminal = $state(storedFlag('terminal', false))
+
+  // Terminal tabs. The id IS the server-side terminal index, and it never
+  // changes for the life of a tab.
+  //
+  // Deliberately not the array position: closing a middle tab would shift every
+  // later tab down one, silently re-pointing them at different tmux windows —
+  // a tab would keep its title and scrollback while attaching to someone else's
+  // shell. A freed index is reused only once no tab holds it.
+  const MAX_TERMINALS = 8
+  let terminals = $state([0])
+  let activeTerminal = $state(0)
+
+  function addTerminal() {
+    if (terminals.length >= MAX_TERMINALS) return
+    let index = 0
+    while (terminals.includes(index)) index += 1
+    if (index >= MAX_TERMINALS) return
+    terminals = [...terminals, index].sort((a, b) => a - b)
+    activeTerminal = index
+  }
+
+  function closeTerminal(index) {
+    if (terminals.length <= 1) return
+    const position = terminals.indexOf(index)
+    terminals = terminals.filter((entry) => entry !== index)
+    if (activeTerminal === index) {
+      activeTerminal = terminals[Math.min(position, terminals.length - 1)]
+    }
+  }
+
+  // A different workspace has its own shells; start over rather than attaching
+  // this connection's tabs to another connection's tmux windows.
+  $effect(() => {
+    ide.connectionId
+    terminals = [0]
+    activeTerminal = 0
+  })
   // Once opened, the panel stays in the DOM (hidden when toggled off) so the
   // terminal keeps its buffer and socket across toggles.
   let terminalMounted = $state(false)
@@ -485,15 +522,44 @@
             style="height: {panelHeight}px"
             hidden={!showTerminal}
           >
-            <div class="flex items-center gap-2 border-b border-vs-border px-3 py-1 text-[11px] tracking-wide uppercase">
-              <SquareTerminal size={13} /> Terminal
-              <span class="text-vs-muted normal-case">{ide.connection?.label || ''}</span>
-              <button class="ml-auto rounded-sm p-0.5 hover:bg-vs-hover" title="Hide panel" aria-label="Hide terminal panel"
+            <div class="flex items-center gap-1 border-b border-vs-border px-2 py-1 text-[11px]">
+              <SquareTerminal size={13} class="mx-1 shrink-0" />
+              <div class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
+                {#each terminals as index (index)}
+                  <span
+                    class="group flex shrink-0 items-center gap-1 rounded-sm px-2 py-0.5
+                           {index === activeTerminal ? 'bg-vs-hover text-vs-fg' : 'text-vs-muted hover:text-vs-fg'}"
+                  >
+                    <button class="max-w-[140px] truncate" onclick={() => (activeTerminal = index)}>
+                      {index === 0 ? (ide.connection?.label || 'Terminal') : `Terminal ${index + 1}`}
+                    </button>
+                    {#if terminals.length > 1}
+                      <button
+                        class="rounded-sm p-0.5 opacity-0 group-hover:opacity-100 hover:bg-vs-line"
+                        title="Close terminal" aria-label="Close terminal {index + 1}"
+                        onclick={() => closeTerminal(index)}><X size={11} /></button>
+                    {/if}
+                  </span>
+                {/each}
+              </div>
+              <button
+                class="shrink-0 rounded-sm p-0.5 hover:bg-vs-hover disabled:opacity-40"
+                title="New terminal in this workspace" aria-label="New terminal"
+                disabled={terminals.length >= MAX_TERMINALS}
+                onclick={addTerminal}><Plus size={14} /></button>
+              <button class="shrink-0 rounded-sm p-0.5 hover:bg-vs-hover" title="Hide panel" aria-label="Hide terminal panel"
                 onclick={() => (showTerminal = false)}><X size={14} /></button>
             </div>
-            <div class="min-h-0 flex-1">
+            <div class="relative min-h-0 flex-1">
               {#key ide.connectionId}
-                <Terminal {rootPath} {session} />
+                <!-- Every terminal stays mounted: unmounting would drop its
+                     WebSocket and clear the xterm buffer, so switching tabs
+                     would lose scrollback. Only the active one is visible. -->
+                {#each terminals as index (index)}
+                  <div class="absolute inset-0" hidden={index !== activeTerminal}>
+                    <Terminal {rootPath} {session} {index} />
+                  </div>
+                {/each}
               {/key}
             </div>
           </div>

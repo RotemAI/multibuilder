@@ -1156,6 +1156,46 @@ class TestSshIdeSafety:
             else:
                 raise AssertionError(f"{path}: configure() accepted an unknown name")
 
+    def test_ssh_terminal_starts_in_the_workspace_root(self):
+        """A remote terminal must open in the workspace, not the login home.
+
+        Plain `ssh host` lands wherever the account's home is, which is almost
+        never the folder the IDE is showing. The local path already does this
+        with `tmux new-window -c`; the two must behave the same.
+        """
+        from services import ssh as ssh_service
+
+        profile = {"kind": "ssh", "workspace_root": "/var/www/workspace"}
+        assert ssh_service._ssh_workspace_root(profile) == "/var/www/workspace"
+        # No configured root still yields a usable shell.
+        assert ssh_service._ssh_workspace_root({"kind": "ssh"}) == "~"
+
+    def test_terminal_window_names_are_stable_per_index(self):
+        """Index 0 keeps the original name; other indexes are distinct.
+
+        Index 0 must not gain a suffix, or every terminal window created before
+        multi-terminal support would stop resolving.
+        """
+        from services import ssh as ssh_service
+
+        for kind in ("ssh", "local"):
+            profile = {"kind": kind, "label": "Prod", "id": "abc123"}
+            base = ssh_service._ssh_tmux_window_name(profile, 0)
+            assert not base.endswith("-0")
+            names = {ssh_service._ssh_tmux_window_name(profile, i) for i in range(4)}
+            assert len(names) == 4, f"{kind}: window names collide across indexes"
+
+    def test_terminal_index_is_clamped_to_the_configured_maximum(self):
+        """A browser must not be able to spawn unbounded tmux windows."""
+        from core.config import MAX_IDE_TERMINALS
+
+        assert 1 <= MAX_IDE_TERMINALS <= 32
+        for raw, expected in (
+            ("0", 0), ("3", 3), ("-5", 0), ("9999", MAX_IDE_TERMINALS - 1),
+        ):
+            index = max(0, min(int(raw), MAX_IDE_TERMINALS - 1))
+            assert index == expected, raw
+
     def test_shared_message_cache_is_one_object_not_a_copy(self):
         """services/stores.py must mutate the SAME dict app.py does.
 

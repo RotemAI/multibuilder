@@ -696,14 +696,31 @@ def _tmux_window_suffix(profile: dict) -> str:
     return str(profile.get("id") or "")[:8]
 
 
-def _ssh_tmux_window_name(profile: dict) -> str:
+def _ssh_workspace_root(profile: dict) -> str:
+    """The remote directory a terminal for this connection should start in.
+
+    Falls back to the login home (`~`) when no workspace root is configured, so
+    the shell still opens somewhere sensible.
+    """
+    root = str(profile.get("workspace_root") or "").strip()
+    return root or "~"
+
+
+def _ssh_tmux_window_name(profile: dict, index: int = 0) -> str:
+    """The tmux window backing one terminal for this connection.
+
+    `index` lets a connection own several independent shells: index 0 keeps the
+    original, un-suffixed name so existing windows (and anything already
+    attached to them) are unaffected.
+    """
     if _is_local_profile(profile):
-        return _local_tmux_window_name(profile)
+        return _local_tmux_window_name(profile, index)
     label = _tmux_safe_label(profile.get("label"), "remote")
-    return f"ssh-{label[:28]}-{_tmux_window_suffix(profile)}"
+    name = f"ssh-{label[:28]}-{_tmux_window_suffix(profile)}"
+    return name if index <= 0 else f"{name}-{int(index)}"
 
 
-def _ssh_tmux_window_exists(profile: dict, session_name: str) -> bool:
+def _ssh_tmux_window_exists(profile: dict, session_name: str, index: int = 0) -> bool:
     """Is this connection's terminal window still present in the tmux session?"""
     if not shutil.which("tmux"):
         return False
@@ -716,13 +733,13 @@ def _ssh_tmux_window_exists(profile: dict, session_name: str) -> bool:
         return False
     if result.returncode != 0:
         return False
-    return _ssh_tmux_window_name(profile) in result.stdout.split()
+    return _ssh_tmux_window_name(profile, index) in result.stdout.split()
 
 
-def _ssh_open_tmux_window(profile: dict, session_name: str) -> str:
+def _ssh_open_tmux_window(profile: dict, session_name: str, index: int = 0) -> str:
     """Open an interactive view of the already-authenticated SSH control master."""
     if _is_local_profile(profile):
-        return _local_open_tmux_window(profile, session_name)
+        return _local_open_tmux_window(profile, session_name, index)
     if not shutil.which("tmux"):
         raise RuntimeError("tmux is not installed on the dashboard host")
     socket_path = _ssh_control_socket(session_name, str(profile.get("id") or ""))
@@ -737,8 +754,25 @@ def _ssh_open_tmux_window(profile: dict, session_name: str) -> str:
         "-o", "ControlMaster=no",
         target,
     ]
-    command = "exec " + " ".join(shlex.quote(arg) for arg in terminal_argv)
-    window_name = _ssh_tmux_window_name(profile)
+    # Start in the workspace, not the login home directory. Without this the
+    # terminal opens wherever the remote account lands, which is almost never
+    # the folder the IDE is showing -- the local path already does this with
+    # `tmux new-window -c`, and the two should behave the same.
+    #
+    # `cd || true` keeps a shell even if the folder has gone away, rather than
+    # dropping the connection; `exec $SHELL -l` then replaces it with a normal
+    # login shell so the prompt and rc files are what the user expects.
+    remote_root = _ssh_workspace_root(profile)
+    remote_command = (
+        f"cd {shlex.quote(remote_root)} 2>/dev/null || true; exec \"$SHELL\" -l"
+    )
+    command = (
+        "exec "
+        + " ".join(shlex.quote(arg) for arg in terminal_argv)
+        + " "
+        + shlex.quote(remote_command)
+    )
+    window_name = _ssh_tmux_window_name(profile, index)
     result = subprocess.run(
         ["tmux", "new-window", "-d", "-t", session_name, "-n", window_name, command],
         capture_output=True,
@@ -750,11 +784,11 @@ def _ssh_open_tmux_window(profile: dict, session_name: str) -> str:
     return window_name
 
 
-def _ssh_focus_tmux_window(profile: dict, session_name: str) -> str:
+def _ssh_focus_tmux_window(profile: dict, session_name: str, index: int = 0) -> str:
     """Select the Remote IDE's interactive SSH window in its owning session."""
     if not shutil.which("tmux"):
         raise RuntimeError("tmux is not installed on the dashboard host")
-    window_name = _ssh_tmux_window_name(profile)
+    window_name = _ssh_tmux_window_name(profile, index)
     result = subprocess.run(
         ["tmux", "select-window", "-t", f"{session_name}:={window_name}"],
         capture_output=True,
@@ -874,19 +908,21 @@ def _local_run(
     return result.stdout.decode("utf-8", "replace")
 
 
-def _local_tmux_window_name(profile: dict) -> str:
+def _local_tmux_window_name(profile: dict, index: int = 0) -> str:
+    """Index 0 keeps the original name so existing windows still resolve."""
     label = _tmux_safe_label(profile.get("label"), "local")
-    return f"local-{label[:28]}-{_tmux_window_suffix(profile)}"
+    name = f"local-{label[:28]}-{_tmux_window_suffix(profile)}"
+    return name if index <= 0 else f"{name}-{int(index)}"
 
 
-def _local_open_tmux_window(profile: dict, session_name: str) -> str:
+def _local_open_tmux_window(profile: dict, session_name: str, index: int = 0) -> str:
     """Open a shell in the workspace folder, the local twin of the SSH window."""
     if not shutil.which("tmux"):
         raise RuntimeError("tmux is not installed on the dashboard host")
     root = _normalized_local_root(str(profile.get("workspace_root") or ""))
     if root is None:
         raise RuntimeError("Local workspace folder is missing or is not a directory")
-    window_name = _local_tmux_window_name(profile)
+    window_name = _local_tmux_window_name(profile, index)
     existing = subprocess.run(
         ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
         capture_output=True,
@@ -1239,7 +1275,7 @@ print(json.dumps({'available': available, 'bridge': 'not-configured'}))
 """
 
 
-def _ssh_terminal_argv(profile: dict, session_name: str) -> list[str]:
+def _ssh_terminal_argv(profile: dict, session_name: str, index: int = 0) -> list[str]:
     """Attach a PTY to the session's existing SSH tmux window.
 
     Attaching to the window the connect step already opened means the browser
@@ -1247,7 +1283,7 @@ def _ssh_terminal_argv(profile: dict, session_name: str) -> list[str]:
     control master -- rather than a second SSH login with its own credentials.
     `-r` is deliberately omitted: this view is interactive.
     """
-    window_name = _ssh_tmux_window_name(profile)
+    window_name = _ssh_tmux_window_name(profile, index)
     return [
         "tmux",
         "attach-session",
@@ -1255,12 +1291,14 @@ def _ssh_terminal_argv(profile: dict, session_name: str) -> list[str]:
     ]
 
 
-async def _ssh_terminal_pty(profile: dict, session_name: str, cols: int, rows: int):
+async def _ssh_terminal_pty(
+    profile: dict, session_name: str, cols: int, rows: int, index: int = 0
+):
     """Spawn the tmux client on a PTY sized to the browser's terminal."""
     primary, secondary = pty.openpty()
     try:
         process = await asyncio.create_subprocess_exec(
-            *_ssh_terminal_argv(profile, session_name),
+            *_ssh_terminal_argv(profile, session_name, index),
             stdin=secondary,
             stdout=secondary,
             stderr=secondary,

@@ -3,7 +3,9 @@
   import { ide } from './store.svelte.js'
   import { monokai } from './monokai.js'
 
-  let { rootPath = '', session = '' } = $props()
+  // `index` selects which of the connection's shells this view attaches to,
+  // so several terminals can run side by side against one workspace.
+  let { rootPath = '', session = '', index = 0 } = $props()
 
   let container
   let term = null
@@ -50,7 +52,8 @@
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
     const url =
       `${scheme}://${location.host}${rootPath}/ws/sessions/` +
-      `${encodeURIComponent(session)}/ide/terminal/${encodeURIComponent(ide.connectionId)}`
+      `${encodeURIComponent(session)}/ide/terminal/${encodeURIComponent(ide.connectionId)}` +
+      `?index=${encodeURIComponent(index)}`
     socket = new WebSocket(url)
     socket.binaryType = 'arraybuffer'
 

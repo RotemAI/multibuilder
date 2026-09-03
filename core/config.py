@@ -491,3 +491,8 @@ _CODEX_DOCS_OVERRIDE_RE = re.compile(
 # not read Codex's config.toml. They are stored per session here and applied
 # when the pane starts, rather than written into a config Claude never reads.
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+# How many terminals one IDE connection may open. Each is a tmux window on the
+# dashboard host, so this bounds what a browser can spawn.
+MAX_IDE_TERMINALS = max(1, min(int(os.environ.get("TMUX_DASH_MAX_IDE_TERMINALS", "8")), 32))

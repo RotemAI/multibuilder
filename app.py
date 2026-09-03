@@ -113,6 +113,7 @@ from core.config import (  # noqa: E402
     GOOGLE_MCP_SCRIPT,
     IDE_BUNDLE_DIR,
     MAIL_FROM,
+    MAX_IDE_TERMINALS,
     MESSAGES_DIR,
     MODELS_FILE,
     NEW_SESSION_CMD,
@@ -8128,6 +8129,13 @@ async def remote_ide_page(request: Request, session_name: str):
 
 @app.websocket("/ws/sessions/{session_name}/ide/terminal/{connection_id}")
 async def ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: str):
+    # `?index=N` selects which of the connection's terminals to attach to, so a
+    # workspace can have several independent shells. Index 0 is the original
+    # window, so an old client that sends no index keeps its terminal.
+    await _ws_ssh_ide_terminal(ws, session_name, connection_id)
+
+
+async def _ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: str):
     """Bidirectional PTY bridge to the session's SSH tmux window.
 
     Authorization mirrors the HTTP IDE routes: a valid token, access to the
@@ -8145,6 +8153,14 @@ async def ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: s
     if not profile:
         await ws.close(code=1008)
         return
+    # Clamped rather than rejected: a bad index should open a terminal, not
+    # fail the socket. The cap bounds how many tmux windows one connection can
+    # create from the browser.
+    try:
+        index = int(ws.query_params.get("index") or 0)
+    except (TypeError, ValueError):
+        index = 0
+    index = max(0, min(index, MAX_IDE_TERMINALS - 1))
     if not await asyncio.to_thread(_ssh_control_is_alive, profile, session_name):
         await ws.close(code=1011)
         return
@@ -8152,9 +8168,9 @@ async def ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: s
     # persistent across browser reloads. If that window is gone (killed, or the
     # tmux server restarted) attaching would fail forever, so re-create it and
     # hand the client a working terminal instead of a dead one.
-    if not await asyncio.to_thread(_ssh_tmux_window_exists, profile, session_name):
+    if not await asyncio.to_thread(_ssh_tmux_window_exists, profile, session_name, index):
         try:
-            await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name)
+            await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name, index)
         except (OSError, RuntimeError, subprocess.TimeoutExpired):
             logger.info("Could not re-open terminal window for %s", session_name, exc_info=True)
             await ws.close(code=1011)
@@ -8172,7 +8188,7 @@ async def ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: s
             )
         except OSError:
             logger.exception("Could not append SSH IDE terminal audit event")
-        process, master_fd = await _ssh_terminal_pty(profile, session_name, 80, 24)
+        process, master_fd = await _ssh_terminal_pty(profile, session_name, 80, 24, index)
 
         async def pump_output():
             """Forward PTY bytes to the browser without blocking the loop."""
