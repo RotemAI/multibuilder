@@ -9,6 +9,7 @@ including modules app.py itself imports.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 
 def _is_admin(user: dict | None) -> bool:
@@ -63,3 +64,20 @@ def _tmux_safe_label(raw: str, fallback: str) -> str:
     """
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", str(raw or "")).strip("-")
     return cleaned or fallback
+
+
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# --- public projects: serving + helpers -----------------------------------
+def _safe_seg(s: str) -> bool:
+    return bool(s) and re.match(r"^[A-Za-z0-9.@_-]{1,128}$", s or "") is not None and s not in (".", "..")
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        resolved_root = root.resolve()
+        return path == resolved_root or resolved_root in path.parents
+    except Exception:
+        return False

@@ -17,9 +17,17 @@ import app as dashboard
 # The dashboard markup moved from an inline HTML_PAGE constant into
 # templates/dashboard.html; these assertions scan both so they keep covering the
 # page whichever file a given fragment now lives in.
-SOURCE = (
-    Path(dashboard.__file__).read_text()
-    + (Path(dashboard.__file__).parent / "templates" / "dashboard.html").read_text()
+# The dashboard markup moved into templates/, and helper code into core/ and
+# services/. These assertions scan the whole surface so they keep covering a
+# rule regardless of which module now holds it.
+_ROOT = Path(dashboard.__file__).parent
+SOURCE = "".join(
+    [
+        Path(dashboard.__file__).read_text(),
+        (_ROOT / "templates" / "dashboard.html").read_text(),
+    ]
+    + [p.read_text() for p in sorted((_ROOT / "services").glob("*.py"))]
+    + [p.read_text() for p in sorted((_ROOT / "core").glob("*.py"))]
 )
 
 

@@ -12,6 +12,7 @@ anywhere without creating a cycle.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from pathlib import Path
 
@@ -461,3 +462,32 @@ Consider every modification to a live system more carefully than an ordinary dev
 """,
     },
 }
+
+PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH  # external base incl. the ROOT_PATH subpath (e.g. .../build)
+
+
+# Codex validates every `mcp_servers.*` table while loading config.toml —
+# including a table that only an `-c` override brought into existence. Sending
+# `-c mcp_servers.openaiDeveloperDocs.enabled=false` to a CODEX_HOME whose
+# config.toml does not declare that server therefore CREATES a server with no
+# `command` and no `url`, and Codex refuses to start:
+#
+#     Error: failed to load configuration
+#     Caused by: invalid transport in `mcp_servers.openaiDeveloperDocs`
+#
+# It exits before the TUI draws, the pane falls back to its parent login shell,
+# and the account looks logged out. Member homes never declare that server, so
+# every member session died this way while admin sessions (whose config.toml
+# does declare it) were fine. Only send the override where the server exists.
+_CODEX_DOCS_MCP_SERVER = "openaiDeveloperDocs"
+
+_CODEX_DOCS_MCP_OVERRIDE = f"mcp_servers.{_CODEX_DOCS_MCP_SERVER}.enabled=false"
+
+_CODEX_DOCS_OVERRIDE_RE = re.compile(
+    r"\s+-c\s+(['\"]?)" + re.escape(_CODEX_DOCS_MCP_OVERRIDE) + r"\1"
+)
+
+# Claude Code takes effort and model as LAUNCH FLAGS (--effort/--model); it does
+# not read Codex's config.toml. They are stored per session here and applied
+# when the pane starts, rather than written into a config Claude never reads.
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")

@@ -69,6 +69,9 @@ from core import users as core_users  # noqa: E402
 from core.config import (  # noqa: E402
     _CLAUDE_API_KEYS_MD,
     _CODEX_DEFAULT_MODEL,
+    _CODEX_DOCS_MCP_OVERRIDE,
+    _CODEX_DOCS_MCP_SERVER,
+    _CODEX_DOCS_OVERRIDE_RE,
     _CODEX_MIN_CLI_VERSION,
     _CONTEXT_FILES,
     _DEFAULT_BROWSER_SESSION,
@@ -94,6 +97,7 @@ from core.config import (  # noqa: E402
     BROWSER_PARK_AFTER,
     BROWSER_POLICY_FILE,
     CB_ROOT,
+    CLAUDE_EFFORTS,
     CLAUDE_SESSION_CMD,
     CODEX_API_FALLBACK_ENABLED,
     CODEX_HOME,
@@ -118,6 +122,7 @@ from core.config import (  # noqa: E402
     PORT,
     PROCESS_ROLE,
     PROJECTS_ROOT,
+    PUB_URL,
     PUBLIC_BASE_URL,
     QA_OUTPUT_DIR,
     RESEND_API_KEY,
@@ -165,8 +170,11 @@ from core.users import (  # noqa: E402
     _user_presence,
 )
 from core.validators import (  # noqa: E402
+    _html_escape,
     _is_admin,
     _is_valid_session_name,
+    _path_within,
+    _safe_seg,
     _tmux_safe_label,
     _valid_git_branch,
     _valid_git_commit_ref,
@@ -181,12 +189,37 @@ from runtime_control import (
     scoped_codex_command,
     user_systemd_argv,
 )
+
+# Agent context files, git rules and auto-push mode now live in
+# services/agent_config.py.
+from services import agent_config as agent_config_service  # noqa: E402
 from services import autonomous as autonomous_service  # noqa: E402
 from services import browser as browser_service  # noqa: E402
 
 # config.toml editing and CLI readiness now live in services/codex_config.py.
 from services import codex_config as codex_config_service  # noqa: E402
+
+# Google sign-in and connected-service OAuth now live in services/google_auth.py.
+from services import google_auth as google_auth_service  # noqa: E402
+
+# Member Codex isolation and advisor sync now live in
+# services/member_auth.py.
+from services import member_auth as member_auth_service  # noqa: E402
+
+# Public project serving and the Codex alert log now live in
+# services/projects.py.
+from services import projects as projects_service  # noqa: E402
+
+# Session launch and lifecycle now live in services/session_launch.py.
+from services import session_launch as session_launch_service  # noqa: E402
 from services import ssh as ssh_service  # noqa: E402
+
+# Per-session stores (messages, notes, skills, memory) now live in
+# services/stores.py.
+from services import stores as stores_service  # noqa: E402
+
+# Shared terminal stream fan-out now lives in services/terminal.py.
+from services import terminal as terminal_service  # noqa: E402
 from services import tmux as tmux_service  # noqa: E402
 
 # The Remote SSH IDE service now lives in services/ssh.py. Route handlers
@@ -197,6 +230,41 @@ from services import tmux as tmux_service  # noqa: E402
 # tmux inspection and agent activity detection now live in services/tmux.py.
 # Usage accounting (tokens, cost, prompt audit) now lives in services/usage.py.
 from services import usage as usage_service  # noqa: E402
+
+# Session watchdogs now live in services/watchdog.py.
+from services import watchdog as watchdog_service  # noqa: E402
+from services.agent_config import (  # noqa: E402
+    _CONTEXT_DIRS,
+    _CONTEXT_TOP_FILES,
+    _DEFAULT_GLOBAL_CONTEXT,
+    _GIT_RULES,
+    _GIT_RULES_BEGIN,
+    _GIT_RULES_END,
+    _GLOBAL_CTX_BEGIN,
+    _GLOBAL_CTX_END,
+    _GROUP_CTX_BEGIN,
+    _GROUP_CTX_END,
+    AUTOPUSH_DEFAULT,
+    AUTOPUSH_MODE_FILE,
+    AUTOPUSH_MODES,
+    GLOBAL_CONTEXT_FILE,
+    _autopush_mode,
+    _context_file_entries,
+    _context_root,
+    _ensure_global_context_file,
+    _get_autopush_mode,
+    _list_context_files,
+    _load_autopush_mode,
+    _my_context_path,
+    _read_global_context,
+    _read_group_context,
+    _remove_legacy_global_context_from_agents,
+    _save_autopush_mode,
+    _setup_shared_git_config,
+    _sync_git_rules_into,
+    _sync_global_context_into,
+    _sync_group_context_into,
+)
 from services.autonomous import (  # noqa: E402
     _AWAY_PING_PROMPT,
     _GN_PHASE1_PROMPT,
@@ -320,6 +388,117 @@ from services.codex_config import (  # noqa: E402
     _toml_basic_string,
     _toml_escape,
 )
+from services.google_auth import (  # noqa: E402
+    _GOOGLE_BTN_HTML,
+    CONNECTIONS_DIR,
+    GOOGLE_DRIVE_SCOPE,
+    GOOGLE_GMAIL_SCOPE,
+    GOOGLE_LABELS,
+    GOOGLE_LOGIN_SCOPES,
+    GOOGLE_LOGIN_STATE_COOKIE,
+    GOOGLE_MCP_AUDIT_FILE,
+    GOOGLE_MCP_PYTHON,
+    GOOGLE_OAUTH_CLIENT_FILE,
+    GOOGLE_SCOPES,
+    GOOGLE_WORKSPACE_REQUIRED_SCOPES,
+    _callback_uri,
+    _conn_path,
+    _ensure_google_mcp,
+    _extract_oauth_code,
+    _google_client,
+    _google_email_allowed,
+    _google_login_enabled,
+    _google_login_redirect_uri,
+    _google_login_user,
+    _google_mcp_command,
+    _google_workspace_delegation_ready,
+    _google_workspace_subject,
+    _jwt_claims,
+    _sign_state,
+    _sync_admin_google_email,
+    _verify_state,
+    _write_google_mcp,
+)
+from services.member_auth import (  # noqa: E402
+    _CODEX_AUTH_PROBE_FLOOR,
+    _CODEX_AUTH_PROBE_MAX_AGE,
+    SHARED_CODEX_AUTH,
+    _advisor_live_sync_enabled,
+    _advisor_request,
+    _apply_member_auth,
+    _codex_auth_display,
+    _codex_auth_fallback_state,
+    _codex_auth_health,
+    _codex_auth_status_dict,
+    _codex_auth_validation_lock,
+    _codex_health_auth,
+    _configure_member_codex_isolation,
+    _ensure_codex_auth_with_fallback,
+    _member_developer_instructions,
+    _repair_member_codex_auth,
+    _set_member_codex_permissions,
+    _sync_advisor_user,
+    _sync_permission_groups_with_advisor,
+)
+from services.projects import (  # noqa: E402
+    _CODEX_ALERT_MAX,
+    _CODEX_ALERT_REPEAT_WINDOW,
+    _CODEX_MCP_HEADER_RE,
+    _PROJ_NOTE,
+    _PROJ_NOTE_BEGIN,
+    _PROJ_NOTE_END,
+    _PROJECT_FILES,
+    _PROJECTS_PAGE_CSS,
+    CODEX_ALERTS_FILE,
+    ProjectFileBody,
+    _build_project_isolation_preamble,
+    _codex_alerts_lock,
+    _codex_alerts_snapshot,
+    _codex_app_server_account_read,
+    _codex_app_server_initialize,
+    _codex_app_server_process,
+    _codex_app_server_rate_limits,
+    _codex_app_server_send,
+    _codex_app_server_wait,
+    _codex_home_mcp_servers,
+    _codex_mcp_decl_cache,
+    _encode_project_path,
+    _ensure_codex_project_trust,
+    _list_projects,
+    _member_can_serve_file,
+    _member_session_project_dir,
+    _project_dir,
+    _project_dir_for_cwd,
+    _projects_page_html,
+    _publish_codex_auth_state,
+    _read_codex_alerts_locked,
+    _resolve_codex_alerts,
+    _run_api_server,
+    _safe_project_path,
+    _sync_projects_note_into,
+    _terminate_codex_app_server,
+    _user_projects_dir,
+    _write_codex_alerts_locked,
+)
+from services.session_launch import (  # noqa: E402
+    SESSION_LIFECYCLE_FILE,
+    _agent_quit_command,
+    _archive_tmux_scrollback,
+    _claude_launch_flags,
+    _launch_codex_cmd,
+    _park_session_local,
+    _restore_parked_tmux_shell,
+    _resume_parked_session,
+    _session_agent_kind,
+    _session_agents_file,
+    _session_agents_store,
+    _session_claude_setting,
+    _session_launch_base,
+    _session_launch_command,
+    _session_launch_identity_prefix,
+    _session_lifecycle_loop,
+    _set_session_agent,
+)
 from services.ssh import (  # noqa: E402
     _SSH_BROWSE_SCRIPT,
     _SSH_FILESYSTEM_SCRIPT,
@@ -410,6 +589,47 @@ from services.ssh import (  # noqa: E402
     _valid_ssh_host,
     _WorkspaceCommand,
 )
+from services.stores import (  # noqa: E402
+    _MEMORY_EXTRA_RE,
+    _SKILL_DIR_NAME_RE,
+    _SKILL_FILENAME_RE,
+    SKILL_LIBRARY_DIR,
+    SKILLS_DIR,
+    SaveLibrarySkillBody,
+    SkillFileBody,
+    SkillLibraryBody,
+    _account_skills_dir,
+    _list_library_skills,
+    _load_all_notes,
+    _load_messages,
+    _load_session_messages,
+    _load_session_notes,
+    _materialize_member_skills,
+    _parse_skill_frontmatter,
+    _read_skill_dir,
+    _sanitize_memory_filename,
+    _sanitize_skill_dir_name,
+    _sanitize_skill_filename,
+    _save_messages,
+    _save_notes,
+    _session_memory_dir,
+    _skill_dir_for_session,
+    _sync_group_skills_into,
+    _user_messages_file,
+    _user_notes_file,
+    get_notes,
+)
+from services.terminal import (  # noqa: E402
+    _controller_terminal_connection,
+    _terminal_broadcast,
+    _terminal_channels,
+    _terminal_full_payload,
+    _terminal_next_payload,
+    _terminal_producer,
+    _terminal_send,
+    _terminal_subscribe,
+    _terminal_unsubscribe,
+)
 from services.tmux import (  # noqa: E402
     _AGENT_PROCESS_NAMES,
     _CODEX_CONVERSATION_RE,
@@ -495,6 +715,56 @@ from services.usage import (  # noqa: E402
     _usage_err,
     _usage_na,
     _user_lifetime_stats,
+)
+from services.watchdog import (  # noqa: E402
+    _CODEX_HEALTH_COOLDOWN,
+    _CODEX_HEALTH_INTERVAL,
+    _LOGIN_FLOW_STALE_AFTER,
+    _LOGIN_NEEDED_RE,
+    _LOGIN_WATCHDOG_COOLDOWN,
+    _LOGIN_WATCHDOG_INTERVAL,
+    _MAX_NUDGES_BEFORE_RESTART,
+    _NUDGE_COOLDOWN,
+    _NUDGE_PROMPT,
+    _SIMPLE_WATCHDOG_COOLDOWN,
+    _SIMPLE_WATCHDOG_IDLE_SECS,
+    _SIMPLE_WATCHDOG_INTERVAL,
+    _SIMPLE_WATCHDOG_MAX_LOG,
+    _SIMPLE_WATCHDOG_MAX_SAME_STALL,
+    _SIMPLE_WATCHDOG_SYSTEM_PROMPT,
+    _STALL_THRESHOLD,
+    _TMP_WATCHDOG_CRITICAL_PCT,
+    _TMP_WATCHDOG_INTERVAL,
+    _TMP_WATCHDOG_PROTECTED_PREFIXES,
+    _TMP_WATCHDOG_SAFE_AGE_CRITICAL,
+    _TMP_WATCHDOG_SAFE_AGE_NORMAL,
+    _TMP_WATCHDOG_WARN_PCT,
+    _WATCHDOG_INTERVAL,
+    _WATCHDOG_SAFE_CONTINUE,
+    SIMPLE_WATCHDOG_DISABLED_FILE,
+    _codex_health_state,
+    _codex_health_watchdog_loop,
+    _crash_recovery_state,
+    _load_simple_watchdog_disabled,
+    _login_watchdog_loop,
+    _login_watchdog_state,
+    _save_simple_watchdog_disabled,
+    _seen_claude_running,
+    _simple_watchdog_disabled,
+    _simple_watchdog_log,
+    _simple_watchdog_loop,
+    _simple_watchdog_record,
+    _simple_watchdog_send_continue,
+    _simple_watchdog_send_text,
+    _simple_watchdog_state,
+    _tmp_watchdog_check,
+    _tmp_watchdog_loop,
+    _tmp_watchdog_prune,
+    _tmp_watchdog_size,
+    _watchdog_check_session,
+    _watchdog_loop,
+    _watchdog_restart_mode,
+    _watchdog_snapshots,
 )
 
 if PROCESS_ROLE not in {"combined", "api", "controller"}:
@@ -624,85 +894,6 @@ async def _model_refresh_loop():
         await asyncio.sleep(3600)
 
 
-_CODEX_MCP_HEADER_RE = re.compile(r"^\s*\[\s*mcp_servers\s*\.\s*([^\].]+?)\s*[\].]")
-_codex_mcp_decl_cache: dict[str, tuple[float, int, frozenset[str]]] = {}
-
-
-def _codex_home_mcp_servers(codex_home: Path | None) -> frozenset[str]:
-    """Names of the MCP servers a CODEX_HOME's ``config.toml`` really declares.
-
-    Cached on (mtime, size) so starting a session does not re-read the file.
-    """
-    path = Path(codex_home or CODEX_HOME) / "config.toml"
-    key = str(path)
-    try:
-        stat = path.stat()
-    except OSError:
-        _codex_mcp_decl_cache.pop(key, None)
-        return frozenset()
-    cached = _codex_mcp_decl_cache.get(key)
-    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-        return cached[2]
-    names: set[str] = set()
-    try:
-        for line in path.read_text(errors="replace").splitlines():
-            match = _CODEX_MCP_HEADER_RE.match(line)
-            if match:
-                names.add(match.group(1).strip().strip("\"'"))
-    except OSError:
-        return frozenset()
-    resolved = frozenset(names)
-    _codex_mcp_decl_cache[key] = (stat.st_mtime, stat.st_size, resolved)
-    return resolved
-
-
-# Codex validates every `mcp_servers.*` table while loading config.toml —
-# including a table that only an `-c` override brought into existence. Sending
-# `-c mcp_servers.openaiDeveloperDocs.enabled=false` to a CODEX_HOME whose
-# config.toml does not declare that server therefore CREATES a server with no
-# `command` and no `url`, and Codex refuses to start:
-#
-#     Error: failed to load configuration
-#     Caused by: invalid transport in `mcp_servers.openaiDeveloperDocs`
-#
-# It exits before the TUI draws, the pane falls back to its parent login shell,
-# and the account looks logged out. Member homes never declare that server, so
-# every member session died this way while admin sessions (whose config.toml
-# does declare it) were fine. Only send the override where the server exists.
-_CODEX_DOCS_MCP_SERVER = "openaiDeveloperDocs"
-_CODEX_DOCS_MCP_OVERRIDE = f"mcp_servers.{_CODEX_DOCS_MCP_SERVER}.enabled=false"
-_CODEX_DOCS_OVERRIDE_RE = re.compile(
-    r"\s+-c\s+(['\"]?)" + re.escape(_CODEX_DOCS_MCP_OVERRIDE) + r"\1"
-)
-
-
-def _launch_codex_cmd(
-    cmd: str,
-    pin_model: bool = True,
-    resume: bool = False,
-    codex_home: Path | None = None,
-) -> str:
-    """Build a Codex launch command using the account's standard configuration."""
-    out = cmd.strip() or NEW_SESSION_CMD
-    if resume:
-        out = "codex resume --last"
-        if "--yolo" in cmd or "--dangerously-bypass-approvals-and-sandbox" in cmd:
-            out += " --yolo"
-        elif "--sandbox" in cmd or " -s " in f" {cmd} ":
-            out += " --sandbox workspace-write --ask-for-approval never"
-    if pin_model and DEFAULT_MODEL and "--model" not in out and " -m " not in f" {out} ":
-        out += " --model " + shlex.quote(DEFAULT_MODEL)
-    # Strip any inherited copy first: a stored session command must not be able
-    # to smuggle the override into a home that does not declare the server.
-    out = _CODEX_DOCS_OVERRIDE_RE.sub("", out).strip()
-    if (
-        _DISABLE_STALLED_OPENAI_DOCS_MCP
-        and _CODEX_DOCS_MCP_SERVER in _codex_home_mcp_servers(codex_home)
-    ):
-        out += " -c " + shlex.quote(_CODEX_DOCS_MCP_OVERRIDE)
-    if not CODEX_API_FALLBACK_ENABLED:
-        out = "env -u OPENAI_API_KEY " + out
-    return out
 
 
 
@@ -711,65 +902,27 @@ def _launch_codex_cmd(
 
 
 
-def _session_agents_file() -> Path:
-    # Resolved lazily: this helper is defined above MESSAGES_DIR, and binding
-    # the path at import time would fail with an undefined name.
-    return MESSAGES_DIR / "session_agents.json"
 
 
-def _session_agents_store():
-    return _shared_store("session_agents", _session_agents_file(), dict)
 
 
-def _session_agent_kind(session_name: str) -> str:
-    try:
-        row = (_session_agents_store().read() or {}).get(str(session_name))
-        # Rows were plain strings before per-agent settings were added; accept
-        # both shapes so existing sessions keep their agent after an upgrade.
-        raw = row.get("agent") if isinstance(row, dict) else row
-        value = str(raw or "").strip().lower()
-        return value if value in {"codex", "claude"} else "codex"
-    except Exception:
-        return "codex"
 
 
-def _set_session_agent(session_name: str, agent: str) -> None:
-    def mutate(agents: dict):
-        # Preserve any sibling settings (effort, model) stored for this session.
-        row = agents.get(str(session_name))
-        if isinstance(row, dict):
-            row["agent"] = str(agent)
-        else:
-            agents[str(session_name)] = {"agent": str(agent)}
-
-    _session_agents_store().update(mutate)
 
 
-# Claude Code takes effort and model as LAUNCH FLAGS (--effort/--model); it does
-# not read Codex's config.toml. They are stored per session here and applied
-# when the pane starts, rather than written into a config Claude never reads.
-CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+
+
+
+
 CLAUDE_MODEL_ALIASES = ("fable", "opus", "sonnet")
 
 
 
 
-def _agent_quit_command(session_name: str) -> str:
-    """The slash command that exits this session's agent.
-
-    Codex quits on "/quit", Claude Code on "/exit". Sending the wrong one is not
-    inert: the live agent treats it as a chat message, stays running, and the
-    caller then believes the pane is free.
-    """
-    return "/exit" if _session_agent_kind(session_name) == "claude" else "/quit"
 
 
-def _session_claude_setting(session_name: str, key: str) -> str:
-    try:
-        row = (_session_agents_store().read() or {}).get(str(session_name))
-        return str(row.get(key) or "") if isinstance(row, dict) else ""
-    except Exception:
-        return ""
 
 
 def _set_session_claude_setting(session_name: str, key: str, value: str) -> None:
@@ -790,95 +943,12 @@ def _clear_session_agent(session_name: str) -> None:
     _session_agents_store().update(mutate)
 
 
-def _claude_launch_flags(session_name: str) -> str:
-    """--effort/--model flags for this session's stored Claude settings."""
-    parts = []
-    effort = _session_claude_setting(session_name, "claude_effort")
-    if effort in CLAUDE_EFFORTS:
-        parts.append("--effort " + shlex.quote(effort))
-    model = _session_claude_setting(session_name, "claude_model")
-    if model and re.fullmatch(r"[A-Za-z0-9._:-]{2,80}", model):
-        parts.append("--model " + shlex.quote(model))
-    return (" " + " ".join(parts)) if parts else ""
 
 
-def _session_launch_base(session_name: str = "", user: dict | None = None) -> str:
-    """Use the canonical full-access launch for members and configured admin command."""
-    if session_name and _session_agent_kind(session_name) == "claude":
-        return CLAUDE_SESSION_CMD + _claude_launch_flags(session_name)
-    try:
-        owner = user or (_user_for_session(session_name) if session_name else None)
-        if owner and not _is_admin(owner):
-            return "codex --yolo"
-    except Exception:
-        pass
-    return NEW_SESSION_CMD
 
 
-def _session_launch_identity_prefix(session_name: str) -> str:
-    """Rebind account identity inside the login shell used by systemd-run.
-
-    The shared OS login exports the admin Advisor token. A member's parent tmux
-    shell may be correct, but ``bash -lc`` sources login files again, so the
-    final child command must override both values after that startup sequence.
-    """
-    owner = _user_for_session(session_name)
-    if owner and not _is_admin(owner):
-        codex_home = _user_codex_config_dir(owner)
-        token_path = codex_home / "advisor-token"
-        return (
-            "env CODEX_HOME="
-            + shlex.quote(str(codex_home))
-            + " CLAUDE_CONFIG_DIR="
-            + shlex.quote(str(_user_claude_config_dir(owner)))
-            + " ADVISOR_TOKEN=\"$(cat "
-            + shlex.quote(str(token_path))
-            + " 2>/dev/null)\""
-        )
-    token_path = Path.home() / ".advisor-token"
-    return (
-        # CLAUDE_CONFIG_DIR is deliberately NOT set for the admin: Claude's
-        # default layout keeps credentials in ~/.claude/.credentials.json but
-        # its main config at ~/.claude.json (home level, not inside the dir).
-        # Pointing CLAUDE_CONFIG_DIR at ~/.claude makes Claude look for
-        # ~/.claude/.claude.json, miss the real config, and rewrite a blank one.
-        # Inheriting the environment is what keeps the existing login working.
-        "env -u CODEX_HOME ADVISOR_TOKEN=\"$(cat "
-        + shlex.quote(str(token_path))
-        + " 2>/dev/null)\""
-    )
 
 
-def _session_launch_command(
-    session_name: str,
-    base: str,
-    *,
-    pin_model: bool = True,
-    resume: bool = False,
-) -> str:
-    """Build the agent command and keep its process tree in a session scope."""
-    if _session_agent_kind(session_name) == "claude":
-        # Claude Code takes none of Codex's --model / CODEX_HOME flags; passing
-        # them through _launch_codex_cmd would produce an invalid command line.
-        # It does have its own resume flag, though: without it a crash-restart
-        # silently dropped the whole conversation while logging "restarted".
-        launch = base + (" --continue" if resume else "")
-    else:
-        launch = _launch_codex_cmd(
-            base,
-            pin_model=pin_model,
-            resume=resume,
-            codex_home=_session_config_base(session_name),
-        )
-    launch = _session_launch_identity_prefix(session_name) + " " + launch
-    return scoped_codex_command(
-        session_name,
-        launch,
-        memory_high_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_HIGH_MB", "2048")),
-        memory_max_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_MAX_MB", "4096")),
-        tasks_max=int(os.environ.get("TMUX_DASH_CODEX_TASKS_MAX", "768")),
-        cpu_weight=int(os.environ.get("TMUX_DASH_CODEX_CPU_WEIGHT", "100")),
-    )
 
 
 # Compatibility aliases used by newer Grabo paths while the implementation is Codex.
@@ -916,13 +986,11 @@ def _model_flag_for_relaunch(session_name: str) -> str:
         model = DEFAULT_MODEL
     return f" --model {shlex.quote(model)}" if model else ""
 
-PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH  # external base incl. the ROOT_PATH subpath (e.g. .../build)
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 SAVED_INFO_PROMPT_VERSION = "v4"
 
-SESSION_LIFECYCLE_FILE = MESSAGES_DIR / "session-lifecycle.json"
 CONTROLLER_SNAPSHOT_FILE = MESSAGES_DIR / "controller-runtime.json"
 # Session lifecycle rides on the shared store so a session's working directory
 # survives a tmux server death -- the metadata is what makes a session
@@ -940,22 +1008,9 @@ _controller_snapshot = LockedJsonStore(
     CONTROLLER_SNAPSHOT_FILE, lambda: {"version": 1}
 )
 OPENAI_KEY_FILE = MESSAGES_DIR / "openai_api_key"
-GOOGLE_MCP_PYTHON = MESSAGES_DIR / "mcp" / "venv" / "bin" / "python"
 _stored_openai_key: str = ""
 
 
-def _google_mcp_command() -> str:
-    """Return the configured command or this checkout's deployed MCP runtime."""
-    configured = os.environ.get("GOOGLE_MCP_COMMAND", "").strip()
-    if configured:
-        return configured
-    if (
-        GOOGLE_MCP_PYTHON.is_file()
-        and os.access(GOOGLE_MCP_PYTHON, os.X_OK)
-        and GOOGLE_MCP_SCRIPT.is_file()
-    ):
-        return shlex.join((str(GOOGLE_MCP_PYTHON), str(GOOGLE_MCP_SCRIPT)))
-    return ""
 
 
 def _load_openai_key() -> str:
@@ -1105,80 +1160,18 @@ def _load_autonomous_state() -> dict[str, dict]:
     return {}
 
 
-# --- Simple Watchdog ---
-# Default-ON, lightweight watchdog that auto-replies "continue" when Codex is
-# idle waiting for the user to confirm whether to keep working on the current
-# task. Does NOT take initiative on truly finished work — only resolves the
-# "shall I continue?" pause case. Per-session opt-out persisted to disk.
-SIMPLE_WATCHDOG_DISABLED_FILE = MESSAGES_DIR / "simple-watchdog-disabled.json"
-_simple_watchdog_disabled: set = set()
-# Per-session log of recent "continue" sends, capped at 20 entries.
-_simple_watchdog_log: dict[str, list] = {}
-# Per-session bookkeeping: {"idle_since": float, "last_action": float, "last_hash": str}
-_simple_watchdog_state: dict[str, dict] = {}
 
 
-def _save_simple_watchdog_disabled():
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        SIMPLE_WATCHDOG_DISABLED_FILE.write_text(json.dumps(sorted(_simple_watchdog_disabled)))
-    except Exception:
-        logger.debug("Failed to save simple-watchdog disabled list", exc_info=True)
 
 
-def _load_simple_watchdog_disabled():
-    global _simple_watchdog_disabled
-    try:
-        if SIMPLE_WATCHDOG_DISABLED_FILE.exists():
-            data = json.loads(SIMPLE_WATCHDOG_DISABLED_FILE.read_text())
-            if isinstance(data, list):
-                _simple_watchdog_disabled = set(data)
-    except Exception:
-        logger.debug("Failed to load simple-watchdog disabled list", exc_info=True)
 
 
-# --- Auto-push mode (per session): "off" | "basic" | "full" ---
-# Governs how much the dashboard is allowed to type into a session's terminal on
-# the user's behalf when Codex stops or waits:
-#   off   — never write anything at all (no option-picking, no Enter on prompts,
-#           no auto /login, no free-form "keep going" messages).
-#   basic — auto-pick from Codex's option menus and confirm permission/plan
-#           prompts (press Enter), and keep the session logged in. Does NOT type
-#           any free-form instructions.
-#   full  — everything in "basic" PLUS the autopilot watchdog that composes and
-#           types a "keep going" message when Codex pauses waiting on the user
-#           before a task is finished. (This was the previous always-on behavior.)
-# New sessions default to "basic". Persisted per session to disk.
-AUTOPUSH_MODES = ("off", "basic", "full")
-AUTOPUSH_DEFAULT = "basic"
-AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
-_autopush_mode: dict[str, str] = {}
 
 
-def _get_autopush_mode(session_name: str) -> str:
-    m = _autopush_mode.get(session_name, AUTOPUSH_DEFAULT)
-    return m if m in AUTOPUSH_MODES else AUTOPUSH_DEFAULT
 
 
-def _save_autopush_mode():
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        AUTOPUSH_MODE_FILE.write_text(json.dumps(_autopush_mode))
-    except Exception:
-        logger.debug("Failed to save autopush-mode map", exc_info=True)
 
 
-def _load_autopush_mode():
-    global _autopush_mode
-    try:
-        if AUTOPUSH_MODE_FILE.exists():
-            data = json.loads(AUTOPUSH_MODE_FILE.read_text())
-            if isinstance(data, dict):
-                _autopush_mode = {
-                    str(k): v for k, v in data.items() if v in AUTOPUSH_MODES
-                }
-    except Exception:
-        logger.debug("Failed to load autopush-mode map", exc_info=True)
 
 
 def _is_codex_running(session_name: str) -> bool:
@@ -1573,12 +1566,8 @@ def _user_data_dir(user: dict | None) -> Path:
     return d
 
 
-def _user_messages_file(user: dict | None) -> Path:
-    return _user_data_dir(user) / "messages.json"
 
 
-def _user_notes_file(user: dict | None) -> Path:
-    return _user_data_dir(user) / "notes.json"
 
 
 def _user_uploads_dir(user: dict | None) -> Path:
@@ -1612,19 +1601,6 @@ core_users.configure_secret(AUTH_SECRET)
 core_users.configure_users_provider(lambda: globals()["_load_users"]())
 
 
-def _member_session_project_dir(user: dict, session_name: str) -> Path:
-    """Return and create the private project root for one member session."""
-    username = str(user.get("username") or user.get("id") or "")
-    if not re.fullmatch(r"[A-Za-z0-9.@_-]{1,128}", username):
-        username = str(user.get("id") or "member")
-    safe_session = str(session_name or "")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", safe_session):
-        safe_session = "session-" + hashlib.sha256(
-            safe_session.encode("utf-8")
-        ).hexdigest()[:16]
-    project_dir = PROJECTS_ROOT / username / safe_session
-    project_dir.mkdir(parents=True, exist_ok=True)
-    return project_dir
 
 
 
@@ -1635,19 +1611,6 @@ def _member_session_project_dir(user: dict, session_name: str) -> Path:
 
 
 
-def _member_developer_instructions(user: dict) -> str:
-    """Combine host policy with the signed-in account's fixed permission group."""
-    global_context = _read_global_context().strip()
-    sections = [global_context]
-    # Existing deployments keep their admin-edited global context file. Append
-    # the managed publishing rule when that file predates it, rather than
-    # overwriting the administrator's policy to pick up a new default.
-    if "local filesystem path as the only link to a work product" not in global_context:
-        sections.append(_PROJ_NOTE.replace("__PUBURL__", PUB_URL).strip())
-    group = PERMISSION_GROUPS.get(str(user.get("group") or ""))
-    if group:
-        sections.append(str(group.get("instructions") or "").strip())
-    return "\n\n".join(section for section in sections if section)
 
 
 def _existing_playwright_block(config_text: str) -> str:
@@ -1686,193 +1649,6 @@ def _existing_playwright_block(config_text: str) -> str:
     return begin + "\n" + "\n".join(out).rstrip() + "\n" + end + "\n"
 
 
-def _configure_member_codex_isolation(
-    cfg_dir: Path,
-    user: dict,
-    browser: dict | None = None,
-) -> bool:
-    """Write the complete unattended full-access config for one member."""
-    if not user or _is_admin(user):
-        return False
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    config = cfg_dir / "config.toml"
-    existing = config.read_text() if config.exists() else ""
-    project_root = PROJECTS_ROOT / str(user.get("username") or user["id"])
-    trusted_projects = []
-    try:
-        trusted_projects = [
-            project_root / session_name
-            for session_name, owner_id in sorted(
-                _load_session_owners().items()
-            )
-            if owner_id == user.get("id")
-            and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", session_name)
-        ]
-    except Exception:
-        logger.warning(
-            "Could not enumerate trusted projects for member %s",
-            user.get("id", ""),
-            exc_info=True,
-        )
-
-    lines = [
-        'model = "gpt-5.6-sol"',
-        'model_reasoning_effort = "max"',
-        "check_for_update_on_startup = false",
-        'approval_policy = "never"',
-        'default_permissions = ":danger-full-access"',
-        (
-            "developer_instructions = "
-            + _toml_basic_string(_member_developer_instructions(user))
-        ),
-        "",
-        "[notice]",
-        "hide_full_access_warning = true",
-        "",
-        "[features]",
-        "remote_plugin = false",
-        "apps = false",
-        "memories = true",
-        "",
-        "[memories]",
-        "use_memories = true",
-        "generate_memories = true",
-        "disable_on_external_context = true",
-        "",
-        "[tui.model_availability_nux]",
-        '"gpt-5.6-sol" = 3',
-    ]
-    for trusted_project in trusted_projects:
-        lines.extend((
-            "",
-            f'[projects."{_toml_escape(str(trusted_project))}"]',
-            'trust_level = "trusted"',
-        ))
-    lines.extend((
-        "",
-        "[apps._default]",
-        "enabled = false",
-    ))
-    # A managed playwright block that already exists is KEPT verbatim, whether or
-    # not this caller resolved a browser. _ensure_browser_mcp owns that block; if
-    # this function also rewrote it the two would undo each other on every sync.
-    keep = _existing_playwright_block(existing)
-    if keep:
-        lines.extend(("", keep.rstrip("\n")))
-    if (
-        not keep
-        and browser
-        and str(browser.get("owner_id", "")) == str(user.get("id", ""))
-        and browser.get("account_browser")
-        and int(browser.get("cdp_port", 0) or 0) > 0
-    ):
-        browser_output = cfg_dir / "browser-output"
-        browser_output.mkdir(parents=True, exist_ok=True)
-        try:
-            browser_output.chmod(0o700)
-        except OSError:
-            logger.debug(
-                "Could not set private permissions on %s",
-                browser_output,
-                exc_info=True,
-            )
-        lines.extend((
-            "",
-            "# BEGIN GRABO PLAYWRIGHT MCP (managed)",
-            "[mcp_servers.playwright-browser]",
-            'command = "node"',
-            (
-                'args = ["'
-                + _toml_escape(str(PLAYWRIGHT_MCP_CLI))
-                + '", "--cdp-endpoint", "http://127.0.0.1:'
-                + str(int(browser["cdp_port"]))
-                + '", "--output-dir", "'
-                + _toml_escape(str(browser_output))
-                + '"]'
-            ),
-            "startup_timeout_sec = 30",
-            "tool_timeout_sec = 120",
-            "# END GRABO PLAYWRIGHT MCP",
-        ))
-    google_cmd = _google_mcp_command()
-    try:
-        google_parts = shlex.split(google_cmd)
-    except ValueError:
-        google_parts = []
-    if google_parts:
-        google_args = ", ".join(
-            f'"{_toml_escape(value)}"' for value in google_parts[1:]
-        )
-        google_env = [
-            (
-                'GOOGLE_MCP_CREDENTIALS_DIR = "'
-                + _toml_escape(str(CONNECTIONS_DIR / user["id"]))
-                + '"'
-            ),
-            (
-                'GOOGLE_OAUTH_CLIENT_FILE = "'
-                + _toml_escape(str(GOOGLE_OAUTH_CLIENT_FILE))
-                + '"'
-            ),
-        ]
-        dwd_subject = _google_workspace_subject(user)
-        if dwd_subject:
-            google_env.extend((
-                (
-                    'GOOGLE_WORKSPACE_DWD_SERVICE_ACCOUNT_FILE = "'
-                    + _toml_escape(str(GOOGLE_DWD_SERVICE_ACCOUNT_FILE))
-                    + '"'
-                ),
-                (
-                    'GOOGLE_WORKSPACE_DWD_SUBJECT = "'
-                    + _toml_escape(dwd_subject)
-                    + '"'
-                ),
-            ))
-        lines.extend((
-            "",
-            "# BEGIN GRABO GOOGLE MCP (managed)",
-            "[mcp_servers.google]",
-            f'command = "{_toml_escape(google_parts[0])}"',
-            f"args = [{google_args}]",
-            'default_tools_approval_mode = "approve"',
-            "",
-            "[mcp_servers.google.env]",
-            *google_env,
-            "# END GRABO GOOGLE MCP",
-        ))
-    # The advisor is the single source of truth every builder host shares, and a
-    # member reaches it as THEMSELVES: the token file below is per-account and the
-    # launcher exports it as ADVISOR_TOKEN, so the advisor applies that person's
-    # role and group. Without this block the token existed but no tool did.
-    if (cfg_dir / "advisor-token").is_file():
-        lines.extend((
-            "",
-            "# BEGIN GRABO ADVISOR MCP (managed)",
-            "[mcp_servers.advisor]",
-            f'url = "{_toml_escape(ADVISOR_BASE_URL)}/mcp"',
-            'bearer_token_env_var = "ADVISOR_TOKEN"',
-            "# END GRABO ADVISOR MCP",
-        ))
-    # The document vault is NOT wired directly any more. It used to be: every
-    # member's config.toml carried the vault's bearer key and talked to
-    # https://grabo.cc/docvault-mcp/mcp itself, so ~150,000 company documents
-    # (payroll runs, bank paperwork, passport scans) were reachable with no
-    # per-person check and the key sat in fifteen files on disk. The advisor
-    # holds the key now and exposes `docvault_search` / `docvault_get`, which
-    # apply the caller's permission group to the query and to what comes back.
-    # Any leftover block from the old wiring is stripped below.
-    updated = "\n".join(lines) + "\n"
-    updated = _strip_managed_block(updated, "GRABO DOCVAULT MCP")
-    # Fixed point: collapse blank runs and settle the trailing newline, so the
-    # next sync produces exactly this text and writes nothing.
-    updated = re.sub(r"\n{3,}", "\n\n", updated).strip("\n") + "\n"
-    tomllib.loads(updated)
-    if updated == existing:
-        return False
-    _backup_before_dashboard_write(config)
-    config.write_text(updated)
-    return True
 
 
 def _strip_managed_block(text: str, marker: str) -> str:
@@ -1888,58 +1664,8 @@ def _strip_managed_block(text: str, marker: str) -> str:
     return pattern.sub("\n", text)
 
 
-def _materialize_member_skills(cfg_dir: Path) -> None:
-    """Replace external skill symlinks with private account-owned copies."""
-    skills_dir = cfg_dir / "skills"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    account_root = cfg_dir.resolve()
-    for entry in list(skills_dir.iterdir()):
-        if not entry.is_symlink():
-            continue
-        try:
-            source = entry.resolve(strict=True)
-            if source == account_root or source.is_relative_to(account_root):
-                continue
-            private_copy = skills_dir / (
-                f".{entry.name}.private-{secrets.token_hex(4)}"
-            )
-            if source.is_dir():
-                shutil.copytree(source, private_copy)
-            elif source.is_file():
-                shutil.copy2(source, private_copy)
-            else:
-                continue
-            entry.unlink()
-            private_copy.rename(entry)
-        except Exception:
-            logger.exception(
-                "Failed to make skill '%s' private to %s",
-                entry.name,
-                cfg_dir,
-            )
 
 
-def _set_member_codex_permissions(cfg_dir: Path) -> None:
-    """Keep every account-owned Codex file private at the filesystem level."""
-    try:
-        cfg_dir.chmod(0o700)
-        for root, dir_names, file_names in os.walk(cfg_dir, followlinks=False):
-            root_path = Path(root)
-            for name in dir_names:
-                path = root_path / name
-                if not path.is_symlink():
-                    path.chmod(0o700)
-            for name in file_names:
-                path = root_path / name
-                if path.is_symlink():
-                    continue
-                current_mode = path.stat().st_mode
-                path.chmod(0o700 if current_mode & 0o111 else 0o600)
-    except OSError:
-        logger.exception(
-            "Failed to set private permissions on member Codex home %s",
-            cfg_dir,
-        )
 
 
 def _ensure_user_codex_config_dir(user: dict):
@@ -2077,11 +1803,6 @@ def _user_can_access_session(user: dict | None, session_name: str) -> bool:
 # dashboard (applied below), so it lives beside it in templates/.
 LOGIN_PAGE = (TEMPLATES_DIR / "login.html").read_text()
 
-# Rendered into __GOOGLE_BTN__ only when a Google OAuth client is configured.
-_GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/google/start">
-    <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.2-.4-4.7H24v8.9h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.2-3.8 6.6-9.5 6.6-16.3z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.3l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.6-3.9-12.4-9.1H4.3v5.7C7.9 41.1 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.2c-.5-1.3-.7-2.7-.7-4.2s.3-2.9.7-4.2v-5.7H4.3C2.8 16.9 2 20.3 2 24s.8 7.1 2.3 9.9l7.3-5.7z"/><path fill="#EA4335" d="M24 10.7c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.1 30 2 24 2 15.4 2 7.9 6.9 4.3 14.1l7.3 5.7c1.8-5.2 6.6-9.1 12.4-9.1z"/></svg>
-    Continue with Google</a>
-  <div class="ghint">__GOOGLE_HINT__</div>"""
 
 _PASSWORD_LOGIN_HTML = """  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
   <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
@@ -2401,55 +2122,12 @@ async def do_logout(request: Request):
     return resp
 
 
-GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
-GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
-GOOGLE_WORKSPACE_REQUIRED_SCOPES = (
-    GOOGLE_DRIVE_SCOPE,
-    GOOGLE_GMAIL_SCOPE,
-)
-GOOGLE_LOGIN_SCOPES = "openid email profile"
-GOOGLE_LOGIN_STATE_COOKIE = AUTH_COOKIE + "_google_state"
 
 
-def _google_workspace_subject(user: dict | None) -> str:
-    """Return the company identity that domain-wide delegation may use."""
-    if not user or not GOOGLE_DWD_SERVICE_ACCOUNT_FILE.is_file():
-        return ""
-    email = str(user.get("google_email") or "").strip().lower()
-    if "@" not in email:
-        return ""
-    if email.split("@", 1)[1] not in GOOGLE_LOGIN_DOMAINS:
-        return ""
-    return email
 
 
-def _google_workspace_delegation_ready(user: dict | None) -> bool:
-    """Verify that company delegation grants both required APIs."""
-    subject = _google_workspace_subject(user)
-    if not subject:
-        return False
-    try:
-        from google.auth.transport.requests import Request as GoogleAuthRequest
-        from google.oauth2 import service_account
-
-        credentials = service_account.Credentials.from_service_account_file(
-            str(GOOGLE_DWD_SERVICE_ACCOUNT_FILE),
-            scopes=list(GOOGLE_WORKSPACE_REQUIRED_SCOPES),
-            subject=subject,
-        )
-        credentials.refresh(GoogleAuthRequest())
-        return bool(credentials.token)
-    except Exception:
-        logger.exception(
-            "Google Workspace delegation preflight failed for %s",
-            subject,
-        )
-        return False
 
 
-def _google_login_enabled() -> bool:
-    cid, csec = _google_client()
-    return bool(cid and csec)
 
 
 def _public_base_url(request: Request) -> str:
@@ -2468,105 +2146,14 @@ def _public_base_url(request: Request) -> str:
     return f"{proto}://{host}"
 
 
-def _google_login_redirect_uri(request: Request) -> str:
-    """Must match a redirect URI registered on the OAuth client, exactly."""
-    return _public_base_url(request) + ROOT_PATH + "/auth/google/callback"
-
-
-def _google_email_allowed(email: str) -> bool:
-    email = (email or "").lower()
-    if "@" not in email:
-        return False
-    if email in GOOGLE_LOGIN_EMAILS or (ADMIN_GOOGLE_EMAIL and email == ADMIN_GOOGLE_EMAIL):
-        return True
-    return email.split("@", 1)[1] in GOOGLE_LOGIN_DOMAINS
 
 
 
 
-def _google_login_user(email: str, name: str) -> dict | None:
-    """Find (or provision) the account for a verified Google address.
-
-    Explicit bindings win over the domain allowlist so a personal address can be
-    pinned to an existing account: an exact `google_email` match, the env-pinned
-    ADMIN_GOOGLE_EMAIL, or a username that already *is* the address. Only after
-    those do we fall back to "allowed domain → create a new member account".
-    """
-    email = (email or "").strip().lower()
-    users = _load_users()
-
-    target = next((u for u in users if (u.get("google_email") or "").lower() == email), None)
-    if target is None and ADMIN_GOOGLE_EMAIL and email == ADMIN_GOOGLE_EMAIL:
-        target = next((u for u in users if u.get("id") == "admin"), None)
-    if target is None:
-        target = next((u for u in users if (u.get("username") or "").lower() == email), None)
-    if target is not None:
-        if (target.get("google_email") or "").lower() != email:
-            target["google_email"] = email
-            _save_users(users)
-        return target
-
-    if not _google_email_allowed(email):
-        return None
-
-    # New employee: provision a member account with no password (password login
-    # stays impossible — _verify_password rejects an empty hash — so the Google
-    # identity is the only way in until an admin sets one).
-    base = re.sub(r"[^A-Za-z0-9._-]", "", email.split("@", 1)[0]) or "user"
-    username = base[:40]
-    taken = {(u.get("username") or "").lower() for u in users}
-    if username.lower() in taken:
-        username = email[:40]
-    if username.lower() in taken:
-        username = (base[:32] + "-" + secrets.token_hex(3))
-    new_user = {
-        "id": _new_user_id(),
-        "username": username,
-        "password_hash": "",
-        "password_salt": "",
-        "role": "user",
-        "group": "",
-        "google_email": email,
-        "display_name": (name or "")[:80],
-        "auth": "google",
-        # Google-provisioned members are dashboard-only: they must not inherit
-        # the nginx auth_request SSO that unlocks the sibling knowva.ai apps.
-        "sso": False,
-        "created_at": time.time(),
-        "last_login": 0,
-    }
-    users.append(new_user)
-    _save_users(users)
-    try:
-        _user_data_dir(new_user)
-        _ensure_user_codex_config_dir(new_user)
-        if _advisor_live_sync_enabled():
-            _sync_advisor_user(new_user, provision=True)
-            # The advisor MCP block is gated on the token file, which only exists
-            # after the line above -- so write the config once more now that it does.
-            _ensure_user_codex_config_dir(new_user)
-        _ensure_user_browser_session(new_user, start=False)
-    except Exception:
-        logger.exception("Failed to provision isolated resources for Google user %s", new_user["id"])
-        users = [u for u in users if u.get("id") != new_user["id"]]
-        _save_users(users)
-        return None
-    logger.info("Provisioned Google user '%s' (%s)", username, email)
-    return new_user
 
 
-def _sync_admin_google_email():
-    """Keep the admin record's google_email in step with the env pin."""
-    if not ADMIN_GOOGLE_EMAIL:
-        return
-    try:
-        users = _load_users()
-        admin = next((u for u in users if u.get("id") == "admin"), None)
-        if admin is not None and (admin.get("google_email") or "").lower() != ADMIN_GOOGLE_EMAIL:
-            admin["google_email"] = ADMIN_GOOGLE_EMAIL
-            _save_users(users)
-    except Exception:
-        logger.exception("Failed to sync the admin Google address")
+
+
 
 
 _sync_admin_google_email()
@@ -3479,17 +3066,6 @@ class SaveMyContextBody(BaseModel):
     content: str
 
 
-def _my_context_path(user: dict, filename: str) -> Path | None:
-    """Resolve a writable per-user context file. Returns None for paths that
-    would escape the user's Codex config dir."""
-    base = _user_codex_config_dir(user)
-    base.mkdir(parents=True, exist_ok=True)
-    target = (base / filename).resolve()
-    try:
-        target.relative_to(base.resolve())
-    except ValueError:
-        return None
-    return target
 
 
 _MY_CONTEXT_ALLOWED = {"AGENTS.md", "MEMORY.md", "config.toml"}
@@ -3686,226 +3262,17 @@ async def api_me(request: Request):
 import urllib.parse
 import urllib.request
 
-SHARED_CODEX_AUTH = CODEX_HOME / "auth.json"
-GLOBAL_CONTEXT_FILE = MESSAGES_DIR / "global-context.md"
 SANDBOX_HOOK_PATH = MESSAGES_DIR / "hooks" / "sandbox_guard.py"
-CONNECTIONS_DIR = MESSAGES_DIR / "connections"
-# Written by google_workspace_mcp.py, one line per Google tool call. Read here
-# so an admin can review access without shelling into the box.
-GOOGLE_MCP_AUDIT_FILE = MESSAGES_DIR / google_policy.AUDIT_FILE_NAME
-GOOGLE_OAUTH_CLIENT_FILE = MESSAGES_DIR / "google_oauth_client.json"
-
-_GLOBAL_CTX_BEGIN = "<!-- TEAM GLOBAL CONTEXT (managed — edits below are overwritten) -->"
-_GLOBAL_CTX_END = "<!-- END TEAM GLOBAL CONTEXT -->"
-
-_DEFAULT_GLOBAL_CONTEXT = """# __BRAND__ account policy (admin managed)
-
-## Operating contract
-
-- Work independently and complete ordinary, reversible tasks without asking for
-  confirmation. Pause only for genuinely destructive, large, irreversible, or
-  sensitive external actions.
-- This is a shared full-access build machine. Preserve unrelated files, dirty
-  worktrees, services, sessions, and other users' project directories.
-- For host-sensitive work, run `hostname` first. Do not infer the current host
-  from copied documentation or silently act on a different server. Verify
-  mutable infrastructure facts live before changing them.
-
-<!-- SELF SERVE CAPABILITIES (managed) -->
-## You can do these yourself. Do not hand them back.
-
-Nothing on this list needs Nimo. Handing one of these back as "please approve
-this" or "please do this and reply done" is the most expensive failure mode on
-this box: it turns a finished job into a stalled one. Check this list and the
-advisor before you decide anything is blocked.
-
-**Buy a domain, or change DNS.** Namecheap is the registrar. Its API is IP-locked
-to instance-3, so go through the proxy, which works from every host:
-`POST https://rotem.cc/api/nc`, Basic auth user `Nimo`, password from
-`get_secret namecheap-proxy`. Body is
-`{"command":"namecheap.domains.dns.getHosts","params":{"SLD":"rotem","TLD":"ai"},"profileId":"nebulainnovations"}`
-and `command` takes any Namecheap API method, so `namecheap.domains.check`,
-`namecheap.domains.create` and `namecheap.domains.dns.setHosts` all work the same
-way. Profiles: `nebulainnovations` (rotem.ai, rotem.cc, lisa.my, knowva.ai),
-`Nebulallc` (alphabell.com), `anton` (industrialdictionary.com). Web UI at
-https://rotem.cc/domains/.
-`setHosts` REPLACES EVERY RECORD on the domain. Always `getHosts` first, apply
-your edit to the full list, and resend all of it including EmailType and every
-TXT record (google-site-verification, SPF, DKIM, DMARC) or you break that
-domain's mail. knowva.ai/domains and knowva.ai/api/nc are dead (404): do not use
-them and do not send anyone to them. GoDaddy is the second registrar and has no
-IP restriction. Per-domain procedure lives in the advisor: `get_domain <name>`.
-
-**Read an SMS, a 2FA code or an OTP.** Every inbound message lands at
-https://rotem.ai/sms/. `GET /api/threads` (sort by `last_at`, the code is in
-`last_body`), then `GET /api/threads/messages?thread=<key>`. instance-3,
-grabo-systems and the VPC range 10.128.0.0/9 pass without Basic auth, but only
-over the VPC: from any other host the public name resolves to builder's external
-IP and 401s, so pin it to the internal address instead:
-`curl --resolve rotem.ai:443:10.128.0.13 https://rotem.ai/sms/api/threads`.
-On builder itself use `http://127.0.0.1:9009/api/threads`. Never ask Nimo for a
-code.
-
-**Pay for something.** Ask the advisor: `get_payment_method` returns a full card
-number, expiry, CVV and billing address, and `ramp_issue_card` mints a capped
-virtual card for a new vendor. If your permission group is denied these, that
-denial is the correct answer: name the single figure you need and who to ask.
-Either way, do not go hunting for a different payment rail, a third-party
-checkout or a device-approval flow. There isn't one, and inventing one turns a
-five-minute purchase into a blocked task.
-
-**Log into a site, click through a console, or clear a captcha.** You have a real
-browser bound to your account. Read
-`/home/nimrod_rotem/.tmux-dashboard/context/browser-policy.md` first and follow
-its execution hierarchy. Close the tabs you opened when the task is done.
-
-**Pick an API that still has quota:**
-`~/tmux-dashboard/.venv/bin/python ~/.tmux-dashboard/api_status.py --json`
-(that script's shebang needs the venv interpreter; plain `python3` fails here).
-Vertex AI and Gemini need no key at all from a VM:
-`google.genai.Client(vertexai=True, project="nimo-gpt", location="us-central1")`,
-which is the fallback whenever an OpenAI key returns `insufficient_quota`.
-
-The general rule: if a task stalls on a credential, a login, a code, a domain, a
-DNS record, a card or an account, that is an advisor lookup or one of the routes
-above, not a question for Nimo. Surface a blocker only when it genuinely needs a
-human in the physical world, or a permission your group does not hold. When it
-does, finish everything else first, then hand back that one item naming the
-exact field or action needed.
-<!-- END SELF SERVE CAPABILITIES -->
-
-## Account boundary
-
-- Treat this dashboard account's `CODEX_HOME`, project directory, browser,
-  connections, memories, skills, uploads, and session history as private to this
-  account. Never inspect or operate another account's corresponding resources.
-- Only the admin-managed policy and explicitly shared reference files are
-  global. A shared OS login is not permission to cross account boundaries.
-- Local Codex memory is private because every account has a separate
-  `CODEX_HOME`. Use it as recall, never as the sole source of required policy or
-  current external facts.
-
-## Google Workspace is per person, and it is enforced
-
-- Drive, Gmail and Calendar run as **your own** company Google account. There is
-  no shared company mailbox behind these tools any more: what you can open is
-  what Workspace shares with you.
-- Documents that read as payroll, HR or personal identity material are refused
-  for the engineering groups, in search results as well as on open. A refusal is
-  the correct answer for your account, not an obstacle to work around: name the
-  single figure you need and ask an admin.
-- Mail to a personal mailbox (gmail.com, qq.com, outlook.com and the like) is
-  refused for every account, and groups outside managers and accounting write to
-  company addresses only. Hand a work product back as its dashboard project
-  link rather than mailing it out.
-- Every Google tool call is recorded with your account, the tool, the target and
-  whether it was allowed.
-
-## Load details only when relevant
-
-- Company mail, Drive, and Document Vault work:
-  `/home/nimrod_rotem/.tmux-dashboard/context/company-data.md`.
-- Browser automation, proxies, viewing, auditing, and resource limits:
-  `/home/nimrod_rotem/.tmux-dashboard/context/browser-policy.md`.
-- Dashboard artifacts and publishing:
-  `/home/nimrod_rotem/.tmux-dashboard/context/publishing.md`.
-- Shared-host processes, reboots, cleanup, or recurring jobs:
-  `/home/nimrod_rotem/.tmux-dashboard/context/operations-safety.md`.
-- Product UI or publishable copy:
-  `/home/nimrod_rotem/.tmux-dashboard/context/product-style.md`.
-- Git or GitHub work: read `~/CLAUDE_GITHUB_RULES.md` completely first.
-
-Use the connected company tools directly when the task calls for them. Keep
-payroll, individual compensation, and personal HR matters restricted to users
-who are clearly entitled to them.
-
-## The advisor holds the shared data — ask it, and write back
-
-`advisor` is a connected MCP tool. It is the single source of truth every builder
-host shares, so shared facts are fetched, never guessed and never copied into a
-file on this box.
-
-- Credentials and logins: `list_secrets`, then `get_secret`.
-- Servers, apps, ports, domains and each domain's exact DNS procedure:
-  `list_hosts`, `list_apps`, `list_domains`, `get_domain`.
-- Companies, registration numbers and addresses: `get_entity`. Accountants,
-  agents and bankers: `get_contacts`. House rules: `list_rules`.
-- Not sure which tool: `search`. Shared notes: `search_memories`.
-
-**Use what it returns.** Nothing is redacted and nothing is a trick question. Put
-the key in the app config, put the registration number on the form, and get on
-with the job. Do not rotate a credential just because you saw it: a shared key is
-used by apps on several hosts. The one real limit is never putting a value in a
-public repo or a public page.
-
-**Your token is who you are.** You call the advisor as your own dashboard account,
-and it applies your role and your permission group. If it answers "Denied", that
-is the correct answer for your account, not a fault to work around: do not try
-another route, another account, or another host. Say what you needed and who to
-ask. Company card and bank detail, personal identity documents and the Ramp card
-list are restricted this way unless your group opens them.
-
-**Write back in the same turn.** A fact that is true beyond this box belongs in
-the advisor, not only in a local note. Rotated or wired up a key: `update_secret`.
-Signed up for something: `add_secret`. A key 401s or its quota is gone:
-`report_secret_problem`. Deployed, moved or retired an app: `register_app`. New or
-resized server: `register_host`. Registered or repointed a domain:
-`register_domain`. Anything org-wide you learned the hard way: `save_memory`.
-A missing field is a bug: fix it, or name the exact field when you hand back.
-
-## Projects and working folder
-
-- Unless told otherwise, publish every project you build at
-  __PUBURL__/<username>/<project>. Default <project> is the current tmux session
-  name.
-- Put the project's web files in `$DASH_PROJECT_DIR`
-  (= `~/web-projects/<username>/<project>/`); static files are served
-  immediately at `$DASH_PROJECT_URL`. For a dynamic app, run your server on a
-  free port and write `$DASH_PROJECT_DIR/.serve.json` = `{"port": <PORT>}` to
-  have it reverse-proxied there.
-- Never return a local filesystem path as the only link to a work product.
-  Put the deliverable under `$DASH_PROJECT_DIR` and hand back its live
-  `$DASH_PROJECT_URL` URL. Project URLs require dashboard sign-in, so the remote
-  user can open them without exposing the work product publicly.
-- This session: user `$DASH_USER`, session `$DASH_SESSION`, link
-  `$DASH_PROJECT_URL` (also shown as a clickable link in the dashboard).
-"""
 
 
-def _html_escape(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _ensure_global_context_file():
-    GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not GLOBAL_CONTEXT_FILE.exists():
-        GLOBAL_CONTEXT_FILE.write_text(_DEFAULT_GLOBAL_CONTEXT.replace("__BRAND__", BRAND_NAME).replace("__PUBURL__", PUB_URL))
 
 
-def _read_global_context() -> str:
-    _ensure_global_context_file()
-    try:
-        return GLOBAL_CONTEXT_FILE.read_text()
-    except Exception:
-        return ""
 
 
-def _remove_legacy_global_context_from_agents(codex_md: Path) -> bool:
-    """Remove the old visible managed policy while preserving account text."""
-    if not codex_md.exists():
-        return False
-    existing = codex_md.read_text()
-    updated = existing
-    while _GLOBAL_CTX_BEGIN in updated and _GLOBAL_CTX_END in updated:
-        pre, remainder = updated.split(_GLOBAL_CTX_BEGIN, 1)
-        _managed, post = remainder.split(_GLOBAL_CTX_END, 1)
-        updated = pre + post
-    if updated == existing:
-        return False
-    updated = updated.lstrip("\n")
-    _backup_before_dashboard_write(codex_md)
-    codex_md.write_text(updated)
-    return True
+
+
 
 
 def _sync_global_policy_into_config(config: Path, user: dict | None = None) -> bool:
@@ -3929,133 +3296,20 @@ def _sync_global_policy_into_config(config: Path, user: dict | None = None) -> b
     return True
 
 
-def _sync_global_context_into(codex_md: Path):
-    """Keep a managed global-context block at the top of a user's AGENTS.md,
-    preserving the user's own content below the END marker."""
-    block = _GLOBAL_CTX_BEGIN + "\n" + _read_global_context().rstrip() + "\n" + _GLOBAL_CTX_END + "\n"
-    existing = ""
-    if codex_md.exists():
-        try:
-            existing = codex_md.read_text()
-        except Exception:
-            existing = ""
-    if _GLOBAL_CTX_BEGIN in existing and _GLOBAL_CTX_END in existing:
-        pre = existing.split(_GLOBAL_CTX_BEGIN, 1)[0]
-        post = existing.split(_GLOBAL_CTX_END, 1)[1]
-        user_part = (pre + post).lstrip("\n")
-    else:
-        user_part = existing.lstrip("\n")
-    updated = block + "\n" + user_part
-    if updated != existing:
-        _backup_before_dashboard_write(codex_md)
-        codex_md.write_text(updated)
-
-
-_PROJ_NOTE_BEGIN = "<!-- TEAM PROJECTS CONVENTION (managed) -->"
-_PROJ_NOTE_END = "<!-- END TEAM PROJECTS CONVENTION -->"
-_PROJ_NOTE = """## Projects & working folder
-- Publish projects at __PUBURL__/<username>/<project> (default <project> = the current tmux session name).
-- Put the project's web files in `$DASH_PROJECT_DIR` (= `~/web-projects/<username>/<project>/`); static files are served immediately at `$DASH_PROJECT_URL`. For a dynamic app, run your server on a free port and write `$DASH_PROJECT_DIR/.serve.json` = `{"port": <PORT>}` to have it reverse-proxied there.
-- Never return a local filesystem path as the only link to a work product. Put the deliverable under `$DASH_PROJECT_DIR` and hand back its live `$DASH_PROJECT_URL` URL. Project URLs require dashboard sign-in, so the remote user can open them without exposing the work product publicly.
-- This session: user `$DASH_USER`, link `$DASH_PROJECT_URL` (also shown as a clickable link in the dashboard)."""
-
-
-def _sync_projects_note_into(codex_md: Path):
-    """Add a managed projects-convention block at the top of AGENTS.md
-    (used for admins, who don't receive the member global block)."""
-    original = codex_md.read_text() if codex_md.exists() else ""
-    existing = original
-    if _PROJ_NOTE_BEGIN in existing and _PROJ_NOTE_END in existing:
-        pre = existing.split(_PROJ_NOTE_BEGIN, 1)[0]
-        post = existing.split(_PROJ_NOTE_END, 1)[1]
-        existing = (pre + post).lstrip("\n")
-    else:
-        existing = existing.lstrip("\n")
-    block = _PROJ_NOTE_BEGIN + "\n" + _PROJ_NOTE.replace("__PUBURL__", PUB_URL) + "\n" + _PROJ_NOTE_END + "\n"
-    # Already there, unchanged: leave it where it is. Re-prepending an identical
-    # block fights the other managed writers and rewrites the file forever.
-    if block in original:
-        return
-    try:
-        codex_md.parent.mkdir(parents=True, exist_ok=True)
-        updated = block + "\n" + existing
-        if updated != original:
-            _backup_before_dashboard_write(codex_md)
-            codex_md.write_text(updated)
-    except Exception:
-        logger.debug("Failed to sync projects note into %s", codex_md, exc_info=True)
-
-
-_GIT_RULES_BEGIN = "<!-- TEAM GIT RULES (managed) -->"
-_GIT_RULES_END = "<!-- END TEAM GIT RULES -->"
-_GIT_RULES = """## Git on a shared machine (multiple people, one box)
-Several teammates work on this server as the same OS user, so be disciplined:
-- **Identity is preset** — your commits are authored as `$GIT_AUTHOR_NAME <$GIT_AUTHOR_EMAIL>` (= your dashboard username). Do NOT change git `user.name`/`user.email` or pass `--author`; let the env vars stand so attribution is correct.
-- **Stay in your own space** — work inside this session's cwd / `$DASH_PROJECT_DIR`. Never edit files in another member's project dir (`~/web-projects/<someone-else>/...`).
-- **Branch, never commit to a shared branch** — always work on a feature branch named `$DASH_USER/<short-topic>`. Never commit directly to `main`/`master` or to a branch someone else is using.
-- **Sync before you start** — `git fetch` + rebase/merge latest so you're not building on stale code. Resolve conflicts cleanly.
-- **Push your branch, open a PR** — let the repo owner review/merge. **NEVER force-push** `main` or any shared branch.
-- **Isolate when sharing a repo** — if a teammate is already working in a repo's working tree, don't fight over it: make your own worktree — `git worktree add ../<repo>-$DASH_USER -b $DASH_USER/<topic>` — and work there.
-- **Never commit secrets** (.env, tokens, keys). Check `git status` before committing."""
-
-
-def _sync_git_rules_into(codex_md: Path):
-    """Maintain a managed GIT RULES block in AGENTS.md (members + admins). Placed
-    just under the projects note / top so it's always current regardless of edits."""
-    original = codex_md.read_text() if codex_md.exists() else ""
-    existing = original
-    if _GIT_RULES_BEGIN in existing and _GIT_RULES_END in existing:
-        pre = existing.split(_GIT_RULES_BEGIN, 1)[0]
-        post = existing.split(_GIT_RULES_END, 1)[1]
-        existing = (pre.rstrip("\n") + "\n" + post.lstrip("\n"))
-    block = _GIT_RULES_BEGIN + "\n" + _GIT_RULES + "\n" + _GIT_RULES_END + "\n"
-    if block in original:
-        return
-    # Insert after the projects-note block if present, else prepend.
-    try:
-        codex_md.parent.mkdir(parents=True, exist_ok=True)
-        if _PROJ_NOTE_END in existing:
-            head, tail = existing.split(_PROJ_NOTE_END, 1)
-            updated = head + _PROJ_NOTE_END + "\n\n" + block + tail.lstrip("\n")
-        else:
-            updated = block + "\n" + existing.lstrip("\n")
-        if updated != original:
-            _backup_before_dashboard_write(codex_md)
-            codex_md.write_text(updated)
-    except Exception:
-        logger.debug("Failed to sync git rules into %s", codex_md, exc_info=True)
 
 
 
 
 
 
-def _setup_shared_git_config():
-    """Set safe, friction-reducing git defaults once for the shared OS user so
-    multi-user work behaves predictably. Idempotent (git config is declarative)."""
-    defaults = [
-        ("push.default", "current"),
-        ("push.autoSetupRemote", "true"),
-        ("pull.rebase", "false"),
-        ("init.defaultBranch", "main"),
-        ("rerere.enabled", "true"),
-        ("merge.conflictStyle", "zdiff3"),
-    ]
-    for k, v in defaults:
-        try:
-            subprocess.run(["git", "config", "--global", k, v],
-                           capture_output=True, text=True, timeout=5)
-        except Exception:
-            logger.debug("git config --global %s failed", k, exc_info=True)
-    # A global ignore so per-user/editor noise never gets committed by accident.
-    try:
-        gi = Path.home() / ".gitignore_global"
-        if not gi.exists():
-            gi.write_text(".DS_Store\n*.swp\n.serve.json\n.claude_primed\nnode_modules/\n__pycache__/\n.venv/\n")
-        subprocess.run(["git", "config", "--global", "core.excludesfile", str(gi)],
-                       capture_output=True, text=True, timeout=5)
-    except Exception:
-        logger.debug("global gitignore setup failed", exc_info=True)
+
+
+
+
+
+
+
+
 
 
 def _share_credentials_symlink(cfg_dir: Path):
@@ -4222,31 +3476,6 @@ def _set_team_model_effort(cfg_dir: Path):
         logger.debug("Failed to set team Codex model/effort in %s", sp, exc_info=True)
 
 
-def _apply_member_auth(cfg_dir: Path) -> str:
-    """Share the admin Codex login with an isolated member CODEX_HOME."""
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    target = cfg_dir / "auth.json"
-    try:
-        if cfg_dir.resolve() == CODEX_HOME.resolve():
-            source = SHARED_CODEX_AUTH
-        else:
-            source = SHARED_CODEX_AUTH
-            if source.exists():
-                if target.is_symlink() and target.resolve() == source.resolve():
-                    pass
-                else:
-                    _backup_before_dashboard_write(target)
-                    if target.is_symlink() or target.exists():
-                        target.unlink()
-                    target.symlink_to(source)
-            elif _active_openai_key():
-                _backup_before_dashboard_write(target)
-                _write_codex_api_auth(cfg_dir, _active_openai_key())
-        data = json.loads(source.read_text()) if source.exists() else {}
-        return "subscription" if data.get("auth_mode") == "chatgpt" else "api"
-    except Exception:
-        logger.debug("Failed to share Codex auth into %s", cfg_dir, exc_info=True)
-        return "api" if _active_openai_key() else "unconfigured"
 
 
 def _claude_config_json(cfg_dir: Path) -> Path:
@@ -4432,88 +3661,6 @@ async def api_sandbox_check(request: Request):
         "Keep working on things that stay on this server; do not try to bypass."})
 
 
-# --- Google connections (Drive / Gmail / Calendar) -------------------------
-GOOGLE_SCOPES = {
-    "drive": ["https://www.googleapis.com/auth/drive.readonly"],
-    "gmail": ["https://www.googleapis.com/auth/gmail.readonly"],
-    "calendar": ["https://www.googleapis.com/auth/calendar.readonly"],
-}
-GOOGLE_LABELS = {"drive": "Google Drive", "gmail": "Gmail", "calendar": "Google Calendar"}
-
-
-def _google_client():
-    cid = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
-    csec = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
-    if (not cid or not csec) and GOOGLE_OAUTH_CLIENT_FILE.exists():
-        try:
-            j = json.loads(GOOGLE_OAUTH_CLIENT_FILE.read_text())
-            j = j.get("web") or j.get("installed") or j
-            cid = cid or j.get("client_id", "")
-            csec = csec or j.get("client_secret", "")
-        except Exception:
-            logger.debug("Failed to read Google OAuth client file", exc_info=True)
-    return cid, csec
-
-
-def _conn_path(user_id: str, service: str) -> Path:
-    return CONNECTIONS_DIR / str(user_id) / (service + ".json")
-
-
-def _sign_state(payload: str) -> str:
-    return core_tokens.sign_state(AUTH_SECRET, payload)
-
-
-def _verify_state(state: str) -> str | None:
-    return core_tokens.verify_state(AUTH_SECRET, state)
-
-
-def _callback_uri(request: Request) -> str:
-    base = PUBLIC_BASE_URL.rstrip("/") or str(request.base_url).rstrip("/")
-    return base + ROOT_PATH + "/api/connections/google/callback"
-
-
-def _ensure_google_mcp(cfg_dir: Path, user: dict):
-    """Register Grabo's Google MCP server in this user's Codex config.toml."""
-    cmd = os.environ.get("GOOGLE_MCP_COMMAND", "")
-    if not cmd or not user or not user.get("id"):
-        return
-    cfg = cfg_dir / "config.toml"
-    begin = "# BEGIN GRABO GOOGLE MCP (managed)"
-    end = "# END GRABO GOOGLE MCP"
-    try:
-        parts = shlex.split(cmd)
-        if not parts:
-            return
-        existing = cfg.read_text() if cfg.exists() else ""
-        if begin in existing and end in existing:
-            existing = re.sub(
-                rf"\n?{re.escape(begin)}.*?{re.escape(end)}\n?",
-                "\n",
-                existing,
-                flags=re.DOTALL,
-            ).rstrip() + "\n"
-        elif re.search(r"^\s*\[mcp_servers\.google\]\s*$", existing, re.MULTILINE):
-            logger.warning("Leaving user-managed mcp_servers.google unchanged in %s", cfg)
-            return
-        args = ", ".join(f'"{_toml_escape(value)}"' for value in parts[1:])
-        credentials_dir = _toml_escape(str(CONNECTIONS_DIR / user["id"]))
-        client_file = _toml_escape(str(GOOGLE_OAUTH_CLIENT_FILE))
-        block = (
-            f"{begin}\n"
-            "[mcp_servers.google]\n"
-            f'command = "{_toml_escape(parts[0])}"\n'
-            f"args = [{args}]\n"
-            "\n[mcp_servers.google.env]\n"
-            f'GOOGLE_MCP_CREDENTIALS_DIR = "{credentials_dir}"\n'
-            f'GOOGLE_OAUTH_CLIENT_FILE = "{client_file}"\n'
-            f"{end}\n"
-        )
-        updated = existing.rstrip() + "\n\n" + block if existing.strip() else block
-        _backup_before_dashboard_write(cfg)
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text(updated)
-    except Exception:
-        logger.debug("Failed to write Google MCP entry into %s", cfg, exc_info=True)
 
 
 
@@ -4526,9 +3673,18 @@ def _ensure_google_mcp(cfg_dir: Path, user: dict):
 
 
 
-def _write_google_mcp(user: dict, service: str):
-    """Called after a successful connect; ensures the google MCP server is registered."""
-    _ensure_google_mcp(_user_codex_config_dir(user), user)
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @app.get("/api/connections")
@@ -4678,8 +3834,6 @@ async def api_save_global_context(request: Request):
 # ===========================================================================
 GROUPS_FILE = MESSAGES_DIR / "groups.json"
 GROUPS_DIR = MESSAGES_DIR / "groups"
-_GROUP_CTX_BEGIN = "<!-- TEAM PERMISSION GROUP (managed; edits inside are overwritten) -->"
-_GROUP_CTX_END = "<!-- END TEAM GROUP CONTEXT -->"
 
 
 # Top-level path segments reserved for the app (never treated as usernames).
@@ -4717,177 +3871,26 @@ def _ensure_group_dir(group_id: str):
     return d
 
 
-def _read_group_context(group_id: str) -> str:
-    p = _group_dir(group_id) / "AGENTS.md"
-    try:
-        return p.read_text() if p.exists() else ""
-    except Exception:
-        return ""
-
-
-def _sync_group_context_into(codex_md: Path, group_id: str):
-    """Maintain a managed GROUP CONTEXT block in a member's AGENTS.md (below the
-    global block). Removes it when the user has no group."""
-    original = codex_md.read_text() if codex_md.exists() else ""
-    existing = original
-    if _GROUP_CTX_BEGIN in existing and _GROUP_CTX_END in existing:
-        pre = existing.split(_GROUP_CTX_BEGIN, 1)[0]
-        post = existing.split(_GROUP_CTX_END, 1)[1]
-        existing = pre.rstrip("\n") + "\n" + post.lstrip("\n")
-    if not group_id:
-        if existing != original:
-            _backup_before_dashboard_write(codex_md)
-            codex_md.write_text(existing)
-        return
-    block = _GROUP_CTX_BEGIN + "\n" + _read_group_context(group_id).rstrip() + "\n" + _GROUP_CTX_END + "\n"
-    if block in original:
-        return
-    if _GLOBAL_CTX_END in existing:
-        head, tail = existing.split(_GLOBAL_CTX_END, 1)
-        existing = head + _GLOBAL_CTX_END + "\n\n" + block + tail.lstrip("\n")
-    else:
-        existing = block + "\n" + existing.lstrip("\n")
-    if existing != original:
-        _backup_before_dashboard_write(codex_md)
-        codex_md.write_text(existing)
-
-
-def _sync_group_skills_into(cfg_dir: Path, group_id: str):
-    """Remove retired group-skill links; permission groups carry policy only."""
-    dst = cfg_dir / "skills"
-    try:
-        if not dst.exists():
-            return
-        for link in dst.glob("group-*"):
-            if link.is_symlink():
-                link.unlink()
-    except Exception:
-        logger.debug("Failed to clean retired group skill links", exc_info=True)
 
 
 
 
-def _advisor_live_sync_enabled() -> bool:
-    """Avoid mutating the shared advisor from unit-test request handlers."""
-    return not bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
 
-def _advisor_request(method: str, path: str, payload: dict | None = None) -> dict:
-    """Call the shared advisor as this host's admin without logging its token."""
-    token = _advisor_admin_token()
-    if not token:
-        raise RuntimeError(f"Advisor admin token is missing at {ADVISOR_ADMIN_TOKEN_FILE}")
-    response = httpx.request(
-        method,
-        ADVISOR_BASE_URL + path,
-        headers={"Authorization": f"Bearer {token}"},
-        json=payload,
-        timeout=15,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data if isinstance(data, dict) else {}
 
 
-def _sync_permission_groups_with_advisor() -> int:
-    """Make the advisor's fixed group records match the dashboard policy."""
-    synced = 0
-    for group_id, group in PERMISSION_GROUPS.items():
-        _ensure_group_dir(group_id)
-        _advisor_request("POST", "/api/groups", {
-            "name": group_id,
-            "title": group["name"],
-            "role": "member",
-            "can_see": group["advisor_can_see"],
-            "cannot_see": group["advisor_cannot_see"],
-            "notes": group["summary"] + "\n\n" + group["instructions"].strip(),
-        })
-        synced += 1
-    return synced
 
 
-def _sync_advisor_user(user: dict, *, provision: bool = False) -> bool:
-    """Provision or update one account's owner-bound advisor identity."""
-    if not user:
-        return False
-    user_id = str(user.get("id") or "").strip()
-    if not user_id:
-        return False
-    group_id = str(user.get("group") or "").strip()
-    if group_id and group_id not in PERMISSION_GROUPS:
-        raise ValueError(f"Unknown permission group: {group_id}")
-    is_admin = _is_admin(user)
-    group = PERMISSION_GROUPS.get(group_id, {})
-    client_name = f"{ADVISOR_HOST_NAME}:{user_id}"
-    token_path = _user_codex_config_dir(user) / "advisor-token"
-    if not is_admin and provision and not token_path.is_file():
-        provisioned = _advisor_request("POST", "/api/provision-user", {
-            "user_id": user_id,
-            "username": str(user.get("username") or user_id),
-            "host": ADVISOR_HOST_NAME,
-            "role": "member",
-            "group_name": group_id,
-        })
-        token = str(provisioned.get("token") or "")
-        if not token:
-            raise RuntimeError(
-                "Advisor identity already exists but its private token is missing locally"
-            )
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(token + "\n")
-        token_path.chmod(0o600)
-    _advisor_request("POST", "/api/clients", {
-        "name": client_name,
-        "label": f"{user.get('username') or user_id} on {ADVISOR_HOST_NAME}",
-        "role": "admin" if is_admin else "member",
-        "scopes": (
-            "secrets,infra,memories.write,payments"
-            if is_admin
-            else str(group.get("advisor_scopes") or "secrets,infra,memories.write")
-        ),
-        "username": str(user.get("username") or user_id),
-        "host": ADVISOR_HOST_NAME,
-        "group_name": "" if is_admin else group_id,
-        "enabled": 1,
-    })
-    return is_admin or token_path.is_file()
 
 
-# --- admin context-file editor (per user / per group) ---------------------
-_CONTEXT_TOP_FILES = ["AGENTS.md", "MEMORY.md", "config.toml", ".mcp.json"]
-_CONTEXT_DIRS = ["skills", "agents", "commands"]
 
 
-def _context_root(scope: str, ident: str):
-    if scope == "user":
-        u = _find_user_by_id(ident)
-        if not u:
-            return None
-        d = _user_codex_config_dir(u)
-        if not _is_admin(u):
-            _ensure_user_codex_config_dir(u)
-        return d
-    if scope == "group":
-        # Permission groups are a fixed policy catalog.  Exposing their backing
-        # AGENTS.md files through the generic context editor would quietly turn
-        # them back into user-editable groups and could weaken access rules.
-        return None
-    return None
 
 
-def _list_context_files(root: Path):
-    out = []
-    for name in _CONTEXT_TOP_FILES:
-        p = root / name
-        if p.is_file():
-            out.append({"path": name, "size": p.stat().st_size})
-    for d in _CONTEXT_DIRS:
-        base = root / d
-        if base.exists():
-            for p in sorted(base.rglob("*")):
-                if p.is_file() and not p.name.startswith("."):
-                    out.append({"path": str(p.relative_to(root)), "size": p.stat().st_size})
-    return out
+
+
+
+
 
 
 def _safe_ctx_path(root: Path, rel: str):
@@ -5235,26 +4238,12 @@ async def api_admin_user_data_file(
     })
 
 
-# --- public projects: serving + helpers -----------------------------------
-def _safe_seg(s: str) -> bool:
-    return bool(s) and re.match(r"^[A-Za-z0-9.@_-]{1,128}$", s or "") is not None and s not in (".", "..")
 
 
-def _user_projects_dir(username: str) -> Path:
-    return PROJECTS_ROOT / username
 
 
-def _list_projects(username: str):
-    d = _user_projects_dir(username)
-    if not d.exists():
-        return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
-def _project_dir(username: str, project: str):
-    if not _safe_seg(username) or not _safe_seg(project):
-        return None
-    return _user_projects_dir(username) / project
 
 
 
@@ -5301,32 +4290,8 @@ def _file_path_is_sensitive(path: Path) -> bool:
     return False
 
 
-def _path_within(path: Path, root: Path) -> bool:
-    try:
-        resolved_root = root.resolve()
-        return path == resolved_root or resolved_root in path.parents
-    except Exception:
-        return False
 
 
-def _member_can_serve_file(user: dict, session_name: str, target: Path) -> bool:
-    """Limit member file links to their account and owned session workspace."""
-    if not session_name or _session_owner_id(session_name) != user.get("id"):
-        return False
-    roots = [
-        _user_data_dir(user),
-        _user_codex_config_dir(user),
-        PROJECTS_ROOT / str(user.get("username") or user.get("id") or "member"),
-    ]
-    cwd = get_session_cwd(session_name)
-    if cwd:
-        cwd_path = Path(cwd).resolve()
-        # A pane at / or the shared OS home must not turn /file into a browser
-        # for every tenant's data. Once the pane enters a project, that project
-        # becomes an allowed root for its owner.
-        if cwd_path not in (Path("/"), Path.home().resolve()):
-            roots.append(cwd_path)
-    return any(_path_within(target, root) for root in roots)
 
 # Some paths the terminal linkifier turns into <BASE>/file?path=... links are
 # not absolute filesystem paths but URL routes on sister apps (typically the
@@ -5791,43 +4756,12 @@ def _write_json_file(path: Path, data: dict):
         logger.debug("Failed to write %s", path, exc_info=True)
 
 
-def _load_all_notes(user: dict | None = None) -> dict[str, str]:
-    """Load all session notes for a given user from disk. Falls back to admin
-    file if `user` is None (matches legacy single-user behaviour)."""
-    return _read_json_file(_user_notes_file(user))
 
 
-def _save_notes():
-    """Persist all session notes to per-user files based on session ownership."""
-    # Group cache entries by owning user
-    by_user: dict[str, dict[str, str]] = {}
-    for name, entry in cache.items():
-        notes = entry.get("notes")
-        if not notes:
-            continue
-        owner_id = _session_owner_id(name)
-        by_user.setdefault(owner_id, {})[name] = notes
-
-    # Write each user's file, merged with any sessions not currently in cache.
-    # Also touch files for users whose cache is empty but who have existing notes
-    # so we don't accidentally drop them: just don't write empty files.
-    for uid, updates in by_user.items():
-        owner = _find_user_by_id(uid) or _find_user_by_id("admin")
-        path = _user_notes_file(owner)
-        existing = _read_json_file(path)
-        existing.update(updates)
-        _write_json_file(path, existing)
 
 
-def _load_session_notes(session_name: str) -> str:
-    """Get persisted notes for a specific session, from its owner's file."""
-    owner = _user_for_session(session_name)
-    return _load_all_notes(owner).get(session_name, "")
 
 
-def _load_messages(user: dict | None = None) -> dict[str, list]:
-    """Load all session messages for a given user from disk."""
-    return _read_json_file(_user_messages_file(user))
 
 
 def _backfill_prompt_audit(users: list[dict] | None = None) -> int:
@@ -5904,45 +4838,8 @@ def _backfill_prompt_audit(users: list[dict] | None = None) -> int:
     return len(records)
 
 
-def _save_messages():
-    """Persist all session messages to per-user files based on session ownership."""
-    if _db_ready():
-        # Mirror into Postgres so the team sees one transcript. The per-user
-        # files are still written below, which keeps the fallback path warm and
-        # means turning the database off does not lose history.
-        for name, entry in cache.items():
-            msgs = entry.get("messages")
-            if msgs:
-                db_store.replace_messages(name, msgs)
-    by_user: dict[str, dict[str, list]] = {}
-    for name, entry in cache.items():
-        msgs = entry.get("messages")
-        if not msgs:
-            continue
-        owner_id = _session_owner_id(name)
-        by_user.setdefault(owner_id, {})[name] = msgs
-
-    for uid, updates in by_user.items():
-        owner = _find_user_by_id(uid) or _find_user_by_id("admin")
-        path = _user_messages_file(owner)
-        existing = _read_json_file(path)
-        existing.update(updates)
-        _write_json_file(path, existing)
 
 
-def _load_session_messages(session_name: str) -> list:
-    """Persisted messages for one session.
-
-    Reads from the shared database when configured — chat is the state that
-    most needs to be shared across a team and the one that grew without bound
-    in a rewrite-the-whole-file store. Falls back to the owner's JSON file.
-    """
-    if _db_ready():
-        rows = db_store.load_messages(session_name, limit=500)
-        if rows:
-            return rows
-    owner = _user_for_session(session_name)
-    return _load_messages(owner).get(session_name, [])
 
 
 DESCRIPTION_TTL = 0    # never auto-expire
@@ -6041,6 +4938,38 @@ _CODEX_CONFIG_FORWARDED_NAMES = frozenset(
     name for name in dir(codex_config_service) if not name.startswith("__")
 )
 
+_WATCHDOG_FORWARDED_NAMES = frozenset(
+    name for name in dir(watchdog_service) if not name.startswith("__")
+)
+
+_GOOGLE_FORWARDED_NAMES = frozenset(
+    name for name in dir(google_auth_service) if not name.startswith("__")
+)
+
+_PROJECTS_FORWARDED_NAMES = frozenset(
+    name for name in dir(projects_service) if not name.startswith("__")
+)
+
+_SESSION_LAUNCH_FORWARDED_NAMES = frozenset(
+    name for name in dir(session_launch_service) if not name.startswith("__")
+)
+
+_MEMBER_AUTH_FORWARDED_NAMES = frozenset(
+    name for name in dir(member_auth_service) if not name.startswith("__")
+)
+
+_AGENT_CONFIG_FORWARDED_NAMES = frozenset(
+    name for name in dir(agent_config_service) if not name.startswith("__")
+)
+
+_TERMINAL_FORWARDED_NAMES = frozenset(
+    name for name in dir(terminal_service) if not name.startswith("__")
+)
+
+_STORES_FORWARDED_NAMES = frozenset(
+    name for name in dir(stores_service) if not name.startswith("__")
+)
+
 _USAGE_FORWARDED_NAMES = frozenset(
     name for name in dir(usage_service) if not name.startswith("__")
 )
@@ -6071,6 +5000,22 @@ class _AppModule(type(_sys.modules[__name__])):
             setattr(tmux_service, name, value)
         if name in _USAGE_FORWARDED_NAMES:
             setattr(usage_service, name, value)
+        if name in _STORES_FORWARDED_NAMES:
+            setattr(stores_service, name, value)
+        if name in _TERMINAL_FORWARDED_NAMES:
+            setattr(terminal_service, name, value)
+        if name in _AGENT_CONFIG_FORWARDED_NAMES:
+            setattr(agent_config_service, name, value)
+        if name in _MEMBER_AUTH_FORWARDED_NAMES:
+            setattr(member_auth_service, name, value)
+        if name in _SESSION_LAUNCH_FORWARDED_NAMES:
+            setattr(session_launch_service, name, value)
+        if name in _PROJECTS_FORWARDED_NAMES:
+            setattr(projects_service, name, value)
+        if name in _GOOGLE_FORWARDED_NAMES:
+            setattr(google_auth_service, name, value)
+        if name in _WATCHDOG_FORWARDED_NAMES:
+            setattr(watchdog_service, name, value)
         if name in _CODEX_CONFIG_FORWARDED_NAMES:
             setattr(codex_config_service, name, value)
         super().__setattr__(name, value)
@@ -6370,64 +5315,6 @@ async def get_progress(session_name: str, full_output: str) -> str:
     )
 
 
-async def get_notes(session_name: str, full_output: str, existing_notes: str = "", messages: list = None) -> str:
-    """Extract key reference info from terminal output and chat history."""
-    lines = full_output.split("\n")
-    total = len(lines)
-    slices = [("BEGINNING", "\n".join(lines[:80]))]
-    if total > 200:
-        q1 = total // 4
-        slices.append(("QUARTER", "\n".join(lines[q1:q1 + 60])))
-    if total > 300:
-        mid = total // 2
-        slices.append(("MIDDLE", "\n".join(lines[mid:mid + 60])))
-    slices.append(("RECENT", "\n".join(lines[-80:])))
-    context = "\n\n".join(f"=== {label} ===\n{text}" for label, text in slices)
-
-    # Include chat messages (captures uploaded files, user commands, etc.)
-    chat_section = ""
-    if messages:
-        recent_msgs = messages[-30:]  # last 30 messages
-        chat_lines = [f"[{m['role']}] {m['text']}" for m in recent_msgs]
-        chat_section = "\n\n=== CHAT HISTORY (user commands & uploads) ===\n" + "\n".join(chat_lines)
-
-    prev_section = ""
-    if existing_notes and existing_notes.strip():
-        prev_section = f"\n\n=== PREVIOUS NOTES (merge new findings into these) ===\n{existing_notes}"
-
-    return await llm_call(
-        system_prompt=(
-            "Extract key reference info from this terminal session. "
-            "Organize into these sections:\n\n"
-            "CREDENTIALS — usernames, passwords, API keys, tokens, secrets\n"
-            "URLS — the public URL(s) where THIS project is served/accessible\n"
-            "STACK — languages, frameworks, libraries, dependencies, tools, package managers\n"
-            "SERVICES — databases, ports, process managers (PM2/supervisor/systemd), background services\n"
-            "STRUCTURE — the key source files created/edited for this deliverable\n"
-            "UPLOADS — paths to any files that were uploaded to this session\n"
-            "NOTES — important dev decisions, gotchas, deployment steps, things to remember\n\n"
-            "Rules:\n"
-            "- Only include info actually visible in the terminal output or chat history\n"
-            "- Keep each item on one line, be specific (include actual values, paths, ports)\n"
-            "- Be SELECTIVE — surface only what the developer would actually reach for again, "
-            "not every path/URL that scrolled by. Prefer the primary deliverable over incidentals.\n"
-            "- URLS: EXCLUDE localhost/127.0.0.1/internal IPs, third-party API endpoints "
-            "(api.openai.com, api.anthropic.com, *.googleapis.com, oauth/health/rest calls), and "
-            "URLs for OTHER projects that merely got mentioned. Keep only THIS project's URL(s).\n"
-            "- STRUCTURE: EXCLUDE tooling/system paths (~/.claude*, ~/.tmux-dashboard*, ~/.codex*, "
-            "/etc, skill/memory files like SKILL.md/CLAUDE.md/claude-roles.json, nginx/supervisor "
-            ".conf files) and the dashboard repo dir itself (tmux-dashboard-original). Never emit "
-            "placeholder paths containing < or >. List a file at most once.\n"
-            "- If a section has nothing relevant, omit it entirely (don't pad it)\n"
-            "- If previous notes exist, merge new findings into them — keep old data, "
-            "remove duplicates (including near-duplicates that differ only by whitespace/case), "
-            "update changed values\n"
-            "- Redact nothing — this is the developer's own reference\n"
-            "- No intro/outro text, just the section headers and their items"
-        ),
-        user_content=f"tmux session '{session_name}' sampled history:\n\n{context[:5000]}{chat_section[:1500]}{prev_section}",
-        max_tokens=500,
-    )
 
 
 
@@ -7350,10 +6237,6 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     })
 
 
-# --- Shared terminal stream + controller IPC -------------------------------
-# One controller process owns one tmux capture loop per viewed session. API
-# workers only relay its line-delimited JSON over authenticated WebSockets.
-_terminal_channels: dict[str, dict] = {}
 _controller_server = None
 
 
@@ -7386,187 +6269,18 @@ class _TerminalQueueWriter:
         return None
 
 
-def _terminal_full_payload(session_name: str) -> tuple[dict, str, int, str, int]:
-    pos = get_pane_position(session_name)
-    pane_total = int(pos.get("total_lines", 0))
-    visible_hash = _visible_pane_hash(session_name)
-    pane_width = get_pane_width(session_name)
-    raw = capture_pane_full(session_name)
-    payload = {
-        "mode": "full",
-        "raw": raw,
-        "total_lines": len(raw.split("\n")),
-        "pane_total": pane_total,
-        "pane_width": pane_width,
-        "visible_hash": visible_hash,
-    }
-    return payload, raw, pane_total, visible_hash, pane_width
 
 
-def _terminal_next_payload(session_name: str, channel: dict) -> dict | None:
-    """Capture one shared delta while maintaining a full reconnect snapshot."""
-    pos = get_pane_position(session_name)
-    current_total = int(pos.get("total_lines", 0))
-    visible_hash = _visible_pane_hash(session_name)
-    pane_width = get_pane_width(session_name)
-    known = int(channel.get("pane_total", 0))
-    full_text = str(channel.get("full_text", ""))
-
-    if not full_text or current_total < known:
-        payload, raw, total, vis, width = _terminal_full_payload(session_name)
-        channel.update(
-            full_text=raw, pane_total=total, visible_hash=vis, pane_width=width
-        )
-        return payload
-
-    if current_total > known:
-        overlap = 5
-        lines_from_end = (current_total - known) + overlap
-        raw = capture_pane_recent(session_name, lines_from_end)
-        incoming = raw.split("\n")
-        existing = full_text.split("\n")
-        if len(existing) >= overlap and existing[-overlap:] == incoming[:overlap]:
-            tail = incoming[overlap:]
-            if tail:
-                channel["full_text"] = full_text + "\n" + "\n".join(tail)
-            channel.update(
-                pane_total=current_total,
-                visible_hash=visible_hash,
-                pane_width=pane_width,
-            )
-            return {
-                "mode": "delta",
-                "raw": raw,
-                "total_lines": current_total,
-                "pane_total": current_total,
-                "pane_width": pane_width,
-                "overlap": overlap,
-                "visible_hash": visible_hash,
-            }
-        payload, raw, total, vis, width = _terminal_full_payload(session_name)
-        channel.update(
-            full_text=raw, pane_total=total, visible_hash=vis, pane_width=width
-        )
-        return payload
-
-    if visible_hash and visible_hash != channel.get("visible_hash"):
-        payload, raw, total, vis, width = _terminal_full_payload(session_name)
-        channel.update(
-            full_text=raw, pane_total=total, visible_hash=vis, pane_width=width
-        )
-        return payload
-
-    channel.update(visible_hash=visible_hash, pane_width=pane_width)
-    return None
 
 
-async def _terminal_send(writer: asyncio.StreamWriter, payload: dict) -> bool:
-    try:
-        writer.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
-        await asyncio.wait_for(writer.drain(), timeout=3)
-        return True
-    except Exception:
-        return False
 
 
-async def _terminal_broadcast(session_name: str, payload: dict) -> None:
-    channel = _terminal_channels.get(session_name)
-    if not channel:
-        return
-    writers = list(channel.get("writers", set()))
-    if not writers:
-        return
-    results = await asyncio.gather(
-        *(_terminal_send(writer, payload) for writer in writers),
-        return_exceptions=True,
-    )
-    for writer, ok in zip(writers, results):
-        if ok is not True:
-            channel["writers"].discard(writer)
-            try:
-                writer.close()
-            except Exception:
-                pass
 
 
-async def _terminal_producer(session_name: str) -> None:
-    channel = _terminal_channels[session_name]
-    quiet_ticks = 0
-    try:
-        while channel.get("writers"):
-            try:
-                payload = await asyncio.to_thread(
-                    _terminal_next_payload, session_name, channel
-                )
-                if payload:
-                    quiet_ticks = 0
-                    channel["last_emit"] = time.time()
-                    await _terminal_broadcast(session_name, payload)
-                else:
-                    quiet_ticks += 1
-                    if time.time() - channel.get("last_emit", 0) >= 20:
-                        channel["last_emit"] = time.time()
-                        await _terminal_broadcast(
-                            session_name,
-                            {
-                                "mode": "ping",
-                                "pane_total": channel.get("pane_total", 0),
-                                "pane_width": channel.get("pane_width", 0),
-                                "visible_hash": channel.get("visible_hash", ""),
-                            },
-                        )
-            except Exception as exc:
-                await _terminal_broadcast(
-                    session_name, {"mode": "error", "error": str(exc)[:240]}
-                )
-                quiet_ticks += 1
-            await asyncio.sleep(0.6 if quiet_ticks < 5 else min(2.0, 0.8 + quiet_ticks / 10))
-    finally:
-        channel["task"] = None
-        if not channel.get("writers"):
-            _terminal_channels.pop(session_name, None)
 
 
-async def _terminal_subscribe(
-    session_name: str, writer: asyncio.StreamWriter
-) -> dict:
-    channel = _terminal_channels.setdefault(
-        session_name,
-        {
-            "writers": set(),
-            "task": None,
-            "full_text": "",
-            "pane_total": 0,
-            "visible_hash": "",
-            "pane_width": 0,
-            "last_emit": 0.0,
-        },
-    )
-    channel["writers"].add(writer)
-    if channel.get("full_text"):
-        await _terminal_send(
-            writer,
-            {
-                "mode": "full",
-                "raw": channel["full_text"],
-                "total_lines": len(channel["full_text"].split("\n")),
-                "pane_total": channel.get("pane_total", 0),
-                "pane_width": channel.get("pane_width", 0),
-                "visible_hash": channel.get("visible_hash", ""),
-            },
-        )
-    if not channel.get("task") or channel["task"].done():
-        channel["task"] = asyncio.create_task(_terminal_producer(session_name))
-    return channel
 
 
-async def _terminal_unsubscribe(session_name: str, writer: asyncio.StreamWriter) -> None:
-    channel = _terminal_channels.get(session_name)
-    if not channel:
-        return
-    channel.get("writers", set()).discard(writer)
-    if not channel.get("writers") and channel.get("task"):
-        channel["task"].cancel()
 
 
 def _session_tmux_activity(session_name: str) -> float:
@@ -7605,242 +6319,14 @@ def _session_has_autonomous_work(session_name: str) -> bool:
 
 
 
-def _archive_tmux_scrollback(session_name: str) -> str:
-    """Persist a mode-600 copy in addition to tmux's remain-on-exit history."""
-    try:
-        target_dir = MESSAGES_DIR / "parked-scrollback"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{session_name}.log"
-        content = capture_pane_full(session_name)
-        if content:
-            tmp = target.with_suffix(".tmp")
-            tmp.write_text(content)
-            tmp.chmod(0o600)
-            os.replace(tmp, target)
-            return str(target)
-    except Exception:
-        logger.exception("Could not archive tmux scrollback for '%s'", session_name)
-    return ""
 
 
-def _restore_parked_tmux_shell(session_name: str, lifecycle: dict) -> bool:
-    """Reanimate a dead/virtual pane without changing its worktree or transcript."""
-    owner = _user_for_session(session_name)
-    cwd = str(lifecycle.get("cwd") or "")
-    if not cwd and _multi_tenant_enabled() and owner and not _is_admin(owner):
-        cwd = str(PROJECTS_ROOT / str(owner.get("username") or "member") / session_name)
-    if not cwd or not Path(cwd).is_dir():
-        cwd = str(Path(__file__).resolve().parent)
-    try:
-        has_session = subprocess.run(
-            ["tmux", "has-session", "-t", session_name],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).returncode == 0
-        if has_session and _pane_is_dead(session_name):
-            result = subprocess.run(
-                ["tmux", "respawn-pane", "-k", "-t", session_name, "-c", cwd],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        elif not has_session:
-            result = subprocess.run(
-                ["tmux", "new-session", "-d", "-s", session_name, "-c", cwd],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        else:
-            return True
-        if result.returncode != 0:
-            logger.error("Could not restore parked tmux '%s': %s", session_name, result.stderr.strip())
-            return False
-        subprocess.run(
-            ["tmux", "set-option", "-pt", session_name, "remain-on-exit", "on"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        owner_name = ((owner or {}).get("username") or AUTH_USER or "admin")
-        project_dir = str(PROJECTS_ROOT / owner_name / session_name)
-        git_email = f"{owner_name}@{GIT_EMAIL_DOMAIN}"
-        assignments = {
-            "DASH_USER": owner_name,
-            "DASH_SESSION": session_name,
-            "DASH_PROJECT_DIR": project_dir,
-            "DASH_PROJECT_URL": f"{PUB_URL}/{owner_name}/{session_name}",
-            "GIT_AUTHOR_NAME": owner_name,
-            "GIT_AUTHOR_EMAIL": git_email,
-            "GIT_COMMITTER_NAME": owner_name,
-            "GIT_COMMITTER_EMAIL": git_email,
-        }
-        if owner and not _is_admin(owner):
-            assignments["CODEX_HOME"] = str(_user_codex_config_dir(owner))
-        export = "export " + " ".join(
-            f"{key}={shlex.quote(value)}" for key, value in assignments.items()
-        )
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "-l", export],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return True
-    except Exception:
-        logger.exception("Failed to restore parked tmux shell '%s'", session_name)
-        return False
 
 
-async def _park_session_local(session_name: str, last_activity: float) -> dict:
-    """Checkpoint by gracefully exiting Codex; tmux, Git and rollouts remain intact."""
-    if _terminal_channels.get(session_name, {}).get("writers"):
-        return {"ok": False, "skipped": "terminal is being viewed"}
-    if _session_has_autonomous_work(session_name):
-        return {"ok": False, "skipped": "autonomous work is enabled"}
-    activity = await async_detect_activity(session_name)
-    if activity.get("status") != "idle":
-        return {"ok": False, "skipped": f"session is {activity.get('status', 'unknown')}"}
-    scrollback_file = await asyncio.to_thread(_archive_tmux_scrollback, session_name)
-    session_cwd = await asyncio.to_thread(get_session_cwd, session_name)
-    await asyncio.to_thread(
-        subprocess.run,
-        ["tmux", "set-option", "-pt", session_name, "remain-on-exit", "on"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if not await _async_is_codex_running(session_name):
-        row = await asyncio.to_thread(
-            _session_lifecycle.mark_parked,
-            session_name,
-            reason="inactive Codex was already stopped",
-            last_activity=last_activity,
-            cwd=session_cwd,
-            scrollback_file=scrollback_file,
-        )
-        return {"ok": True, "parked": True, "session": row}
-
-    await asyncio.to_thread(
-        subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "-l", _agent_quit_command(session_name)],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    await asyncio.to_thread(
-        subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "Enter"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    for _ in range(15):
-        await asyncio.sleep(1)
-        if not await _async_is_codex_running(session_name):
-            break
-    if await _async_is_codex_running(session_name):
-        # Codex may require one interrupt to leave an empty composer before it
-        # accepts /quit. This is used only after an idle re-check.
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "C-c"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        await asyncio.sleep(0.5)
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", _agent_quit_command(session_name)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        for _ in range(10):
-            await asyncio.sleep(1)
-            if not await _async_is_codex_running(session_name):
-                break
-    if await _async_is_codex_running(session_name):
-        return {"ok": False, "error": "Codex did not exit cleanly; left running"}
-    row = await asyncio.to_thread(
-        _session_lifecycle.mark_parked,
-        session_name,
-        reason=f"inactive for at least {SESSION_PARK_AFTER}s",
-        last_activity=last_activity,
-        cwd=session_cwd,
-        scrollback_file=scrollback_file,
-    )
-    _seen_claude_running.discard(session_name)
-    logger.info("Parked inactive Codex session '%s' without removing tmux or state", session_name)
-    return {"ok": True, "parked": True, "session": row}
 
 
-async def _resume_parked_session(session_name: str, source: str = "dashboard") -> dict:
-    row = await asyncio.to_thread(
-        _session_lifecycle.touch, session_name, source=source
-    )
-    if not row.get("parked"):
-        return {"ok": True, "parked": False, "resumed": False, "session": row}
-    if row.get("virtual") or _pane_is_dead(session_name):
-        restored = await asyncio.to_thread(
-            _restore_parked_tmux_shell, session_name, row
-        )
-        if not restored:
-            return {"ok": False, "error": "parked tmux shell could not be restored"}
-    if not _find_session(session_name)[1]:
-        return {"ok": False, "error": "session not found"}
-    resumed = await _ensure_codex_running(session_name)
-    if not resumed:
-        return {"ok": False, "error": "Codex resume failed; tmux and state are intact"}
-    row = await asyncio.to_thread(
-        _session_lifecycle.mark_resumed, session_name, source=source
-    )
-    _seen_claude_running.add(session_name)
-    logger.info("Resumed parked Codex session '%s' on demand", session_name)
-    return {"ok": True, "parked": False, "resumed": True, "session": row}
 
 
-async def _session_lifecycle_loop() -> None:
-    await asyncio.sleep(20)
-    while True:
-        try:
-            now = time.time()
-            sessions = await asyncio.to_thread(get_tmux_sessions)
-            for session in sessions:
-                name = session["name"]
-                lifecycle = _session_lifecycle.get(name)
-                if lifecycle.get("parked") or _session_has_autonomous_work(name):
-                    continue
-                if _terminal_channels.get(name, {}).get("writers"):
-                    continue
-                last_activity = await asyncio.to_thread(
-                    _session_last_activity, name, float(session.get("created") or 0)
-                )
-                if not last_activity or now - last_activity < SESSION_PARK_AFTER:
-                    continue
-                result = await _park_session_local(name, last_activity)
-                if not result.get("ok") and result.get("error"):
-                    logger.warning("Could not park '%s': %s", name, result["error"])
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Session lifecycle pass failed")
-        await asyncio.sleep(SESSION_LIFECYCLE_INTERVAL)
 
 
 def _controller_runtime_data() -> dict:
@@ -8068,15 +6554,6 @@ async def _controller_call(op: str, **fields) -> dict:
     return {"ok": False, "error": last_error}
 
 
-async def _controller_terminal_connection(session_name: str):
-    if PROCESS_ROLE != "api":
-        return None, None
-    reader, writer = await asyncio.open_unix_connection(
-        str(CONTROLLER_SOCKET), limit=32 * 1024 * 1024
-    )
-    writer.write((json.dumps({"op": "terminal_subscribe", "session": session_name}) + "\n").encode())
-    await writer.drain()
-    return reader, writer
 
 
 @app.websocket("/ws/sessions/{session_name}/raw")
@@ -8721,9 +7198,6 @@ async def api_save_codex_md(session_name: str, body: SaveCodexMd):
 # Codex reads MEMORY.md from `<CODEX_HOME>/projects/<encoded-cwd>/memory/MEMORY.md`,
 # where the encoded path replaces `/` and `_` with `-`. We mirror that here.
 
-def _encode_project_path(cwd: str) -> str:
-    """Mirror Codex's project-dir encoding: replace `/` and `_` with `-`."""
-    return (cwd or "").replace("/", "-").replace("_", "-")
 
 
 def _session_config_base(session_name: str) -> Path:
@@ -8736,6 +7210,41 @@ def _session_config_base(session_name: str) -> Path:
     if owner and not _is_admin(owner):
         return _user_codex_config_dir(owner)
     return CODEX_HOME
+
+
+# Wire services/session_launch.py once its helpers exist.
+session_launch_service.configure(
+    _async_is_codex_running=_async_is_codex_running,
+    _codex_home_mcp_servers=_codex_home_mcp_servers,
+    _ensure_codex_running=_ensure_codex_running,
+    _multi_tenant_enabled=_multi_tenant_enabled,
+    _seen_claude_running=_seen_claude_running,
+    _session_config_base=_session_config_base,
+    _session_has_autonomous_work=_session_has_autonomous_work,
+    _session_last_activity=_session_last_activity,
+    _session_lifecycle=_session_lifecycle,
+    _terminal_channels=_terminal_channels,
+    _user_claude_config_dir=_user_claude_config_dir,
+    _user_codex_config_dir=_user_codex_config_dir,
+    _user_for_session=_user_for_session,
+    DEFAULT_MODEL=DEFAULT_MODEL,
+)
+
+
+# Wire services/stores.py. `cache` is passed by reference: it is mutated in
+# place on both sides, so both must see the same object.
+stores_service.configure(
+    _encode_project_path=_encode_project_path,
+    _read_json_file=_read_json_file,
+    _session_config_base=_session_config_base,
+    _session_owner_id=_session_owner_id,
+    _user_codex_config_dir=_user_codex_config_dir,
+    _user_data_dir=_user_data_dir,
+    _user_for_session=_user_for_session,
+    _write_json_file=_write_json_file,
+    llm_call=llm_call,
+    cache=cache,
+)
 
 
 # Wire services/usage.py once its helpers exist. AUTH_SECRET and DEFAULT_MODEL
@@ -8751,23 +7260,10 @@ usage_service.configure(
 )
 
 
-def _session_memory_dir(session_name: str) -> tuple[Path, str]:
-    """Resolve the project memory directory for an account and workdir."""
-    cwd = get_session_cwd(session_name) or ""
-    encoded = _encode_project_path(cwd)
-    base = _session_config_base(session_name)
-    mem_dir = base / "projects" / encoded / "memory"
-    return mem_dir, cwd
 
 
-_MEMORY_EXTRA_RE = re.compile(r"^[A-Za-z0-9._-]+\.md$")
 
 
-def _sanitize_memory_filename(name: str) -> str:
-    name = os.path.basename(name or "")
-    if not _MEMORY_EXTRA_RE.match(name):
-        return ""
-    return name
 
 
 @app.get("/api/sessions/{session_name}/memory-md")
@@ -8908,27 +7404,6 @@ def _first_existing_path(paths: list[Path]) -> Path:
     return next((path for path in paths if path.exists()), paths[0])
 
 
-def _context_file_entries():
-    """Resolve fixed registry candidates plus existing per-host infra details."""
-    entries = []
-    for configured in _CONTEXT_FILES:
-        entry = dict(configured)
-        candidates = list(entry.pop("paths"))
-        entry["path"] = _first_existing_path(candidates)
-        entries.append(entry)
-    try:
-        infra_dir = _first_existing_path(list(_INFRA_DETAIL_DIRS))
-        for p in sorted(infra_dir.glob("*.md")):
-            entries.append({
-                "id": "infra-" + p.stem, "path": p, "load": "ondemand",
-                "label": "infra/" + p.name,
-                "note": ("One line per infrastructure change, newest first."
-                         if p.name == "CHANGELOG.md"
-                         else "Per-host infrastructure detail, linked from the index."),
-            })
-    except Exception:
-        logger.debug("Failed to list infra detail files", exc_info=True)
-    return entries
 
 
 @app.get("/api/context-files")
@@ -8989,11 +7464,7 @@ async def api_save_context_file(body: ContextFileBody):
 #                not configurable per account. Listed via /api/builtin-skills
 #                so the UI can surface them as read-only.
 
-SKILLS_DIR = MESSAGES_DIR / "skills"
-SKILL_LIBRARY_DIR = MESSAGES_DIR / "skill-library"
 
-_SKILL_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_-]+\.md$")
-_SKILL_DIR_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
 # Built-in skills bundled with Codex itself. Always available; cannot be
 # disabled per account. Surfaced to the UI as a read-only "Built-in" section
@@ -9007,86 +7478,14 @@ _BUILTIN_SKILLS = [
 ]
 
 
-def _sanitize_skill_filename(name: str) -> str:
-    """Sanitize and validate a flat .md skill filename (legacy session API)."""
-    name = os.path.basename(name)
-    if not name.endswith(".md"):
-        name += ".md"
-    if not _SKILL_FILENAME_RE.match(name):
-        return ""
-    return name
 
 
-def _sanitize_skill_dir_name(name: str) -> str:
-    """Sanitize a skill directory name (the canonical Skill `<name>`)."""
-    name = os.path.basename((name or "").strip())
-    if name.endswith(".md"):
-        name = name[:-3]
-    if not _SKILL_DIR_NAME_RE.match(name):
-        return ""
-    return name
 
 
-def _parse_skill_frontmatter(skill_md_path: Path) -> dict:
-    """Extract `name` and `description` from a SKILL.md YAML frontmatter block.
-
-    Falls back to the parent directory name when frontmatter is missing or malformed.
-    """
-    out = {"name": skill_md_path.parent.name, "description": ""}
-    try:
-        text = skill_md_path.read_text()
-    except Exception:
-        return out
-    if not text.startswith("---"):
-        return out
-    # Find the closing fence
-    end = text.find("\n---", 3)
-    if end == -1:
-        return out
-    block = text[3:end]
-    for raw in block.splitlines():
-        line = raw.strip()
-        if line.startswith("name:"):
-            v = line.split(":", 1)[1].strip().strip('"').strip("'")
-            if v:
-                out["name"] = v
-        elif line.startswith("description:"):
-            v = line.split(":", 1)[1].strip().strip('"').strip("'")
-            if v:
-                out["description"] = v
-    return out
 
 
-def _read_skill_dir(d: Path) -> dict | None:
-    """Read a skill directory; return metadata dict or None if not a valid skill."""
-    if not d.is_dir():
-        return None
-    skill_md = d / "SKILL.md"
-    if not skill_md.is_file():
-        return None
-    fm = _parse_skill_frontmatter(skill_md)
-    try:
-        content = skill_md.read_text()
-    except Exception:
-        content = ""
-    return {
-        "name": fm["name"],
-        "dir_name": d.name,
-        "description": fm["description"],
-        "path": str(skill_md),
-        "content": content,
-    }
 
 
-def _list_library_skills() -> list:
-    """List all skills in the library (sorted by directory name)."""
-    SKILL_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
-    out = []
-    for entry in sorted(SKILL_LIBRARY_DIR.iterdir()):
-        info = _read_skill_dir(entry)
-        if info:
-            out.append(info)
-    return out
 
 
 def _is_library_link(skills_dir: Path, skill_dir_name: str) -> bool:
@@ -9102,38 +7501,14 @@ def _is_library_link(skills_dir: Path, skill_dir_name: str) -> bool:
     return resolved == expected
 
 
-def _skill_dir_for_session(session_name: str) -> Path:
-    owner = _user_for_session(session_name)
-    if owner and not _is_admin(owner):
-        d = _user_data_dir(owner) / "skills" / session_name
-    else:
-        d = SKILLS_DIR / session_name
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
-class SkillFileBody(BaseModel):
-    name: str
-    content: str
 
 
-class SaveLibrarySkillBody(BaseModel):
-    description: str = ""
-    content: str
 
 
-class SkillLibraryBody(BaseModel):
-    name: str
-    session_name: str = ""
 
 
-def _account_skills_dir(user: dict) -> Path:
-    skills_dir = _user_codex_config_dir(user) / "skills"
-    if skills_dir.is_symlink():
-        raise ValueError("Account skills root cannot be a symlink")
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    skills_dir.chmod(0o700)
-    return skills_dir
 
 
 @app.get("/api/my/skills")
@@ -9418,6 +7793,40 @@ def _backup_before_dashboard_write(path: Path):
         logger.debug("Failed to back up %s before dashboard write", path, exc_info=True)
 
 
+# Wire services/member_auth.py once its helpers exist.
+member_auth_service.configure(
+    _active_openai_key=_active_openai_key,
+    _backup_before_dashboard_write=_backup_before_dashboard_write,
+    _ensure_group_dir=_ensure_group_dir,
+    _existing_playwright_block=_existing_playwright_block,
+    _load_session_owners=_load_session_owners,
+    _multi_tenant_enabled=_multi_tenant_enabled,
+    _strip_managed_block=_strip_managed_block,
+    _user_codex_config_dir=_user_codex_config_dir,
+    _write_codex_api_auth=_write_codex_api_auth,
+)
+
+
+# Wire services/agent_config.py once its helpers exist.
+agent_config_service.configure(
+    _backup_before_dashboard_write=_backup_before_dashboard_write,
+    _ensure_user_codex_config_dir=_ensure_user_codex_config_dir,
+    _first_existing_path=_first_existing_path,
+    _group_dir=_group_dir,
+    _user_codex_config_dir=_user_codex_config_dir,
+)
+
+
+# Wire services/projects.py once its helpers exist.
+projects_service.configure(
+    _backup_before_dashboard_write=_backup_before_dashboard_write,
+    _session_owner_id=_session_owner_id,
+    _toml_escape=_toml_escape,
+    _user_codex_config_dir=_user_codex_config_dir,
+    _user_data_dir=_user_data_dir,
+)
+
+
 # Wire services/browser.py here rather than beside its import: these helpers are
 # defined further down the file, and configuring at import position would bind
 # names that do not exist yet.
@@ -9434,44 +7843,6 @@ browser_service.configure(
 
 
 
-def _ensure_codex_project_trust(existing: str, project_dir: str) -> str:
-    """Persist Codex's native trust marker for a dashboard-managed workdir."""
-    project = str(Path(project_dir).expanduser().resolve())
-    header = f'[projects."{_toml_escape(project)}"]'
-    lines = existing.splitlines()
-    section_start = next(
-        (index for index, line in enumerate(lines) if line.strip() == header),
-        None,
-    )
-    if section_start is None:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.extend((header, 'trust_level = "trusted"'))
-        return "\n".join(lines).rstrip() + "\n"
-
-    section_end = next(
-        (
-            index
-            for index in range(section_start + 1, len(lines))
-            if lines[index].strip().startswith("[")
-            and lines[index].strip().endswith("]")
-        ),
-        len(lines),
-    )
-    trust_line = re.compile(r"^\s*trust_level\s*=")
-    matches = [
-        index
-        for index in range(section_start + 1, section_end)
-        if trust_line.match(lines[index])
-    ]
-    if matches:
-        first = matches[0]
-        lines[first] = 'trust_level = "trusted"'
-        for duplicate in reversed(matches[1:]):
-            del lines[duplicate]
-    else:
-        lines.insert(section_start + 1, 'trust_level = "trusted"')
-    return "\n".join(lines).rstrip() + "\n"
 
 
 def _normalize_reasoning_effort(effort: str | None) -> str | None:
@@ -9499,35 +7870,8 @@ class SetSessionModelBody(BaseModel):
 # Surface them in the session's "More" dropdown so the user can edit per-project
 # rules without leaving the dashboard.
 
-_PROJECT_FILES = [
-    ("AGENTS.md", "md",
-     "Project rules loaded on top of the account AGENTS.md."),
-    (".codex/config.toml", "toml",
-     "Project config (model, env, hooks) loaded on top of account config."),
-    (".codex/config.local.toml", "toml",
-     "Project-local config (not committed). Loaded last; wins over everything."),
-    (".mcp.json", "json",
-     "Project-scope MCP servers added to the account MCP servers."),
-]
 
 
-def _safe_project_path(cwd: str, rel: str) -> Path | None:
-    """Confine writes to known per-project files under cwd."""
-    if not cwd:
-        return None
-    rel_clean = (rel or "").lstrip("/").replace("\\", "/")
-    allowed = {p for p, _, _ in _PROJECT_FILES}
-    if rel_clean not in allowed:
-        return None
-    base = Path(cwd).resolve()
-    if not base.exists() or not base.is_dir():
-        return None
-    target = (base / rel_clean).resolve()
-    try:
-        target.relative_to(base)
-    except ValueError:
-        return None
-    return target
 
 
 @app.get("/api/sessions/{session_name}/project-files")
@@ -9574,9 +7918,6 @@ async def api_get_session_project_file(session_name: str, path: str):
                          "size": target.stat().st_size if exists else 0})
 
 
-class ProjectFileBody(BaseModel):
-    path: str
-    content: str
 
 
 @app.put("/api/sessions/{session_name}/project-file")
@@ -11293,22 +9634,6 @@ def _auth_admin_ok(request: Request) -> bool:
 
 
 
-def _codex_auth_status_dict(codex_home: Path = CODEX_HOME) -> dict:
-    auth_path = codex_home / "auth.json"
-    mode = "unknown"
-    has_api_key = False
-    try:
-        data = json.loads(auth_path.read_text())
-        mode = str(data.get("auth_mode") or "unknown")
-        has_api_key = bool(data.get("OPENAI_API_KEY"))
-    except Exception:
-        pass
-    return {
-        "loggedIn": auth_path.exists() and (has_api_key or mode in ("chatgpt", "apikey")),
-        "authMode": mode,
-        "hasApiKey": has_api_key or bool(_active_openai_key()),
-        "credentialsFile": auth_path.exists(),
-    }
 
 
 @app.get("/api/auth/status")
@@ -11946,57 +10271,23 @@ def _code_from_urls(urls: list) -> str:
     return ""
 
 
-async def _extract_oauth_code(tab, authorize_url: str) -> dict:
-    """Drive the consent page to an auth code. Returns {code} or {error}."""
-    await tab.call("Network.enable")
-    # A background tab's renderer is throttled and the consent button does
-    # nothing at all, so the tab must be foregrounded before we touch it.
-    await tab.call("Page.bringToFront")
-    await tab.navigate(authorize_url, settle=2.5)
-    await tab.call("Page.bringToFront")
-    body = (await tab.eval("document.body ? document.body.innerText : ''")) or ""
-    # A free/no-plan account can't authorize Claude Code at all — say so plainly
-    # rather than waiting for a button that will never work.
-    if "Max or Pro is required" in body or "required to connect to Claude Code" in body:
-        return {"error": "the login browser's claude.ai account has no Max/Pro plan, "
-                         "so it cannot authorize Claude Code"}
-    if "just a moment" in body.lower():
-        return {"error": "Cloudflare challenge on the consent page — retry"}
-    if "sign in" in body.lower() and "authorize" not in body.lower():
-        return {"error": "the login browser is signed out of claude.ai"}
-    clicked = await tab.wait_for("""(() => {
-        const want = /^(authorize|allow|continue|approve)$/i;
-        const els = [...document.querySelectorAll('button, a[role=button], input[type=submit]')];
-        const b = els.find(e => want.test((e.innerText||e.value||'').trim()));
-        if (b) { b.click(); return true; }
-        return false;
-    })()""", timeout=25)
-    if not clicked:
-        return {"error": "no Authorize button appeared on the consent page"}
-    # The code can surface three ways, so watch all of them: the redirect to the
-    # callback (often ABORTED here, but the request event still carries the code),
-    # the address bar, or the code rendered on the page for copying.
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        await tab.drain(3)
-        code = _code_from_urls(tab.urls_seen())
-        if code:
-            return {"code": code}
-        try:
-            onpage = await tab.eval("""(() => {
-                const p = new URLSearchParams(location.search);
-                const c = p.get('code');
-                if (c && c !== 'true') return c + (p.get('state') ? '#' + p.get('state') : '');
-                const t = document.body ? document.body.innerText : '';
-                const m = t.match(/[A-Za-z0-9_-]{20,}#[A-Za-z0-9_-]{10,}/);
-                return m ? m[0] : '';
-            })()""")
-        except Exception:
-            onpage = ""
-        if onpage:
-            return {"code": str(onpage).strip()}
-    return {"error": "clicked Authorize but claude.ai never returned a code "
-                     "(its consent page stalls when driven automatically)"}
+# Wire services/google_auth.py once its helpers exist.
+google_auth_service.configure(
+    _advisor_live_sync_enabled=_advisor_live_sync_enabled,
+    _backup_before_dashboard_write=_backup_before_dashboard_write,
+    _code_from_urls=_code_from_urls,
+    _ensure_user_browser_session=_ensure_user_browser_session,
+    _ensure_user_codex_config_dir=_ensure_user_codex_config_dir,
+    _new_user_id=_new_user_id,
+    _public_base_url=_public_base_url,
+    _sync_advisor_user=_sync_advisor_user,
+    _toml_escape=_toml_escape,
+    _user_codex_config_dir=_user_codex_config_dir,
+    _user_data_dir=_user_data_dir,
+    AUTH_SECRET=AUTH_SECRET,
+)
+
+
 
 
 async def _auto_fix_login(session_name: str) -> dict:
@@ -12345,8 +10636,6 @@ async def api_transcribe(audio: UploadFile = File(...)):
 # --- Codex auth management ---
 
 _codex_auth_cache: dict = {"ts": 0, "data": {}}
-_codex_auth_validation_lock = threading.Lock()
-_codex_auth_fallback_state: dict = {"path": "", "reason": "", "ts": 0.0}
 _codex_login_lock = threading.Lock()
 _codex_login_process = None
 _codex_login_state: dict = {
@@ -12359,182 +10648,18 @@ _codex_login_state: dict = {
 }
 
 
-def _codex_app_server_process(codex_home: Path):
-    """Start the official Codex app-server with file-backed credentials."""
-    codex_home.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env["CODEX_HOME"] = str(codex_home)
-    return subprocess.Popen(
-        [
-            "codex", "app-server", "-c", 'cli_auth_credentials_store="file"',
-            "--stdio",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
 
 
-def _codex_app_server_send(process, message: dict):
-    if process.stdin is None:
-        raise RuntimeError("Codex app-server stdin is unavailable")
-    process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-    process.stdin.flush()
 
 
-def _codex_app_server_wait(process, request_id: int, timeout: float = 15.0) -> dict:
-    """Read JSONL until the requested response arrives, with a hard deadline."""
-    if process.stdout is None:
-        raise RuntimeError("Codex app-server stdout is unavailable")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError("Codex app-server exited before responding")
-        remaining = max(0.0, deadline - time.monotonic())
-        ready, _, _ = select.select([process.stdout], [], [], min(0.5, remaining))
-        if not ready:
-            continue
-        line = process.stdout.readline()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if message.get("id") == request_id:
-            return message
-    raise TimeoutError("Codex app-server did not respond in time")
 
 
-def _codex_app_server_initialize(process):
-    _codex_app_server_send(process, {
-        "method": "initialize",
-        "id": 0,
-        "params": {
-            "clientInfo": {
-                "name": "grabo_dashboard",
-                "title": "Grabo Codex Dashboard",
-                "version": "1",
-            },
-        },
-    })
-    response = _codex_app_server_wait(process, 0)
-    if response.get("error"):
-        raise RuntimeError("Codex app-server initialization failed")
-    _codex_app_server_send(process, {"method": "initialized", "params": {}})
 
 
-def _terminate_codex_app_server(process):
-    if process is None or process.poll() is not None:
-        return
-    try:
-        process.terminate()
-        process.wait(timeout=3)
-    except Exception:
-        try:
-            process.kill()
-            process.wait(timeout=2)
-        except Exception:
-            pass
 
 
-def _codex_app_server_account_read(codex_home: Path, refresh_token: bool = True) -> dict:
-    """Ask Codex itself to validate (and, for ChatGPT, refresh) its credential."""
-    process = _codex_app_server_process(codex_home)
-    try:
-        _codex_app_server_initialize(process)
-        _codex_app_server_send(process, {
-            "method": "account/read",
-            "id": 1,
-            "params": {"refreshToken": refresh_token},
-        })
-        response = _codex_app_server_wait(process, 1, timeout=20)
-        if response.get("error"):
-            error = response.get("error") or {}
-            message = error.get("message") if isinstance(error, dict) else ""
-            return {"ok": False, "error": str(message or "credential refresh failed")[:300]}
-        result = response.get("result") or {}
-        account = result.get("account")
-        if not isinstance(account, dict):
-            return {"ok": False, "error": "Codex reported no active account"}
-        return {"ok": True, "account": account}
-    except Exception as exc:
-        logger.warning("Codex credential validation failed: %s", type(exc).__name__)
-        return {"ok": False, "error": "Codex could not validate the ChatGPT credential"}
-    finally:
-        _terminate_codex_app_server(process)
 
 
-def _ensure_codex_auth_with_fallback(
-    codex_home: Path = CODEX_HOME,
-    validate_chatgpt: bool = True,
-) -> dict:
-    """Validate ChatGPT auth and activate the stored API key when it is unusable."""
-    with _codex_auth_validation_lock:
-        auth_path = codex_home / "auth.json"
-        creds: dict = {}
-        parse_error = False
-        try:
-            loaded = json.loads(auth_path.read_text())
-            creds = loaded if isinstance(loaded, dict) else {}
-        except Exception:
-            parse_error = True
-        configured_mode = str(creds.get("auth_mode") or "unknown")
-        active_mode = "unknown"
-        reason = ""
-        account: dict = {}
-
-        if configured_mode == "apikey" and creds.get("OPENAI_API_KEY"):
-            active_mode = "apikey"
-        elif configured_mode == "chatgpt":
-            tokens = creds.get("tokens")
-            if not isinstance(tokens, dict) or not all(
-                tokens.get(name) for name in ("access_token", "refresh_token")
-            ):
-                reason = "ChatGPT credential is missing required tokens"
-            elif validate_chatgpt:
-                probe = _codex_app_server_account_read(codex_home, refresh_token=True)
-                account = probe.get("account") if isinstance(probe.get("account"), dict) else {}
-                if probe.get("ok") and account.get("type") == "chatgpt":
-                    active_mode = "chatgpt"
-                else:
-                    reason = "ChatGPT credential is expired, revoked, or could not be refreshed"
-            else:
-                active_mode = "chatgpt"
-        elif parse_error:
-            reason = "Codex credential file is missing or unreadable"
-        else:
-            reason = "Codex credential is not usable"
-
-        stored_key = _active_openai_key()
-        fallback_active = False
-        if active_mode == "unknown" and reason and stored_key:
-            _write_codex_api_auth(codex_home, stored_key)
-            active_mode = "apikey"
-            fallback_active = True
-            _codex_auth_fallback_state.update({
-                "path": str(auth_path), "reason": reason, "ts": time.time(),
-            })
-            logger.warning("Activated stored OpenAI API-key fallback for %s", codex_home)
-        elif (
-            active_mode == "apikey"
-            and _codex_auth_fallback_state.get("path") == str(auth_path)
-            and _codex_auth_fallback_state.get("reason")
-        ):
-            fallback_active = True
-            reason = str(_codex_auth_fallback_state["reason"])
-
-        return {
-            "configuredMode": configured_mode,
-            "activeMode": active_mode,
-            "loggedIn": active_mode in ("apikey", "chatgpt"),
-            "fallbackActive": fallback_active,
-            "fallbackReason": reason if fallback_active else "",
-            "account": account,
-        }
 
 
 def _public_codex_login_state() -> dict:
@@ -12681,72 +10806,8 @@ def _cancel_codex_chatgpt_login() -> bool:
     return True
 
 
-def _jwt_claims(token: object) -> dict:
-    """Decode non-secret display claims from a JWT without validating it."""
-    if not isinstance(token, str) or token.count(".") < 2:
-        return token if isinstance(token, dict) else {}
-    try:
-        payload = token.split(".", 2)[1]
-        payload += "=" * (-len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
 
 
-def _codex_auth_display() -> dict:
-    auth_state = _ensure_codex_auth_with_fallback(CODEX_HOME, True)
-    result: dict = {
-        "loggedIn": auth_state["loggedIn"],
-        "hasApiKey": bool(_active_openai_key()),
-        "authMode": auth_state["activeMode"],
-        "activeMode": auth_state["activeMode"],
-        "configuredMode": auth_state["configuredMode"],
-        "fallbackActive": auth_state["fallbackActive"],
-        "fallbackReason": auth_state["fallbackReason"],
-        "model": "",
-    }
-    try:
-        creds = json.loads((CODEX_HOME / "auth.json").read_text())
-        mode = auth_state["activeMode"]
-        result["hasApiKey"] = bool(_active_openai_key() or creds.get("OPENAI_API_KEY"))
-        if mode == "apikey" and creds.get("OPENAI_API_KEY"):
-            result.update({
-                "loggedIn": True,
-                "subscriptionType": "API key",
-                "email": "OpenAI API",
-            })
-        elif mode == "chatgpt" and isinstance(creds.get("tokens"), dict):
-            claims = _jwt_claims(creds["tokens"].get("id_token"))
-            auth_claims = claims.get("https://api.openai.com/auth")
-            if not isinstance(auth_claims, dict):
-                auth_claims = {}
-            plan = (
-                claims.get("chatgpt_plan_type")
-                or auth_claims.get("chatgpt_plan_type")
-                or "ChatGPT"
-            )
-            result.update({
-                "loggedIn": True,
-                "subscriptionType": str(
-                    auth_state["account"].get("planType") or plan
-                ),
-                "email": str(
-                    auth_state["account"].get("email")
-                    or claims.get("email")
-                    or "ChatGPT user"
-                ),
-            })
-    except Exception:
-        logger.debug("Could not read Codex auth status", exc_info=True)
-    try:
-        cfg = (CODEX_HOME / "config.toml").read_text()
-        match = re.search(r'^\s*model\s*=\s*"([^"]+)"', cfg, re.MULTILINE)
-        if match:
-            result["model"] = match.group(1)
-    except Exception:
-        pass
-    return result
 
 
 @app.get("/api/auth/codex-status")
@@ -12858,26 +10919,6 @@ def _all_codex_rollouts() -> list[Path]:
     return files
 
 
-def _codex_app_server_rate_limits(codex_home: Path) -> dict:
-    """Read the authoritative plan windows from Codex's app-server."""
-    process = _codex_app_server_process(codex_home)
-    try:
-        _codex_app_server_initialize(process)
-        _codex_app_server_send(process, {
-            "method": "account/rateLimits/read",
-            "id": 2,
-            "params": None,
-        })
-        response = _codex_app_server_wait(process, 2, timeout=20)
-        if response.get("error"):
-            return {}
-        result = response.get("result")
-        return result if isinstance(result, dict) else {}
-    except Exception:
-        logger.warning("Codex rate-limit lookup failed", exc_info=True)
-        return {}
-    finally:
-        _terminate_codex_app_server(process)
 
 
 def _rate_limit_window_payload(slot: str, window: object) -> dict | None:
@@ -14184,64 +12225,7 @@ async def api_auto_respond_log():
 # genuinely destructive/irreversible (needs a human), or when the task is truly
 # 100% complete with nothing deferred or optional left.
 
-_SIMPLE_WATCHDOG_INTERVAL = 20          # poll every 20s
-_SIMPLE_WATCHDOG_IDLE_SECS = 45         # stable-idle this long before considering action
-_SIMPLE_WATCHDOG_COOLDOWN = 90          # min seconds between replies per session
-_SIMPLE_WATCHDOG_MAX_LOG = 20
-_SIMPLE_WATCHDOG_MAX_SAME_STALL = 3     # back off after N nudges that don't change the screen
 
-_SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
-    "You are an autonomous operator keeping a Codex agent moving while THE USER IS AWAY. "
-    "You are shown the bottom of the agent's terminal; the agent has gone idle. If it has stopped "
-    "and is in ANY way waiting on the user before it can keep working, write the exact message to "
-    "send so it continues on its own. The user is not here and will not answer — waiting wastes time.\n\n"
-    "CRITICAL: only ever continue work that is ALREADY underway. If the agent has not started "
-    "anything — a brand-new or empty session, just the welcome screen, or an idle prompt with no "
-    "question and no work above it to act on — choose 'wait'. NEVER invent a task, instruction, or "
-    "next step out of nothing; you only push EXISTING work forward, you do not start new work.\n\n"
-    "NEVER ASSERT RESULTS AND NEVER DECLARE THE WORK DONE. You are only reading a terminal — you do "
-    "NOT actually know whether any check, test, build, deploy, or fix passed or works. So you must NEVER:\n"
-    "- State or imply that checks/tests passed, or that something is verified, confirmed, working, "
-    "fixed, or 'functioning correctly'.\n"
-    "- Tell the agent to mark, set, treat, consider, or declare a task complete, done, verified, "
-    "resolved, or finished.\n"
-    "Your job is to push UNFINISHED work forward, never to rubber-stamp it as finished. If the agent "
-    "is showing results and is about to wrap up, do NOT confirm them for it — instead tell it to "
-    "re-verify the work ITSELF and keep going, e.g. 'Re-check that yourself end to end before "
-    "concluding, then finish anything still left. Don't wait for me.' If the task genuinely has "
-    "nothing left to do, choose 'wait' — let the agent or the user close it out, never close it out "
-    "for them.\n\n"
-    "Treat ALL of these as 'waiting on the user' and answer them so work continues:\n"
-    "- Questions or choices ('Which should I do, A or B?', 'Do you want X or Y?', 'which one?').\n"
-    "- Confirmations ('Shall I proceed?', 'Want me to continue?', 'Should I also do X?').\n"
-    "- Deferrals / scope-punts ('I left this for phase 2', 'X is out of scope', 'as a follow-up', "
-    "'next steps:', 'we could also…', 'optionally', 'if you want I can…').\n"
-    "- Soft stops ('Let me know how you'd like to proceed', 'standing by', 'paused here').\n\n"
-    "How to answer — always push toward FULLY DONE, autonomously:\n"
-    "- Choice: pick the option that best completes the overall task and say to proceed with it, e.g. "
-    "'Go with option 2 and keep going — don't wait for me.'\n"
-    "- Deferral/scope-punt: tell it to do that work now, e.g. 'Do phase 2 now as well. Treat the "
-    "whole thing as in scope and finish it end to end. Don't stop to ask.'\n"
-    "- Confirmation: 'Yes, proceed. Keep going autonomously and don't wait for me.'\n"
-    "- Make reasonable default assumptions; NEVER ask the user anything back; never tell it to stop, "
-    "pause, or wait. Keep the message to 1-3 concrete sentences that include an instruction to "
-    "continue without the user.\n\n"
-    "Choose action 'wait' ONLY if:\n"
-    "- The agent is still actively working (spinner / 'esc to interrupt' / tool output streaming), OR\n"
-    "- There is NO existing task to advance: a brand-new/empty session, a bare welcome screen, or an "
-    "idle prompt with no question, no deferred work, and nothing above it to act on. Do not fabricate "
-    "a first instruction — only continue work already on screen, OR\n"
-    "- The task is 100% complete: every goal met, nothing deferred, nothing optional left, no question "
-    "on screen, OR\n"
-    "- *** SAFETY OVERRIDE (this beats the continue-bias) *** the next action is genuinely "
-    "DESTRUCTIVE / IRREVERSIBLE / HIGH-COST and a human must decide: deleting or overwriting "
-    "production or unrecoverable data, dropping/truncating DB tables, force-pushing or rewriting "
-    "shared git history, spending real money above a small (~$100) threshold, or sending mass / "
-    "sensitive external messages. If there is ANY doubt about whether an action is destructive, "
-    "irreversible, or high-cost, choose 'wait'. Never auto-approve these.\n\n"
-    "Respond with STRICT JSON only: {\"action\":\"send\",\"message\":\"<what to type>\"} "
-    "or {\"action\":\"wait\"}."
-)
 
 
 # Deterministic safety backstop. If the recent screen (or the message we're about
@@ -14270,16 +12254,6 @@ def _looks_destructive(text: str) -> bool:
     return bool(_DESTRUCTIVE_RE.search(text or ""))
 
 
-# The watchdog must only push UNFINISHED work forward — it must never assert that
-# checks/tests passed or instruct the agent to mark a task complete/verified. (It
-# only reads a terminal; it cannot actually know any result.) If the composed reply
-# does either, we swap it for this neutral nudge so the session still gets unstuck
-# without fabricating a status or forcing a premature "done".
-_WATCHDOG_SAFE_CONTINUE = (
-    "Keep going on your own and take the task all the way to the end. Don't rely on my say-so for "
-    "whether it's finished — re-check the work yourself first, then continue with anything still left. "
-    "Don't wait for me."
-)
 
 _COMPLETION_ASSERT_RE = re.compile(
     # telling the agent to mark/treat/declare the work finished
@@ -14330,316 +12304,18 @@ def _parse_autopilot_decision(raw: str):
     return None
 
 
-def _simple_watchdog_record(session_name: str, action: str):
-    log = _simple_watchdog_log.setdefault(session_name, [])
-    log.append({"ts": time.time(), "action": action})
-    if len(log) > _SIMPLE_WATCHDOG_MAX_LOG:
-        del log[:-_SIMPLE_WATCHDOG_MAX_LOG]
 
 
-async def _simple_watchdog_send_continue(session_name: str) -> bool:
-    """Send 'continue' to the session's Codex prompt. Returns True on send."""
-    return await _simple_watchdog_send_text(session_name, "continue")
 
 
-async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
-    """Type a composed reply into the session's Codex input box and submit.
-    Collapses to a single line so Enter submits the whole message at once."""
-    text = " ".join((text or "").split())
-    if not text:
-        return False
-    try:
-        # -l sends the text literally (so it isn't interpreted as tmux key names);
-        # a separate Enter then submits it to Codex.
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", text],
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.sleep(0.1)
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return True
-    except Exception as e:
-        logger.debug("autopilot: failed to send reply to '%s': %s", session_name, e)
-        return False
 
 
-async def _simple_watchdog_loop():
-    """Background loop: nudge sessions that are paused waiting for 'continue'."""
-    slog = logging.getLogger("simple-watchdog")
-    await asyncio.sleep(8)  # let startup settle
-    while True:
-        try:
-            await asyncio.sleep(_SIMPLE_WATCHDOG_INTERVAL)
-            sessions_list = await asyncio.to_thread(get_tmux_sessions)
-            now = time.time()
-            for sess in sessions_list:
-                name = sess["name"]
-                # Free-form "keep going" nudges only run in FULL auto-push mode.
-                # ("off"/"basic" leave the composing watchdog idle; basic still
-                # gets option-picking + prompt confirms via the auto-responder.)
-                if _get_autopush_mode(name) != "full":
-                    _simple_watchdog_state.pop(name, None)
-                    continue
-                # Don't fight the autonomous-mode watchdog — those modes have their own loop
-                if _away_mode_state.get(name, {}).get("enabled"):
-                    continue
-                if _go_nuts_state.get(name, {}).get("enabled"):
-                    continue
-                # Don't fire if Codex isn't even running
-                if not await _async_is_codex_running(name):
-                    _simple_watchdog_state.pop(name, None)
-                    continue
-                # Cooldown
-                state = _simple_watchdog_state.setdefault(name, {})
-                last_action = state.get("last_action", 0)
-                if now - last_action < _SIMPLE_WATCHDOG_COOLDOWN:
-                    continue
-                # Activity must be idle
-                try:
-                    activity = await async_detect_activity(name)
-                except Exception:
-                    continue
-                if activity.get("status") != "idle":
-                    state["idle_since"] = 0
-                    continue
-                # Capture the visible pane to inspect the prompt area
-                try:
-                    vis = await asyncio.to_thread(
-                        subprocess.run,
-                        ["tmux", "capture-pane", "-t", name, "-p"],
-                        capture_output=True, text=True, timeout=3,
-                    )
-                    if vis.returncode != 0:
-                        continue
-                    visible = vis.stdout
-                except Exception:
-                    continue
-                # Skip if there's an interactive selection prompt — auto-responder owns it
-                if _detect_interactive_prompt(visible):
-                    continue
-                # Never type "continue" into a bare shell. If Codex crashed to bash
-                # between the is-running check above and now, the crash-recovery loop
-                # owns relaunching it — typing here would just spam the shell.
-                if _looks_like_bare_shell(visible):
-                    continue
-                # Never act on a brand-new Codex session that hasn't started work yet
-                # (welcome splash + empty prompt, no conversation). There is nothing to
-                # "continue", so nudging only makes the LLM fabricate a first instruction
-                # and type it into an untouched session.
-                if _looks_like_fresh_claude_session(visible):
-                    continue
-                # Skip if user has typed something into the prompt box (don't clobber)
-                if _has_pending_user_input(visible):
-                    continue
-                # Track stable-idle duration
-                content_hash = hashlib.md5(visible.encode()).hexdigest()
-                if state.get("last_hash") != content_hash:
-                    state["last_hash"] = content_hash
-                    state["idle_since"] = now
-                    continue
-                idle_for = now - state.get("idle_since", now)
-                if idle_for < _SIMPLE_WATCHDOG_IDLE_SECS:
-                    continue
-                # Back off if we keep hitting the EXACT same stalled screen — a reply
-                # that doesn't move it means poking again won't help; leave it for a human.
-                if content_hash == state.get("acted_hash"):
-                    same = state.get("same_stall", 0) + 1
-                    state["same_stall"] = same
-                    if same >= _SIMPLE_WATCHDOG_MAX_SAME_STALL:
-                        if not state.get("backed_off"):
-                            slog.info("Autopilot backing off '%s' — unchanged after %d replies", name, same)
-                            state["backed_off"] = True
-                        continue
-                else:
-                    state["same_stall"] = 0
-                    state["backed_off"] = False
-                # Read the screen and let the LLM compose the reply that keeps it moving.
-                recent = await asyncio.to_thread(capture_pane_recent, name, 80)
-                if not recent.strip():
-                    continue
-                # Safety backstop: never auto-drive a clearly destructive/irreversible
-                # action — the one carve-out from the continue bias. Checked before the
-                # LLM call (cheap) so we don't waste a call either.
-                if _looks_destructive(recent):
-                    if state.get("held_hash") != content_hash:
-                        state["held_hash"] = content_hash
-                        slog.info("Autopilot HOLDING '%s' — possible destructive/irreversible "
-                                  "action on screen; needs a human", name)
-                    continue
-                try:
-                    raw = await llm_call(
-                        system_prompt=_SIMPLE_WATCHDOG_SYSTEM_PROMPT,
-                        user_content=f"Session '{name}' terminal (most recent lines):\n\n{recent[-4500:]}",
-                        max_tokens=160,
-                        response_format={"type": "json_object"},
-                    )
-                except Exception:
-                    continue
-                decision = _parse_autopilot_decision(raw)
-                if not decision or decision.get("action") != "send":
-                    continue
-                msg = (decision.get("message") or "").strip()
-                if not msg or _looks_destructive(msg):
-                    continue
-                # Never let the watchdog assert results or rubber-stamp completion. Its
-                # only job is to UNSTICK the session and push unfinished work forward —
-                # not to claim checks passed or tell the agent to mark a task done. If the
-                # composed reply does either, swap it for a neutral "keep going, verify it
-                # yourself" nudge so we still continue without fabricating a status.
-                if _asserts_completion(msg):
-                    slog.info("Autopilot rewrote completion-asserting reply to '%s': %s",
-                              name, (msg if len(msg) <= 120 else msg[:117] + "..."))
-                    _simple_watchdog_record(name, f"rewrote completion claim: {msg[:80]}")
-                    msg = _WATCHDOG_SAFE_CONTINUE
-                # One more guard: re-check Codex is still running before sending
-                if not await _async_is_claude_running(name):
-                    continue
-                ok = await _simple_watchdog_send_text(name, msg)
-                if ok:
-                    state["last_action"] = now
-                    state["idle_since"] = now
-                    state["acted_hash"] = content_hash
-                    short = msg if len(msg) <= 90 else msg[:87] + "..."
-                    _simple_watchdog_record(name, f"replied (idle {int(idle_for)}s): {short}")
-                    slog.info("Autopilot replied to '%s' after %ds idle: %s", name, int(idle_for), short)
-        except asyncio.CancelledError:
-            slog.info("Simple watchdog cancelled")
-            raise
-        except Exception:
-            logger.debug("Simple watchdog iteration failed", exc_info=True)
 
 
 # --- Auto /login watchdog: re-authenticate a session when Codex asks for login ---
 
-_LOGIN_NEEDED_RE = re.compile(
-    r"(?:please run\s+/login|run\s+`?/login`?|type\s+/login|/login\s+to\s+(?:authenticate|continue|log in|sign in)|"
-    r"invalid api key|authentication[ _]error|oauth[^\n]*(?:token)?[^\n]*(?:expired|invalid|revoked)|"
-    r"(?:your )?session (?:has )?expired|please (?:re-?)?log\s?in|login required|"
-    r"you (?:are|'re) not (?:logged in|authenticated)|sign in to continue)",
-    re.I,
-)
-_LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
-_LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
-# A login prompt must sit unchanged this long before we treat it as abandoned and
-# clear it — otherwise we'd interrupt someone typing /login by hand.
-_LOGIN_FLOW_STALE_AFTER = 45
-_login_watchdog_state: dict[str, dict] = {}
 
 
-async def _login_watchdog_loop():
-    """If a session's Codex shows a login-required message, auto-run /login once
-    (per cooldown) so the user doesn't have to notice and type it themselves."""
-    llog = logging.getLogger("login-watchdog")
-    await asyncio.sleep(10)  # let startup settle
-    while True:
-        try:
-            await asyncio.sleep(_LOGIN_WATCHDOG_INTERVAL)
-            sessions_list = await asyncio.to_thread(get_tmux_sessions)
-            now = time.time()
-            for sess in sessions_list:
-                name = sess["name"]
-                # Auto-push "off" means fully hands-off — don't even auto /login.
-                if _get_autopush_mode(name) == "off":
-                    continue
-                state = _login_watchdog_state.setdefault(name, {})
-                if now - state.get("last_action", 0) < _LOGIN_WATCHDOG_COOLDOWN:
-                    continue
-                if not await _async_is_claude_running(name):
-                    continue
-                try:
-                    recent = await asyncio.to_thread(capture_pane_recent, name, 40)
-                except Exception:
-                    continue
-                low = (recent or "").lower()
-                # Is a Codex /login flow currently on screen? (auth-method menu,
-                # OAuth URL, paste-code prompt, or the "invalid code — retry" error).
-                login_flow_open = bool(recent) and (
-                    ("paste" in low and "code" in low)
-                    or ("https://" in recent and "oauth" in low)
-                    or ("oauth error" in low)
-                    or ("select login method" in low)
-                    or ("press enter to retry" in low and "esc to cancel" in low)
-                )
-
-                needs_login = bool(recent) and bool(_LOGIN_NEEDED_RE.search(recent))
-                # A stored OpenAI key is the non-interactive recovery path. If the
-                # active ChatGPT refresh token was revoked, _auto_fix_login asks
-                # Codex to validate it, writes API-key auth on failure, and relaunches.
-                if _active_openai_key():
-                    if not needs_login and not login_flow_open:
-                        state.pop("flow_since", None)
-                        continue
-                    state["last_action"] = now
-                    state.pop("flow_since", None)
-                    res = await _auto_fix_login(name)
-                    if res.get("ok"):
-                        llog.warning(
-                            "Session '%s' recovered automatically (via %s)",
-                            name,
-                            res.get("via"),
-                        )
-                    else:
-                        llog.warning("API fallback recovery for '%s' failed: %s", name, res.get("error"))
-                    continue
-
-                if not needs_login and not login_flow_open:
-                    state.pop("flow_since", None)
-                    continue
-
-                # A login prompt on screen might be a HUMAN typing /login right
-                # now — never yank that out from under them. Only once the same
-                # prompt has sat unchanged for a while is it stale and ours.
-                if login_flow_open:
-                    since = state.get("flow_since")
-                    if not since:
-                        state["flow_since"] = now
-                        continue
-                    if now - since < _LOGIN_FLOW_STALE_AFTER:
-                        continue
-                else:
-                    state.pop("flow_since", None)
-
-                # Primary recovery: restore the machine's valid credential and
-                # relaunch. No OAuth, no browser, no clicks — a stranded /login
-                # clears itself within ~15s.
-                state["last_action"] = now
-                state.pop("flow_since", None)
-                llog.warning("Auto-fixing login for '%s' (%s)", name,
-                             "stale login prompt" if login_flow_open else "login required")
-                res = await _auto_fix_login(name)
-                if res.get("ok"):
-                    llog.warning("Session '%s' logged back in automatically (via %s)",
-                                 name, res.get("via"))
-                    continue
-                llog.warning("Auto-fix for '%s' failed: %s", name, res.get("error"))
-
-                # Optional fallback: drive the OAuth consent in the signed-in
-                # browser. Off by default — claude.ai blocks it.
-                if AUTO_AUTH_ENABLED and _pick_login_browser():
-                    res = await _auto_auth_session(name, reason="watchdog")
-                    llog.warning("Auto-auth for '%s': %s", name,
-                                 "ok" if res.get("ok") else res.get("error"))
-                continue
-                try:
-                    await asyncio.to_thread(
-                        subprocess.run,
-                        ["tmux", "send-keys", "-t", name, "/login", "Enter"],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    state["last_action"] = now
-                    llog.warning("Auto-ran /login in '%s' (login-required detected)", name)
-                except Exception as e:
-                    llog.debug("login watchdog send failed for '%s': %s", name, e)
-        except asyncio.CancelledError:
-            llog.info("Login watchdog cancelled")
-            raise
-        except Exception:
-            logger.debug("Login watchdog iteration failed", exc_info=True)
 
 
 # --- Crash-recovery watchdog: relaunch Codex when a session OOM/crashes to a shell ---
@@ -14655,8 +12331,6 @@ _CRASH_RECOVERY_INTERVAL = 20          # poll every 20s
 _CRASH_RECOVERY_COOLDOWN = 120         # min seconds between restart attempts per session
 _CRASH_RECOVERY_MAX_ATTEMPTS = 3       # give up after this many consecutive failed restarts
 _CRASH_RECOVERY_MAX_TRANSCRIPT = 60_000_000   # don't scan transcripts larger than this (bytes)
-_crash_recovery_state: dict[str, dict] = {}
-_seen_claude_running: set = set()       # sessions observed running Codex this process
 
 
 
@@ -14671,47 +12345,10 @@ _seen_claude_running: set = set()       # sessions observed running Codex this p
 
 
 
-# --- Codex health alerts -----------------------------------------------------
-# The watchdog below repairs sessions on its own, but a repair that keeps
-# happening is a fault someone has to see.
-#
-# The file on disk is the single source of truth, not a module global: the
-# watchdog runs in the controller process while the API is served by separate
-# uvicorn workers (see PROCESS_ROLE), so an in-memory list would leave the
-# endpoint reporting zero alerts while the controller was raising them. Alerts
-# are rare enough that read-modify-write per alert costs nothing.
-CODEX_ALERTS_FILE = MESSAGES_DIR / "codex-alerts.json"
-_CODEX_ALERT_MAX = 200
-_CODEX_ALERT_REPEAT_WINDOW = 900   # fold repeats of the same fault into one row
-_codex_alerts_lock = threading.Lock()
 
 
-def _read_codex_alerts_locked() -> tuple[list[dict], dict]:
-    """Return (alerts, auth-state) from disk. Tolerates the legacy bare list."""
-    try:
-        data = json.loads(CODEX_ALERTS_FILE.read_text())
-    except Exception:
-        return [], {}
-    if isinstance(data, list):
-        return [row for row in data if isinstance(row, dict)], {}
-    if isinstance(data, dict):
-        rows = data.get("alerts")
-        auth = data.get("auth")
-        return (
-            [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
-            auth if isinstance(auth, dict) else {},
-        )
-    return [], {}
 
 
-def _write_codex_alerts_locked(rows: list[dict], auth: dict | None = None):
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {"alerts": rows[-_CODEX_ALERT_MAX:]}
-        payload["auth"] = auth if auth is not None else _read_codex_alerts_locked()[1]
-        _atomic_write_json(CODEX_ALERTS_FILE, payload)
-    except Exception:
-        logger.debug("Failed to persist Codex alerts", exc_info=True)
 
 
 def _record_codex_alert(
@@ -14761,36 +12398,10 @@ def _record_codex_alert(
     return dict(entry)
 
 
-def _resolve_codex_alerts(session_name: str, note: str = ""):
-    """Mark a session's open alerts resolved once Codex is healthy again."""
-    with _codex_alerts_lock:
-        rows, auth = _read_codex_alerts_locked()
-        changed = False
-        for row in rows:
-            if row.get("session_name") == session_name and not row.get("resolved"):
-                row["resolved"] = True
-                row["resolved_ts"] = time.time()
-                if note:
-                    row["resolution"] = note[:200]
-                changed = True
-        if changed:
-            _write_codex_alerts_locked(rows, auth)
 
 
-def _publish_codex_auth_state(auth: dict):
-    """Share the watchdog's credential verdict with the API workers."""
-    with _codex_alerts_lock:
-        rows, _ = _read_codex_alerts_locked()
-        _write_codex_alerts_locked(rows, dict(auth))
 
 
-def _codex_alerts_snapshot(include_resolved: bool = True) -> tuple[list[dict], dict]:
-    with _codex_alerts_lock:
-        rows, auth = _read_codex_alerts_locked()
-    if not include_resolved:
-        rows = [row for row in rows if not row.get("resolved")]
-    rows.sort(key=lambda row: float(row.get("last_ts") or 0), reverse=True)
-    return rows, auth
 
 
 def _username_for_session(session_name: str) -> str:
@@ -14829,31 +12440,6 @@ def _codex_failure_excerpt(text: str, max_chars: int = 300) -> str:
     return " / ".join(picked)[:max_chars]
 
 
-def _repair_member_codex_auth() -> int:
-    """Re-point every member CODEX_HOME at the shared, working credential.
-
-    Member ``auth.json`` files are symlinks into the admin home. An accidental
-    ``/login`` (or an atomic rewrite) replaces the symlink with a stale copy,
-    and that account alone starts failing. Re-applying the link is cheap and
-    idempotent, so this runs whenever the credential looks unhealthy.
-    """
-    repaired = 0
-    try:
-        if not _multi_tenant_enabled():
-            return 0
-        for user in _load_users():
-            if not user or _is_admin(user):
-                continue
-            try:
-                _apply_member_auth(_user_codex_config_dir(user))
-                repaired += 1
-            except Exception:
-                logger.debug(
-                    "Could not repair Codex auth for %s", user.get("id"), exc_info=True
-                )
-    except Exception:
-        logger.debug("Member Codex auth repair failed", exc_info=True)
-    return repaired
 
 
 
@@ -14867,22 +12453,6 @@ def _repair_member_codex_auth() -> int:
 
 
 
-def _project_dir_for_cwd(cwd: str) -> Path | None:
-    """Map a working directory to its ~/.claude/projects/<encoded> transcript dir.
-    Claude encodes the path by replacing '/', '_' and '.' with '-'."""
-    base = Path.home() / ".claude" / "projects"
-    enc = re.sub(r"[/_.]", "-", cwd.rstrip("/"))
-    cand = base / enc
-    if cand.is_dir():
-        return cand
-    try:
-        leaf = re.sub(r"[/_.]", "-", cwd.rstrip("/").split("/")[-1])
-        for d in sorted(base.glob("*" + leaf)):
-            if d.is_dir():
-                return d
-    except Exception:
-        pass
-    return None
 
 
 def _find_session_transcript_uuid(session_name: str) -> str | None:
@@ -14981,142 +12551,10 @@ async def _crash_recovery_loop():
 # credential when that is the fault, and types the correct relaunch command
 # into every session still sitting at a shell.
 
-_CODEX_HEALTH_INTERVAL = 60        # seconds between fleet sweeps
-_CODEX_HEALTH_COOLDOWN = 120       # min seconds between relaunches per session
-_CODEX_AUTH_PROBE_MAX_AGE = 300    # reuse a credential verdict for this long
-_CODEX_AUTH_PROBE_FLOOR = 120      # ...and never re-probe faster than this
-_codex_health_state: dict[str, dict] = {}
-_codex_health_auth: dict = {"ts": 0.0, "loggedIn": True, "reason": ""}
 
 
-async def _codex_auth_health(force: bool = False) -> dict:
-    """Validate the shared Codex credential, at most once every few minutes.
-
-    Validation starts a Codex app-server, so it is far too expensive to run on
-    every sweep; the cached verdict is plenty for deciding whether a fleet-wide
-    outage is a login problem. Even ``force`` keeps a floor, so a persistent
-    outage cannot spawn an app-server every single sweep.
-    """
-    now = time.time()
-    age = now - float(_codex_health_auth.get("ts") or 0)
-    if age < (_CODEX_AUTH_PROBE_FLOOR if force else _CODEX_AUTH_PROBE_MAX_AGE):
-        return dict(_codex_health_auth)
-    try:
-        state = await asyncio.to_thread(
-            _ensure_codex_auth_with_fallback, CODEX_HOME, True
-        )
-    except Exception:
-        logger.debug("Codex auth health probe failed", exc_info=True)
-        return dict(_codex_health_auth)
-    _codex_health_auth.update({
-        "ts": now,
-        "loggedIn": bool(state.get("loggedIn")),
-        "activeMode": str(state.get("activeMode") or "unknown"),
-        "reason": str(state.get("fallbackReason") or ""),
-        "fallbackActive": bool(state.get("fallbackActive")),
-    })
-    # The API workers cannot see this process's memory — publish it.
-    await asyncio.to_thread(_publish_codex_auth_state, _codex_health_auth)
-    return dict(_codex_health_auth)
 
 
-async def _codex_health_watchdog_loop():
-    """Alert on, and recover from, sessions that dropped out of Codex."""
-    hlog = logging.getLogger("codex-health")
-    await asyncio.sleep(25)  # let startup and crash recovery settle
-    while True:
-        try:
-            await asyncio.sleep(_CODEX_HEALTH_INTERVAL)
-            sessions_list = await asyncio.to_thread(get_tmux_sessions)
-            owners = _load_session_owners()
-            now = time.time()
-
-            down: list[tuple[str, str]] = []
-            for sess in sessions_list:
-                name = sess["name"]
-                if _session_lifecycle.get(name).get("parked"):
-                    continue
-                # Only sessions this dashboard owns or has seen running Codex.
-                if name not in owners and name not in _seen_claude_running:
-                    continue
-                if await _async_is_codex_running(name):
-                    _seen_claude_running.add(name)
-                    if _codex_health_state.pop(name, None):
-                        _resolve_codex_alerts(name, "Codex is running again")
-                    continue
-                try:
-                    recent = await asyncio.to_thread(capture_pane_recent, name, 80)
-                except Exception:
-                    continue
-                if not _pane_is_recoverable_shell(recent):
-                    continue
-                down.append((name, recent))
-
-            if not down:
-                continue
-
-            # More than one account down at once points at the shared
-            # credential rather than one bad session. Check the login before
-            # relaunching anything, and repair it when it is the fault.
-            auth = await _codex_auth_health(force=len(down) > 1)
-            if not auth.get("loggedIn"):
-                _record_codex_alert(
-                    "*",
-                    "codex-logged-out",
-                    auth.get("reason") or "Codex has no usable credential",
-                )
-                repaired = await asyncio.to_thread(_repair_member_codex_auth)
-                hlog.warning("Repaired Codex auth for %d member home(s)", repaired)
-                auth = await _codex_auth_health(force=True)
-                if auth.get("loggedIn"):
-                    _resolve_codex_alerts("*", "credential repaired")
-
-            for name, recent in down:
-                state = _codex_health_state.setdefault(
-                    name, {"attempts": 0, "last_action": 0}
-                )
-                # Recheck the clock: validating the credential above can take
-                # seconds, and a stale `now` would shorten every cooldown.
-                now = time.time()
-                if now - float(state.get("last_action") or 0) < _CODEX_HEALTH_COOLDOWN:
-                    continue
-                # Crash recovery polls three times as often and may already be
-                # relaunching this pane. Two loops typing into the same terminal
-                # is worse than waiting one sweep.
-                peer = _crash_recovery_state.get(name) or {}
-                if now - float(peer.get("last_action") or 0) < _CODEX_HEALTH_COOLDOWN:
-                    continue
-                state["last_action"] = now
-                state["attempts"] = int(state.get("attempts") or 0) + 1
-                username = _username_for_session(name)
-                _record_codex_alert(
-                    name,
-                    "codex-not-running",
-                    _codex_failure_excerpt(recent) or "Codex exited to a shell",
-                    username=username,
-                )
-                hlog.warning(
-                    "Relaunching Codex in '%s'%s (attempt %d)",
-                    name, f" for {username}" if username else "", state["attempts"],
-                )
-                if await _ensure_codex_running(name):
-                    _seen_claude_running.add(name)
-                    _codex_health_state.pop(name, None)
-                    _resolve_codex_alerts(name, "relaunched by the health watchdog")
-                    hlog.warning("Session '%s' is back on Codex", name)
-                else:
-                    _record_codex_alert(
-                        name,
-                        "relaunch-failed",
-                        "Relaunch did not bring Codex up. Pane: "
-                        + _codex_failure_excerpt(recent),
-                        username=username,
-                    )
-        except asyncio.CancelledError:
-            hlog.info("Codex health watchdog cancelled")
-            raise
-        except Exception:
-            logger.debug("Codex health watchdog iteration failed", exc_info=True)
 
 
 def _has_pending_user_input(visible: str) -> bool:
@@ -15210,21 +12648,9 @@ async def api_simple_watchdog_toggle(session_name: str, body: SimpleWatchdogBody
 # Monitors all active away-mode and go-nuts-mode sessions.
 # Detects stalls (no terminal change for too long) and unsticks them.
 
-_watchdog_snapshots: dict[str, dict] = {}
 # Per-session: {"content_hash": str, "first_seen": float, "nudge_count": int, "last_nudge": float}
 
-_WATCHDOG_INTERVAL = 30         # Check every 30 seconds
-_STALL_THRESHOLD = 600          # 10 minutes of identical terminal = stalled
-_NUDGE_COOLDOWN = 180           # Wait 3 minutes between nudge attempts
-_MAX_NUDGES_BEFORE_RESTART = 3  # After 3 failed nudges, hard-restart the mode
 
-_NUDGE_PROMPT = """You appear to be idle or stuck. The user is not present — you are in autonomous mode.
-
-If you just finished a task: pick the next one and start working. Check your skill files and backlog.
-If you're waiting for something: cancel the wait (Ctrl+C if needed) and move to a different task.
-If you encountered an error: log it, revert if needed, and continue with the next item.
-
-Do NOT say "standing by" or ask for instructions. Take action NOW."""
 
 
 
@@ -15296,355 +12722,20 @@ async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
         state["task"] = None
 
 
-_TMP_WATCHDOG_INTERVAL = 120            # poll /tmp every 2 minutes
-_TMP_WATCHDOG_WARN_PCT = 75             # start cleaning at 75% full
-_TMP_WATCHDOG_CRITICAL_PCT = 90         # aggressive clean at 90% full
-_TMP_WATCHDOG_SAFE_AGE_NORMAL = 3600    # delete files older than 1h at warn level
-_TMP_WATCHDOG_SAFE_AGE_CRITICAL = 600   # delete files older than 10m at critical
-_TMP_WATCHDOG_PROTECTED_PREFIXES = (
-    ".",                # .X11-unix, .ICE-unix, dotfiles
-    "codex-",          # active Codex CLI cache
-    "tsx-",             # active tsx cache
-    "tmux-",            # tmux server sockets
-    "systemd-",         # systemd runtime
-    "snap-",            # snap runtime
-    "node-compile-cache",
-    "data-gym-cache",   # tiktoken cache (recreated on demand but expensive)
-    "vscode-",
-)
 
 
-async def _tmp_watchdog_loop():
-    """Background watchdog: prevents /tmp from filling up.
-
-    When /tmp is a tmpfs (RAM-backed), filling it breaks bash commands and
-    any tool that writes temp files. This loop monitors usage and prunes
-    stale files before that happens.
-    """
-    tlog = logging.getLogger("tmp_watchdog")
-    tlog.info("Tmp watchdog started — interval=%ds warn=%d%% critical=%d%%",
-              _TMP_WATCHDOG_INTERVAL, _TMP_WATCHDOG_WARN_PCT, _TMP_WATCHDOG_CRITICAL_PCT)
-    while True:
-        try:
-            await asyncio.sleep(_TMP_WATCHDOG_INTERVAL)
-            await asyncio.to_thread(_tmp_watchdog_check, tlog)
-        except asyncio.CancelledError:
-            tlog.info("Tmp watchdog cancelled")
-            raise
-        except Exception as e:
-            tlog.error(f"Tmp watchdog loop error: {e}")
-            await asyncio.sleep(60)
 
 
-def _tmp_watchdog_check(tlog: logging.Logger) -> None:
-    """One iteration: check /tmp usage and clean if needed. Runs in a thread."""
-    try:
-        usage = shutil.disk_usage("/tmp")
-    except OSError as e:
-        tlog.error(f"shutil.disk_usage('/tmp') failed: {e}")
-        return
-    pct = (usage.used / usage.total) * 100 if usage.total else 0
-    if pct < _TMP_WATCHDOG_WARN_PCT:
-        return  # plenty of room
-
-    if pct >= _TMP_WATCHDOG_CRITICAL_PCT:
-        max_age = _TMP_WATCHDOG_SAFE_AGE_CRITICAL
-        level = "CRITICAL"
-    else:
-        max_age = _TMP_WATCHDOG_SAFE_AGE_NORMAL
-        level = "WARN"
-
-    tlog.warning("/tmp at %.1f%% (%s) — pruning entries older than %ds",
-                 pct, level, max_age)
-    deleted, freed = _tmp_watchdog_prune(max_age, tlog)
-    try:
-        new_usage = shutil.disk_usage("/tmp")
-        new_pct = (new_usage.used / new_usage.total) * 100 if new_usage.total else 0
-    except OSError:
-        new_pct = pct
-    tlog.warning("/tmp cleanup done — removed %d entries (~%d KB freed), now %.1f%% used",
-                 deleted, freed // 1024, new_pct)
 
 
-def _tmp_watchdog_prune(max_age_secs: int, tlog: logging.Logger) -> tuple[int, int]:
-    """Delete files/dirs in /tmp older than max_age_secs. Returns (count, bytes_freed).
-
-    Skips any entry whose name starts with a protected prefix (system sockets,
-    active CLI caches). Also skips entries owned by other users.
-    """
-    deleted = 0
-    freed = 0
-    now = time.time()
-    my_uid = os.getuid()
-    try:
-        entries = list(os.scandir("/tmp"))
-    except OSError as e:
-        tlog.error(f"scandir /tmp failed: {e}")
-        return (0, 0)
-    for entry in entries:
-        name = entry.name
-        if any(name.startswith(p) for p in _TMP_WATCHDOG_PROTECTED_PREFIXES):
-            continue
-        try:
-            st = entry.stat(follow_symlinks=False)
-        except OSError:
-            continue
-        if st.st_uid != my_uid:
-            continue  # don't touch other users' files
-        age = now - st.st_mtime
-        if age < max_age_secs:
-            continue
-        size = _tmp_watchdog_size(entry.path) if entry.is_dir(follow_symlinks=False) else st.st_size
-        try:
-            if entry.is_dir(follow_symlinks=False):
-                shutil.rmtree(entry.path, ignore_errors=True)
-            else:
-                os.unlink(entry.path)
-            deleted += 1
-            freed += size
-        except OSError as e:
-            tlog.warning(f"Failed to delete {entry.path}: {e}")
-    return (deleted, freed)
 
 
-def _tmp_watchdog_size(path: str) -> int:
-    """Recursive size of a directory in bytes. Best-effort, ignores errors."""
-    total = 0
-    for root, _dirs, files in os.walk(path, onerror=lambda _: None):
-        for f in files:
-            try:
-                total += os.lstat(os.path.join(root, f)).st_size
-            except OSError:
-                pass
-    return total
 
 
-async def _watchdog_loop():
-    """Background watchdog: detects stalled autonomous sessions and unsticks them."""
-    wlog = logging.getLogger("watchdog")
-    wlog.info("Autonomous mode watchdog started")
-    while True:
-        try:
-            await asyncio.sleep(_WATCHDOG_INTERVAL)
-            # Collect all active autonomous sessions
-            active_sessions: list[tuple[str, dict, str]] = []  # (name, state, mode)
-            for name, state in _away_mode_state.items():
-                if state.get("enabled") and state.get("task") and not state["task"].done():
-                    active_sessions.append((name, state, "away"))
-            for name, state in _go_nuts_state.items():
-                if state.get("enabled") and state.get("task") and not state["task"].done():
-                    active_sessions.append((name, state, "gonuts"))
-
-            if not active_sessions:
-                if _watchdog_snapshots:
-                    _watchdog_snapshots.clear()
-                continue
-
-            for session_name, state, mode in active_sessions:
-                try:
-                    await _watchdog_check_session(session_name, state, mode, wlog)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    wlog.error(f"Watchdog error checking '{session_name}': {e}")
-
-            # Also check for zombie states: enabled=True but task is dead
-            for name, state in list(_away_mode_state.items()):
-                if state.get("enabled") and (not state.get("task") or state["task"].done()):
-                    wlog.warning(f"Away mode zombie detected for '{name}' — restarting worker")
-                    await _watchdog_restart_mode(name, state, "away", wlog)
-            for name, state in list(_go_nuts_state.items()):
-                if state.get("enabled") and (not state.get("task") or state["task"].done()):
-                    wlog.warning(f"Go Nuts mode zombie detected for '{name}' — restarting worker")
-                    await _watchdog_restart_mode(name, state, "gonuts", wlog)
-
-        except asyncio.CancelledError:
-            wlog.info("Watchdog cancelled")
-            raise
-        except Exception as e:
-            wlog.error(f"Watchdog loop error: {e}")
-            await asyncio.sleep(60)
 
 
-async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlog):
-    """Check a single session for stalls."""
-    import hashlib
-    now = time.time()
-
-    # Capture recent terminal content (non-blocking)
-    recent = await asyncio.to_thread(capture_pane_recent, session_name, 50)
-    if not recent.strip():
-        return  # Empty pane, can't assess
-
-    content_hash = hashlib.md5(recent.encode()).hexdigest()
-    snap = _watchdog_snapshots.get(session_name)
-
-    if snap is None or snap["content_hash"] != content_hash:
-        # Terminal content changed — session is making progress
-        _watchdog_snapshots[session_name] = {
-            "content_hash": content_hash,
-            "first_seen": now,
-            "nudge_count": 0,
-            "last_nudge": 0,
-        }
-        return
-
-    # Terminal content is UNCHANGED since last check
-    stall_duration = now - snap["first_seen"]
-
-    if stall_duration < _STALL_THRESHOLD:
-        return  # Not stalled yet — could be processing
-
-    # Terminal has been identical for >10 minutes. Check if there's a good reason.
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    # Check if Codex has crashed (OOM, etc) — if so, restart immediately
-    if not await _async_is_codex_running(session_name):
-        wlog.warning(f"Codex not running in '{session_name}' — OOM/crash detected, restarting")
-        log_fn(state, "Watchdog: Codex crashed (OOM?) — restarting")
-        _watchdog_snapshots.pop(session_name, None)
-        await _watchdog_restart_mode(session_name, state, mode, wlog)
-        return
-
-    # First stall detection — use LLM to check if it's a legitimate long operation
-    if snap["nudge_count"] == 0 and snap["last_nudge"] == 0:
-        wlog.info(f"Potential stall detected for '{session_name}' ({mode}) — {stall_duration:.0f}s unchanged")
-        try:
-            assessment = await llm_call(
-                system_prompt=(
-                    "You are monitoring an autonomous AI coding session. The terminal output has not changed "
-                    "for over 10 minutes. Assess whether this is:\n"
-                    "1. LEGITIMATE: downloading large files, compiling a big project, running extensive tests, "
-                    "waiting for a deployment, or any operation that genuinely takes >10 minutes\n"
-                    "2. STUCK: the agent said 'standing by', asked a question, hit an error and stopped, "
-                    "is waiting for user input, or simply finished and didn't continue\n\n"
-                    "Reply with ONLY one word: LEGITIMATE or STUCK"
-                ),
-                user_content=f"Terminal output (last 50 lines):\n{recent[-3000:]}",
-                max_tokens=10,
-            )
-            assessment = assessment.strip().upper()
-        except Exception:
-            assessment = "STUCK"  # If we can't assess, assume stuck
-
-        if "LEGITIMATE" in assessment:
-            wlog.info(f"Session '{session_name}' stall assessed as LEGITIMATE — skipping for now")
-            log_fn(state, f"Watchdog: stall detected ({stall_duration:.0f}s) but appears legitimate — waiting")
-            # Push out the first_seen so we re-check in another 10 minutes
-            snap["first_seen"] = now - _STALL_THRESHOLD + 300  # Re-check in 5 min
-            return
-
-        wlog.info(f"Session '{session_name}' assessed as STUCK — will nudge")
-
-    # Session is stuck. Try nudging.
-    if now - snap["last_nudge"] < _NUDGE_COOLDOWN:
-        return  # Wait for cooldown between nudges
-
-    if snap["nudge_count"] < _MAX_NUDGES_BEFORE_RESTART:
-        # Gentle nudge: send continuation prompt
-        snap["nudge_count"] += 1
-        snap["last_nudge"] = now
-        log_fn(state, f"Watchdog: nudge #{snap['nudge_count']} — sending continuation prompt")
-        wlog.info(f"Nudging '{session_name}' (attempt {snap['nudge_count']}/{_MAX_NUDGES_BEFORE_RESTART})")
-
-        # Ensure Codex is running before nudging
-        if not await _async_is_codex_running(session_name):
-            wlog.warning(f"Codex not running in '{session_name}' during nudge — restarting mode")
-            log_fn(state, "Watchdog: Codex not running during nudge — restarting")
-            _watchdog_snapshots.pop(session_name, None)
-            await _watchdog_restart_mode(session_name, state, mode, wlog)
-            return
-
-        # If session appears to be waiting for input or truly idle, just send the nudge
-        try:
-            activity = await async_detect_activity(session_name)
-        except Exception:
-            activity = {"status": "unknown"}
-
-        if activity["status"] == "busy":
-            # Session claims busy but terminal hasn't changed — might be truly stuck
-            # Send Ctrl+C first to break out of whatever it's doing
-            log_fn(state, "Watchdog: session reports busy but no terminal change — sending Ctrl+C")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-            await asyncio.sleep(5)
-
-        await _away_send_prompt(session_name, _build_project_isolation_preamble(session_name) + _NUDGE_PROMPT)
-        return
-
-    # Nudges exhausted — hard restart
-    log_fn(state, f"Watchdog: {_MAX_NUDGES_BEFORE_RESTART} nudges failed — restarting {mode} mode")
-    wlog.warning(f"Restarting {mode} mode for '{session_name}' after {snap['nudge_count']} failed nudges")
-    await _watchdog_restart_mode(session_name, state, mode, wlog)
-    # Reset snapshot
-    _watchdog_snapshots.pop(session_name, None)
 
 
-async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog):
-    """Gracefully restart an autonomous mode session, preserving history."""
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    # 1. Cancel existing task
-    old_task = state.get("task")
-    if old_task and not old_task.done():
-        old_task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(old_task), timeout=5)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-
-    # 2. Send Ctrl+C to break any stuck process in the terminal
-    try:
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(3)
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(2)
-    except Exception:
-        pass
-
-    # 2b. Ensure Codex is actually running (handles OOM/crash recovery)
-    codex_ok = await _ensure_codex_running(session_name, log_fn, state)
-    if not codex_ok:
-        log_fn(state, "Watchdog: could not restart Codex — aborting restart")
-        state["enabled"] = False
-        _save_autonomous_state()
-        return
-
-    # 3. Preserve the log history, reset state for fresh loop
-    old_log = state.get("log", [])
-    old_started = state.get("started_at", time.time())
-    old_step = state.get("step", 0)
-
-    log_fn(state, "Watchdog: restarting mode — skipping initial phases, jumping to continuous loop")
-
-    # 4. Re-initialize state
-    state.update({
-        "enabled": True,
-        "phase": 4,
-        "phase_name": "Continuous (restarted)" if mode == "away" else "Continuous Build (restarted)",
-        "step": old_step,
-        "step_name": "Watchdog restart",
-        "started_at": old_started,  # Keep original start time
-        "log": old_log,  # Keep full log history
-        "task": None,
-    })
-    _save_autonomous_state()
-
-    # 5. Send an unstick prompt directly instead of re-running initial phases (with project isolation)
-    skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-    unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
-
-    await _away_send_prompt(session_name, unstick_prompt)
-    await asyncio.sleep(2)
-
-    # 6. Launch fresh worker that skips to continuous loop
-    if mode == "away":
-        task = asyncio.create_task(_away_mode_continuous_loop(session_name))
-        state["task"] = task
-    else:
-        task = asyncio.create_task(_go_nuts_continuous_loop(session_name))
-        state["task"] = task
-
-    wlog.info(f"Restarted {mode} mode for '{session_name}' — continuous loop relaunched")
 
 
 
@@ -15663,24 +12754,37 @@ async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog
 
 
 
-def _build_project_isolation_preamble(session_name: str) -> str:
-    """Build a preamble that anchors the autonomous mode to the correct project."""
-    cwd = get_session_cwd(session_name)
-    return f"""PROJECT ISOLATION — READ THIS FIRST:
-You are working in tmux session "{session_name}".
-Your project directory is: {cwd or '(unknown — run pwd to confirm)'}
 
-STRICT RULES:
-- ONLY modify files inside your project directory ({cwd or 'current working directory'}).
-- NEVER cd into, read from, or write to other project directories on this server.
-- NEVER modify files under /var/www/, /opt/, or ~/  that belong to other projects.
-- Write all reports and temp files to /tmp/ using your session name as prefix: /tmp/{session_name}-*.md
-- Do NOT write to generic paths like /tmp/away-mode-*.md or /tmp/go-nuts-*.md — always include the session name.
-- If you need to check infrastructure context, read ~/.codex/vm_projects_dir.md (read-only, never modify during autonomous mode).
-- If a skill or task does not apply to THIS project, skip it entirely.
-- Do NOT restart, modify configs for, or interact with services belonging to other projects.
 
-"""
+# Wire services/watchdog.py once every helper its loops drive exists.
+watchdog_service.configure(
+    _active_openai_key=_active_openai_key,
+    _asserts_completion=_asserts_completion,
+    _async_is_claude_running=_async_is_claude_running,
+    _async_is_codex_running=_async_is_codex_running,
+    _auto_auth_session=_auto_auth_session,
+    _auto_fix_login=_auto_fix_login,
+    _build_project_isolation_preamble=_build_project_isolation_preamble,
+    _codex_auth_health=_codex_auth_health,
+    _codex_failure_excerpt=_codex_failure_excerpt,
+    _detect_interactive_prompt=_detect_interactive_prompt,
+    _ensure_codex_running=_ensure_codex_running,
+    _get_autopush_mode=_get_autopush_mode,
+    _has_pending_user_input=_has_pending_user_input,
+    _load_session_owners=_load_session_owners,
+    _looks_destructive=_looks_destructive,
+    _looks_like_fresh_claude_session=_looks_like_fresh_claude_session,
+    _pane_is_recoverable_shell=_pane_is_recoverable_shell,
+    _parse_autopilot_decision=_parse_autopilot_decision,
+    _pick_login_browser=_pick_login_browser,
+    _record_codex_alert=_record_codex_alert,
+    _repair_member_codex_auth=_repair_member_codex_auth,
+    _resolve_codex_alerts=_resolve_codex_alerts,
+    _save_autonomous_state=_save_autonomous_state,
+    _session_lifecycle=_session_lifecycle,
+    _username_for_session=_username_for_session,
+    llm_call=llm_call,
+)
 
 
 # Wire services/autonomous.py once every helper it drives exists. These are the
@@ -15793,43 +12897,10 @@ HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
 LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
-_GOOGLE_BTN_HTML = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", ROOT_PATH)
 
 
-# ===========================================================================
-# Catch-all routes for authenticated projects + per-user project lists. Registered
-# LAST so every literal/api route takes precedence over these path params.
-# ===========================================================================
-_PROJECTS_PAGE_CSS = (
-    "body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0d1117;color:#e6edf3;"
-    "max-width:820px;margin:40px auto;padding:0 20px}a{color:#58a6ff;text-decoration:none}"
-    "a:hover{text-decoration:underline}h1{font-size:1.3rem}.muted{color:#8b949e;font-size:.85rem}"
-    "li{margin:7px 0;list-style:none}ul{padding:0}.grp{margin-top:18px;color:#79c0ff;font-weight:600}"
-    ".card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 22px;margin-top:16px}"
-    ".open{font-size:.72rem;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:1px 6px;margin-left:8px}"
-)
 
 
-def _projects_page_html(title: str, rows):
-    base = PUB_URL.rstrip("/")
-    items = "".join(
-        (
-            '<li><a href="{href}">{label}</a> <span class="open">open ↗</span></li>'
-            .format(
-                href=_html_escape(
-                    base + "/" + urllib.parse.quote(str(u), safe="@._-")
-                    + "/" + urllib.parse.quote(str(p), safe="@._-")
-                ),
-                label=_html_escape(f"{base}/{u}/{p}"),
-            )
-        )
-        for (u, p) in rows) or '<li class="muted">No projects yet. Ask Codex in a session to build something — it gets published here.</li>'
-    return (f"<!doctype html><html><head><meta charset=utf-8><title>{_html_escape(title)} · {BRAND_NAME}</title>"
-            "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"<style>{_PROJECTS_PAGE_CSS}</style></head><body><h1>{_html_escape(title)}</h1>"
-            f"<div class=card><ul>{items}</ul></div>"
-            f"<p class=muted>{BRAND_NAME} — projects are private and require dashboard sign-in.</p>"
-            "</body></html>")
 
 
 @app.get("/{username}", response_class=HTMLResponse)
@@ -15920,25 +12991,6 @@ async def _controller_forever() -> None:
         await stop.wait()
 
 
-def _run_api_server(workers: int) -> None:
-    # WebSocket keepalive — this is what stopped the noVNC viewers dropping every
-    # ~minute. A viewer watching a STATIC desktop sends/receives nothing, and
-    # uvicorn's default ws implementation on websockets>=14 ("websockets_sansio")
-    # implements no ping at all, so ws_ping_interval was silently ignored and the
-    # connection carried zero traffic — leaving it to be reaped by the first
-    # intermediary's idle timeout (nginx proxy_send_timeout, NAT, etc.). Pinning
-    # ws="websockets" selects the implementation that DOES honour ping_interval,
-    # so a Ping/Pong flows every 25s and every hop keeps the tunnel open. The
-    # generous ping_timeout avoids killing a healthy viewer over one late pong.
-    try:
-        uvicorn.run("app:app", host="0.0.0.0", port=PORT, workers=workers,
-                    ws="websockets", ws_ping_interval=25, ws_ping_timeout=120)
-    except (ValueError, ImportError, KeyError):
-        # The legacy implementation is deprecated upstream; if a future uvicorn
-        # drops it, fall back to the default rather than failing to boot.
-        logger.warning("uvicorn ws='websockets' unavailable — falling back to the default "
-                       "implementation (WebSocket keepalive pings will be disabled)")
-        uvicorn.run("app:app", host="0.0.0.0", port=PORT, workers=workers)
 
 
 if __name__ == "__main__":

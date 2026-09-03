@@ -1126,6 +1126,86 @@ class TestSshIdeSafety:
         assert _valid_git_branch("feature/remote-ide")
         assert not _valid_git_branch("feature/../secret")
 
+    def test_every_service_declaring_injected_names_has_configure(self):
+        """A module that declares injected globals must expose configure().
+
+        Splicing a new header onto a service module twice dropped its
+        configure() function. The module still imported cleanly and failed only
+        at the wiring call, so import success is not evidence the module is
+        whole.
+        """
+        import importlib
+        import re
+        from pathlib import Path
+
+        for path in sorted(Path("services").glob("*.py")):
+            if path.name == "__init__.py":
+                continue
+            source = path.read_text()
+            if "# Injected by app.py" not in source:
+                continue
+            module = importlib.import_module(f"services.{path.stem}")
+            assert callable(getattr(module, "configure", None)), (
+                f"{path} declares injected names but has no configure()"
+            )
+            # And it must reject an unknown name rather than silently binding it.
+            try:
+                module.configure(__definitely_not_a_dependency__=1)
+            except TypeError:
+                pass
+            else:
+                raise AssertionError(f"{path}: configure() accepted an unknown name")
+
+    def test_shared_message_cache_is_one_object_not_a_copy(self):
+        """services/stores.py must mutate the SAME dict app.py does.
+
+        The session message cache is mutated in place on both sides. If the
+        extraction had copied it, writes on one side would be invisible to the
+        other and transcripts would silently diverge.
+        """
+        import app
+        from services import stores as stores_service
+
+        assert stores_service.cache is app.cache
+        probe = "__cache_identity_probe__"
+        try:
+            app.cache[probe] = {"messages": []}
+            assert probe in stores_service.cache
+        finally:
+            app.cache.pop(probe, None)
+
+    def test_every_service_module_is_wired(self):
+        """A configure() call that never runs leaves silent None dependencies.
+
+        Each service declares its injected names as module globals defaulting to
+        None; after import they must all be bound, or the first call into that
+        path fails with a TypeError at runtime rather than at startup.
+        """
+        import app
+
+        # Only names the module declares as INJECTED may not stay None. A
+        # lazily-populated cache is legitimately None until first use, so read
+        # each module's configure() to learn which names it expects wired.
+        import inspect
+        import re
+
+        for module in (
+            app.ssh_service, app.browser_service, app.autonomous_service,
+            app.tmux_service, app.usage_service, app.watchdog_service,
+            app.google_auth_service, app.stores_service,
+        ):
+            source = inspect.getsource(module)
+            # Injected names are declared between the "Injected by app.py"
+            # marker and the configure() definition.
+            block = source.split("# Injected by app.py")
+            if len(block) < 2:
+                continue
+            declared = re.findall(
+                r"^(\w+) = (?:None|\"\")$", block[1].split("def configure")[0], re.M
+            )
+            unbound = [n for n in declared if getattr(module, n, "") is None]
+            assert not unbound, f"{module.__name__} has unwired deps: {unbound}"
+
     def test_patching_a_service_sibling_on_app_reaches_the_service(self):
         """Intra-service calls must honour a patch applied on app.
 
