@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte'
   import { ide } from './store.svelte.js'
   import { api } from './api.js'
-  import { ArrowUp, Loader, Sparkles, Check, ChevronDown, Square } from 'lucide-svelte'
+  import { ArrowUp, Loader, Sparkles, Check, ChevronDown, Square, Minimize2 } from 'lucide-svelte'
 
   // Codex and Claude are both agents running inside a tmux session, so the
   // "provider" is really which session the prompt is delivered to.
@@ -11,6 +11,10 @@
   let question = $state('')
   let target = $state(session || sessions[0] || '')
   let sending = $state(false)
+  let agentBusy = $state(false)
+  let busyDetail = $state('')
+  // "Working" covers both: our request in flight, and the agent still writing.
+  const working = $derived(sending || agentBusy)
   let messages = $state([])
   let error = $state('')
   let listEl = $state(null)
@@ -69,12 +73,29 @@
       const next = data.messages || []
       const grew = next.length !== messages.length
       messages = next
+      // The server knows whether the agent is mid-turn; `sending` only covers
+      // our own POST, which returns long before the agent has finished.
+      agentBusy = !!data.busy
+      busyDetail = data.detail || ''
       error = ''
       if (grew) queueMicrotask(scrollToEnd)
     } catch (exc) {
       error = exc.message || 'Could not load chat'
     }
   }
+
+  // Poll faster while a turn is in flight so the reply lands promptly, and back
+  // off when idle so an open panel is not hammering the server.
+  const POLL_IDLE = 3000
+  const POLL_BUSY = 1000
+  let pollRate = 0
+  $effect(() => {
+    const wanted = working ? POLL_BUSY : POLL_IDLE
+    if (!target || pollRate === wanted) return
+    pollRate = wanted
+    clearInterval(timer)
+    timer = setInterval(loadMessages, wanted)
+  })
 
   function scrollToEnd() {
     if (listEl) listEl.scrollTop = listEl.scrollHeight
@@ -239,6 +260,71 @@
     }
     return text
   }
+  // --- Token usage + /compact, mirroring Claude Code's status bar ---------
+  //
+  // The numbers come from the agent's own JSONL transcript via
+  // /api/sessions/{name}/stats, so they are what the CLI itself reports rather
+  // than an estimate made here.
+  let usage = $state(null)
+  let compacting = $state(false)
+  let usageTimer = null
+
+  async function loadUsage() {
+    if (!target) return
+    try {
+      const response = await fetch(
+        `${rootPath}/api/sessions/${encodeURIComponent(target)}/stats`,
+      )
+      const data = await response.json().catch(() => ({}))
+      usage = data && data.available ? data : null
+    } catch {
+      usage = null
+    }
+  }
+
+  $effect(() => {
+    target
+    loadUsage()
+    clearInterval(usageTimer)
+    // Cheap (a cached file parse) but not free, so poll slowly; a turn also
+    // refreshes it on completion below.
+    usageTimer = setInterval(loadUsage, 20000)
+    return () => clearInterval(usageTimer)
+  })
+
+  /** Ask the agent to compact its own context, the way /compact does in the CLI. */
+  async function compact() {
+    if (!target || compacting) return
+    compacting = true
+    try {
+      const response = await fetch(
+        `${rootPath}/api/sessions/${encodeURIComponent(target)}/send`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: '/compact' }),
+        },
+      )
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.error || 'Could not compact')
+      setTimeout(loadUsage, 4000)
+    } catch (error) {
+      ide.setStatus(error.message || 'Could not compact context')
+    } finally {
+      compacting = false
+    }
+  }
+
+  const compactNumber = (value) => {
+    const n = Number(value) || 0
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+    return String(n)
+  }
+
+  // VS Code's thresholds: quiet until it matters, then amber, then red.
+  const usageTone = (pct) =>
+    pct >= 90 ? 'text-vs-red' : pct >= 70 ? 'text-vs-yellow' : 'text-vs-muted'
 </script>
 
 <svelte:window onclick={(e) => { if (!e.target.closest?.('[data-menu]')) menu = '' }} />
@@ -247,7 +333,7 @@
   <!-- Header: which session answers -->
   <div class="flex items-center gap-2 border-b border-mk-line px-3 py-1.5">
     <Sparkles size={13} class="shrink-0 text-mk-green" />
-    <span class="text-[11px] font-semibold tracking-wide text-mk-muted uppercase">Chat</span>
+    <span class="text-[11px] font-semibold tracking-wide text-mk-muted uppercase">AI Agent</span>
     <select
       class="ml-auto min-w-0 max-w-[55%] truncate rounded-sm border border-mk-line bg-mk-input px-1.5 py-0.5 text-[11px] text-mk-fg outline-none focus:border-mk-green"
       bind:value={target}
@@ -299,12 +385,48 @@
         </div>
       {/if}
     {/each}
-    {#if sending}
+    {#if working}
       <div class="flex items-center gap-2 text-[11px] text-mk-comment">
-        <Loader size={11} class="animate-spin" /> Working…
+        <Loader size={11} class="animate-spin" />
+        {busyDetail || 'Working…'}
       </div>
     {/if}
   </div>
+
+  <!-- Context/token status, as Claude Code shows above its prompt. Hidden until
+       the agent has actually reported usage, so it never shows empty zeros. -->
+  {#if usage}
+    <div class="flex shrink-0 items-center gap-2 border-t border-mk-line px-3 py-1 text-[10px] text-mk-comment">
+      {#if usage.ctxWindowSize}
+        <span class={usageTone(usage.contextPct || 0)} title="Context used of the model's window">
+          {usage.contextPct ?? 0}% context
+        </span>
+        <span class="h-2 w-16 overflow-hidden rounded-full bg-mk-line" aria-hidden="true">
+          <span
+            class="block h-full rounded-full {(usage.contextPct || 0) >= 90
+              ? 'bg-vs-red'
+              : (usage.contextPct || 0) >= 70
+                ? 'bg-vs-yellow'
+                : 'bg-mk-green'}"
+            style="width: {Math.min(100, Math.max(0, usage.contextPct || 0))}%"
+          ></span>
+        </span>
+      {/if}
+      <span title="Total tokens this session">{compactNumber(usage.totalTokens)} tokens</span>
+      {#if usage.estimatedCost}
+        <span title="Estimated cost">${Number(usage.estimatedCost).toFixed(2)}</span>
+      {/if}
+      <button
+        class="ml-auto flex items-center gap-1 rounded-sm px-1.5 py-0.5 hover:bg-mk-line hover:text-mk-fg disabled:opacity-40"
+        title="Compact the conversation to free up context (/compact)"
+        disabled={compacting}
+        onclick={compact}
+      >
+        {#if compacting}<Loader size={10} class="animate-spin" />{:else}<Minimize2 size={10} />{/if}
+        Compact
+      </button>
+    </div>
+  {/if}
 
   <!-- Composer: input first, controls beneath — the Claude Code arrangement -->
   <div class="border-t border-mk-line p-2">
@@ -408,11 +530,11 @@
           <button
             class="flex h-6 w-6 items-center justify-center rounded-md bg-mk-green text-mk-bg disabled:opacity-40"
             onclick={send}
-            disabled={sending || !question.trim()}
+            disabled={working || !question.trim()}
             title="Send (Enter)"
             aria-label="Send"
           >
-            {#if sending}<Square size={11} />{:else}<ArrowUp size={13} />{/if}
+            {#if working}<Square size={11} />{:else}<ArrowUp size={13} />{/if}
           </button>
         </span>
       </div>

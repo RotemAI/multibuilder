@@ -377,10 +377,26 @@ _RE_COMPLETION = re.compile(
 _RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
 
 
-_RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
+# `\S.*?` rather than `\w+`: the agents' status lines are multi-word phrases
+# ("Finding the GRABO index.html…", "Compacting conversation…"), and requiring
+# the ellipsis to follow a single word meant none of them matched. The session
+# then read as idle while the agent was working, and the chat captured the
+# status line itself as the reply -- a turn that never updated again.
+_RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\S.*?(?:…|\.{2,3})')
 
 
-_RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
+_RE_SPINNER_INLINE = re.compile(
+    _SPINNER_ICONS + r'\s+\S.*?(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$'
+)
+
+
+# The status footer carries its own elapsed time and interrupt hint. Matching it
+# directly means a working agent is still detected even if the spinner glyph
+# scrolls off or the CLI changes its icon set -- the failure mode that has bitten
+# this dashboard before.
+_RE_STATUS_FOOTER = re.compile(
+    r'\(\s*\d+\s*[smh][^)]*\besc to interrupt\b', re.IGNORECASE
+)
 
 
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
@@ -486,6 +502,13 @@ def _detect_activity_raw(session_name: str) -> dict:
             if _RE_RUNNING_TASK.match(stripped):
                 info["status"] = "busy"
                 info["detail"] = "Running task"
+                return info
+            # "(1m 49s · esc to interrupt)" — the agent's own status footer.
+            # Checked independently of the spinner glyph so a changed icon set
+            # cannot make a working session look idle.
+            if _RE_STATUS_FOOTER.search(stripped):
+                info["status"] = "busy"
+                info["detail"] = "Working"
                 return info
             # Spinner icon + verb… at START of line
             if _RE_SPINNER_START.match(stripped):

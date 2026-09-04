@@ -49,6 +49,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from core.config import (
+    MAX_IDE_TERMINALS,
     MESSAGES_DIR,
     PROJECTS_ROOT,
     SSH_CONTROL_DIR,
@@ -782,6 +783,55 @@ def _ssh_open_tmux_window(profile: dict, session_name: str, index: int = 0) -> s
         detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")
         raise RuntimeError((detail or "Could not open SSH tmux window")[:800])
     return window_name
+
+
+def _ssh_list_terminal_indexes(profile: dict, session_name: str) -> list[int]:
+    """Which of this connection's terminals actually exist right now.
+
+    tmux is the source of truth: a tab list kept only in the browser drifts from
+    reality after a reload, a server restart, or a window killed from elsewhere.
+    Index 0 is always offered so the panel has a tab to open even before its
+    window has been created.
+    """
+    if not shutil.which("tmux"):
+        return [0]
+    try:
+        result = subprocess.run(
+            ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return [0]
+    if result.returncode != 0:
+        return [0]
+    live = set(result.stdout.split())
+    found = [
+        index for index in range(MAX_IDE_TERMINALS)
+        if _ssh_tmux_window_name(profile, index) in live
+    ]
+    return found or [0]
+
+
+def _ssh_kill_tmux_window(profile: dict, session_name: str, index: int) -> bool:
+    """End one terminal for real: kill its tmux window and the shell in it.
+
+    Closing a tab should stop the remote shell, not just hide a view -- an
+    abandoned window keeps its SSH channel and any process running in it.
+    Returns False when the window was already gone, which is not an error.
+    """
+    if not shutil.which("tmux"):
+        raise RuntimeError("tmux is not installed on the dashboard host")
+    window_name = _ssh_tmux_window_name(profile, index)
+    result = subprocess.run(
+        ["tmux", "kill-window", "-t", f"{session_name}:={window_name}"],
+        capture_output=True, text=True, timeout=8,
+    )
+    if result.returncode == 0:
+        return True
+    detail = (result.stderr or "").strip().lower()
+    if "can't find window" in detail or "no such window" in detail:
+        return False
+    raise RuntimeError((result.stderr.strip() or "Could not close terminal")[:400])
 
 
 def _ssh_focus_tmux_window(profile: dict, session_name: str, index: int = 0) -> str:

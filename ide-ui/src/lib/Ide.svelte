@@ -17,7 +17,7 @@
     Files, GitBranch, MessageSquare, Server, Plus, Trash2, SquareTerminal,
     ExternalLink, FolderOpen, FileCode2, X, PanelBottom, Circle, CircleDot,
     CircleCheck, CircleAlert, Search, MonitorSmartphone, Settings, CircleUser,
-    Ellipsis, PanelLeft,
+    Ellipsis, PanelLeft, ChevronDown,
   } from 'lucide-svelte'
 
   let { sessions = [], session = '', rootPath = '' } = $props()
@@ -86,21 +86,52 @@
     activeTerminal = index
   }
 
-  function closeTerminal(index) {
-    if (terminals.length <= 1) return
+  /** Close a terminal for real: kill its tmux window, not just this view.
+   *
+   * Dropping the tab alone would leave the remote shell running with whatever
+   * was in it, and the window would reappear on the next reload because the
+   * tab list is restored from tmux.
+   */
+  async function closeTerminal(index) {
     const position = terminals.indexOf(index)
-    terminals = terminals.filter((entry) => entry !== index)
+    const remaining = terminals.filter((entry) => entry !== index)
+    // Update immediately so the tab does not linger while the request runs.
+    terminals = remaining.length ? remaining : [0]
     if (activeTerminal === index) {
       activeTerminal = terminals[Math.min(position, terminals.length - 1)]
     }
+    try {
+      await api.closeTerminal(ide.connectionId, index)
+    } catch (error) {
+      ide.setStatus(error.message || 'Could not close terminal')
+    }
   }
 
-  // A different workspace has its own shells; start over rather than attaching
-  // this connection's tabs to another connection's tmux windows.
+  // Restore the tab bar from tmux whenever the workspace connects. Browser
+  // state alone drifts: a window killed elsewhere, or a dashboard restart,
+  // would leave tabs pointing at shells that no longer exist.
+  let terminalsLoadedFor = $state('')
   $effect(() => {
-    ide.connectionId
+    const connection = ide.connectionId
+    const state = ide.connectionState
+    if (!connection || state !== 'connected') return
+    const key = `${connection}|${state}`
+    if (terminalsLoadedFor === key) return
+    terminalsLoadedFor = key
     terminals = [0]
     activeTerminal = 0
+    api
+      .listTerminals(connection)
+      .then((data) => {
+        const live = (data?.terminals || []).filter((n) => Number.isInteger(n))
+        if (live.length) {
+          terminals = live
+          if (!live.includes(activeTerminal)) activeTerminal = live[0]
+        }
+      })
+      .catch(() => {
+        /* keep the default single tab; the socket will create the window */
+      })
   })
   // Once opened, the panel stays in the DOM (hidden when toggled off) so the
   // terminal keeps its buffer and socket across toggles.
@@ -536,7 +567,8 @@
                     {#if terminals.length > 1}
                       <button
                         class="rounded-sm p-0.5 opacity-0 group-hover:opacity-100 hover:bg-vs-line"
-                        title="Close terminal" aria-label="Close terminal {index + 1}"
+                        title="Close terminal — ends the shell"
+                        aria-label="Close terminal {index + 1}"
                         onclick={() => closeTerminal(index)}><X size={11} /></button>
                     {/if}
                   </span>
@@ -547,8 +579,16 @@
                 title="New terminal in this workspace" aria-label="New terminal"
                 disabled={terminals.length >= MAX_TERMINALS}
                 onclick={addTerminal}><Plus size={14} /></button>
-              <button class="shrink-0 rounded-sm p-0.5 hover:bg-vs-hover" title="Hide panel" aria-label="Hide terminal panel"
-                onclick={() => (showTerminal = false)}><X size={14} /></button>
+              <!-- Hide is not close: the tmux windows and everything running in
+                   them keep going, and the tabs come back exactly as they were. -->
+              <button class="shrink-0 rounded-sm p-0.5 hover:bg-vs-hover"
+                title="Hide terminals (Ctrl+`) — sessions keep running"
+                aria-label="Hide all terminals"
+                onclick={() => (showTerminal = false)}><ChevronDown size={15} /></button>
+              <button class="shrink-0 rounded-sm p-0.5 hover:bg-vs-hover hover:text-vs-red"
+                title="Close this terminal — ends the shell"
+                aria-label="Close this terminal"
+                onclick={() => closeTerminal(activeTerminal)}><Trash2 size={13} /></button>
             </div>
             <div class="relative min-h-0 flex-1">
               {#key ide.connectionId}
@@ -582,7 +622,7 @@
       >
         <div class="flex items-center gap-2 border-b border-vs-border px-3 py-1.5">
           <MessageSquare size={13} />
-          <span class="flex-1 text-[11px] font-semibold tracking-wide uppercase">Chat</span>
+          <span class="flex-1 text-[11px] font-semibold tracking-wide uppercase">AI Agent</span>
           <button class="rounded-sm p-0.5 hover:bg-vs-hover" title="Hide chat" aria-label="Hide chat"
             onclick={() => (showChat = false)}><X size={14} /></button>
         </div>
@@ -616,7 +656,7 @@
       {/if}
       {#if true}
         <button class="flex items-center gap-1 rounded-sm px-1 hover:bg-white/20"
-          title="Toggle chat panel" onclick={() => (showChat = !showChat)}>
+          title="Toggle AI Agent panel" onclick={() => (showChat = !showChat)}>
           <MessageSquare size={12} /> Chat
         </button>
       {/if}

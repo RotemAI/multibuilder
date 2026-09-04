@@ -1156,6 +1156,75 @@ class TestSshIdeSafety:
             else:
                 raise AssertionError(f"{path}: configure() accepted an unknown name")
 
+    def test_agent_status_lines_are_detected_as_busy(self):
+        """A multi-word status line must mark the session busy.
+
+        The spinner pattern required the ellipsis to follow a single word
+        (`\\w+…`), but real status lines are phrases: "Finding the GRABO
+        index.html…". None of them matched, so a working agent read as idle and
+        the chat captured the status line itself as the reply.
+        """
+        from services import tmux as tmux_service
+
+        working = [
+            "✻ Finding the GRABO index.html… (1m 49s · ↑ 2.1k tokens · esc to interrupt)",
+            "✽ Thinking… (3s)",
+            "✻ Compacting conversation… (12s · esc to interrupt)",
+        ]
+        for line in working:
+            assert (
+                tmux_service._RE_SPINNER_START.match(line)
+                or tmux_service._RE_STATUS_FOOTER.search(line)
+            ), line
+
+        for line in ("● Bash(ls -la)", "Here is the answer to your question."):
+            assert not tmux_service._RE_SPINNER_START.match(line), line
+            assert not tmux_service._RE_STATUS_FOOTER.search(line), line
+
+    def test_status_only_turns_are_never_recorded_as_replies(self):
+        """Recording a status line pins the chat to it forever.
+
+        The signature is stored with the message, so the real answer that
+        follows looks unchanged and is never captured -- the "chat stuck"
+        symptom. A reply that merely ends in "..." is NOT status chrome.
+        """
+        import app
+
+        for text in (
+            "✻ Finding the GRABO index.html… (1m 49s · esc to interrupt)",
+            "✽ Thinking… (3s)",
+            "Compacting conversation (12s · esc to interrupt)",
+            "",
+        ):
+            assert app._turn_is_only_status(text), text
+
+        for text in (
+            "I checked the file...",
+            "Here is the answer.",
+            "Hello! The workspace is rooted at /home/x.\n\nWhat next?",
+        ):
+            assert not app._turn_is_only_status(text), text
+
+    def test_ide_chat_skips_the_summary_llm_call(self):
+        """The IDE chat renders `full`, so summarising it is pure latency."""
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app._capture_agent_reply)
+        assert "want_summary=False" in source
+
+    def test_terminal_close_kills_the_tmux_window(self):
+        """Closing a tab must end the shell, not just drop the view."""
+        import inspect
+
+        from services import ssh as ssh_service
+
+        source = inspect.getsource(ssh_service._ssh_kill_tmux_window)
+        assert "kill-window" in source
+        # An already-gone window is a no-op, not an error.
+        assert "can't find window" in source
+
     def test_git_panel_loads_status_on_mount(self):
         """Source Control must fetch status when it opens, not only on click.
 

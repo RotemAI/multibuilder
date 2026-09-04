@@ -168,6 +168,13 @@ export const api = {
 
   focusTerminal: (id) => request(conn(id, '/focus-terminal'), { method: 'POST' }),
 
+  // tmux is the source of truth for which terminals exist, so the tab bar is
+  // restored from the server rather than from browser state that can drift.
+  listTerminals: (id) => request(conn(id, '/terminals')),
+
+  closeTerminal: (id, index) =>
+    request(conn(id, `/terminals/${index}`), { method: 'DELETE' }),
+
   getWorkspace: (id) => request(conn(id, '/workspace')),
 
   saveWorkspace: (id, body) =>

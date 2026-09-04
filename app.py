@@ -560,6 +560,8 @@ from services.ssh import (  # noqa: E402
     _ssh_ide_state_key,
     _ssh_ide_state_store,
     _ssh_key_fingerprints,
+    _ssh_kill_tmux_window,
+    _ssh_list_terminal_indexes,
     _ssh_managed_key_path,
     _ssh_open_tmux_window,
     _ssh_profile,
@@ -5732,6 +5734,56 @@ def _codex_event_payload(event: dict, event_type: str) -> dict | None:
     return None
 
 
+def _claude_turn_text(event: dict) -> str | None:
+    """Assistant text from one Claude transcript line, or None.
+
+    Claude writes a different shape from Codex: `{"type": "assistant",
+    "message": {"content": [{"type": "text", "text": ...}]}}` rather than an
+    `event_msg`/`agent_message` envelope. Without this the extractor found
+    nothing in a Claude transcript and silently fell back to scraping the
+    terminal pane -- which returns the WRAPPED, on-screen text, so long replies
+    were cut off and tables arrived mangled by the terminal's box drawing.
+
+    Tool-use blocks are skipped: only what the agent actually said is a reply.
+    """
+    if event.get("type") != "assistant":
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip() or None
+    if not isinstance(content, list):
+        return None
+    parts = [
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    joined = "\n".join(part for part in parts if part.strip()).strip()
+    return joined or None
+
+
+def _claude_is_user_turn(event: dict) -> bool:
+    """A real human prompt, not a tool result echoed back as a user message."""
+    if event.get("type") != "user":
+        return False
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        # A tool result arrives as a "user" event too; it is not a new prompt.
+        return any(
+            isinstance(block, dict) and block.get("type") == "text"
+            for block in content
+        )
+    return False
+
+
 def _norm_text(s: str) -> str:
     return " ".join((s or "").split()).lower()
 
@@ -5795,7 +5847,9 @@ def _extract_last_assistant_turn(session_name: str, last_user_text: str = "") ->
                     o = json.loads(ln)
                 except Exception:
                     continue
-                if _codex_event_payload(o, "user_message"):
+                # Both agents' transcript shapes, so a Claude session reads its
+                # real reply text instead of falling through to the pane scrape.
+                if _codex_event_payload(o, "user_message") or _claude_is_user_turn(o):
                     texts = []
                     continue
                 payload = _codex_event_payload(o, "agent_message")
@@ -5803,6 +5857,10 @@ def _extract_last_assistant_turn(session_name: str, last_user_text: str = "") ->
                     text = payload.get("message")
                     if isinstance(text, str) and text.strip():
                         texts.append(text.strip())
+                    continue
+                claude_text = _claude_turn_text(o)
+                if claude_text:
+                    texts.append(claude_text)
             if texts:
                 return "\n\n".join(texts).strip()
         except Exception:
@@ -5955,7 +6013,9 @@ async def _capture_agent_reply(session_name: str) -> bool:
              if m.get("role") == "user"),
             "",
         )
-        summary = await get_chat_summary(session_name, entry.get("chat_summary_sig", ""), last_user)
+        summary = await get_chat_summary(
+            session_name, entry.get("chat_summary_sig", ""), last_user, want_summary=False
+        )
         if not summary or not (summary.get("summary") or summary.get("full")):
             return False
         _append_assistant_msg(
@@ -5973,7 +6033,38 @@ async def _capture_agent_reply(session_name: str) -> bool:
         return False
 
 
-async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str = ""):
+# An agent status line ("✻ Finding … (1m 49s · esc to interrupt)") is not a
+# reply. Detection should stop the capture happening at all, but if a turn ever
+# arrives that is nothing but status chrome, recording it would pin the chat to
+# that line forever: the signature is stored, so the real answer that follows
+# looks unchanged and is never captured. That is the "chat stuck" symptom.
+# Two shapes count as status chrome, and nothing else. A bare sentence that
+# merely ends in "..." is a real reply and must not be swallowed.
+_RE_TURN_IS_STATUS_ONLY = re.compile(
+    r"^\s*(?:"
+    # 1. Leading spinner glyph followed by a phrase.
+    r"[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]\s*\S[^\n]*"
+    r"|"
+    # 2. No glyph, but the agent's own timing/interrupt footer.
+    r"\S[^\n]*\(\s*\d+\s*[smh][^)]*\)"
+    r")\s*$"
+)
+
+
+def _turn_is_only_status(text: str) -> bool:
+    """True when a captured turn is just the agent's working indicator."""
+    body = (text or "").strip()
+    if not body:
+        return True
+    lines = [line for line in body.splitlines() if line.strip()]
+    if len(lines) > 2:
+        return False
+    return all(_RE_TURN_IS_STATUS_ONLY.match(line.strip()) for line in lines)
+
+
+async def get_chat_summary(
+    session_name: str, prev_sig: str, last_user_text: str = "", want_summary: bool = True
+):
     """Return {'sig','summary','full','links'} for the latest turn, or None when
     unchanged/empty.
 
@@ -5982,14 +6073,16 @@ async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str
     after a couple of lines and dropping the links with it."""
     turn_text = await asyncio.to_thread(_extract_last_assistant_turn, session_name, last_user_text)
     turn_text = (turn_text or "").strip()
-    if not turn_text:
+    if not turn_text or _turn_is_only_status(turn_text):
         return None
     sig = _output_signature(turn_text)
     if sig == prev_sig:
         return None  # this exact output was already summarized
     full = _turn_full_text(turn_text)
-    summary = await _summarize_turn(turn_text)
-    summary = (summary or "").strip()
+    # The IDE chat renders `full`, so summarising there is a whole extra LLM
+    # round trip of latency before the reply can appear. Only the dashboard
+    # Chat tab needs the plain-language recap.
+    summary = (await _summarize_turn(turn_text) or "").strip() if want_summary else ""
     if not summary and not full:
         return None
     links = await asyncio.to_thread(_extract_turn_links, turn_text)
@@ -8350,7 +8443,16 @@ async def api_ide_chat_messages(request: Request, session_name: str, limit: int 
     await _capture_agent_reply(session_name)
     messages = await asyncio.to_thread(_load_session_messages, session_name)
     bounded = max(1, min(int(limit or 80), 200))
-    return JSONResponse({"messages": messages[-bounded:]})
+    # Report whether the agent is mid-turn. The composer only knew about its own
+    # POST, which finishes in milliseconds, so the panel looked idle for the
+    # minutes the agent was actually working.
+    activity = _activity_state.get(session_name) or {}
+    busy = str(activity.get("status") or "") == "busy"
+    return JSONResponse({
+        "messages": messages[-bounded:],
+        "busy": busy,
+        "detail": str(activity.get("detail") or "") if busy else "",
+    })
 
 
 @app.get("/api/sessions/{session_name}/ide/ssh-connections")
@@ -8970,6 +9072,46 @@ async def api_focus_ssh_terminal(request: Request, session_name: str, connection
     return JSONResponse({"ok": True, "window_name": window_name, "audit_id": audit["id"]})
 
 
+
+
+@app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/terminals")
+async def api_list_ssh_terminals(request: Request, session_name: str, connection_id: str):
+    """The terminals that actually exist for this connection, from tmux."""
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    indexes = await asyncio.to_thread(_ssh_list_terminal_indexes, profile, session_name)
+    return JSONResponse({"terminals": indexes, "max": MAX_IDE_TERMINALS})
+
+
+@app.delete("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/terminals/{index}")
+async def api_close_ssh_terminal(
+    request: Request, session_name: str, connection_id: str, index: int
+):
+    """End one terminal: kill its tmux window and whatever is running in it."""
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+    if index < 0 or index >= MAX_IDE_TERMINALS:
+        return JSONResponse({"error": "Unknown terminal"}, status_code=400)
+    try:
+        killed = await asyncio.to_thread(
+            _ssh_kill_tmux_window, profile, session_name, index
+        )
+        await asyncio.to_thread(
+            _append_ssh_ide_audit, _current_user(request), session_name, profile,
+            "terminal_closed",
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    remaining = await asyncio.to_thread(_ssh_list_terminal_indexes, profile, session_name)
+    return JSONResponse({"ok": True, "closed": killed, "terminals": remaining})
 
 
 @app.get("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}/files/search")
