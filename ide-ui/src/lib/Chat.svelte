@@ -13,6 +13,7 @@
   let sending = $state(false)
   let pollRate = 0
   let agentBusy = $state(false)
+  let pending = $state('')
   let busyDetail = $state('')
   // "Working" covers both: our request in flight, and the agent still writing.
   const working = $derived(sending || agentBusy)
@@ -78,8 +79,14 @@
       // our own POST, which returns long before the agent has finished.
       agentBusy = !!data.busy
       busyDetail = data.detail || ''
+      const nextPending = data.pending || ''
+      const streamed = nextPending !== pending
+      pending = nextPending
       error = ''
-      if (grew) queueMicrotask(scrollToEnd)
+      // Follow along while a reply streams in, not only when a message is
+      // added -- otherwise the text grows below the fold and the user has to
+      // chase it. Skipped if they have scrolled up to read history.
+      if ((grew || streamed) && atBottom) queueMicrotask(scrollToEnd)
     } catch (exc) {
       error = exc.message || 'Could not load chat'
     }
@@ -97,13 +104,33 @@
     timer = setInterval(loadMessages, wanted)
   })
 
+  // True when the view is at (or near) the newest message. Auto-scroll only
+  // happens then, so scrolling up to read history is not yanked back down.
+  let atBottom = $state(true)
+
+  function onScroll() {
+    if (!listEl) return
+    const distance = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight
+    atBottom = distance < 80
+  }
+
   function scrollToEnd() {
     if (listEl) listEl.scrollTop = listEl.scrollHeight
+  }
+
+  function jumpToLatest() {
+    atBottom = true
+    scrollToEnd()
   }
 
   $effect(() => {
     const current = target
     messages = []
+    // A different session has its own turn in flight; showing the previous
+    // one's partial text against the new transcript would be wrong.
+    pending = ''
+    agentBusy = false
+    atBottom = true
     if (timer) clearInterval(timer)
     // Force the polling effect below to re-arm for the new session; it owns the
     // timer, so setting one here too would leave two running.
@@ -348,7 +375,11 @@
   </div>
 
   <!-- Transcript -->
-  <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-3 py-3" bind:this={listEl}>
+  <div
+    class="relative flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-3 py-3"
+    bind:this={listEl}
+    onscroll={onScroll}
+  >
     {#if error}
       <p class="rounded-sm border border-mk-pink/40 bg-mk-pink/10 px-2 py-1 text-xs text-mk-pink">{error}</p>
     {/if}
@@ -387,13 +418,37 @@
         </div>
       {/if}
     {/each}
+    <!-- The turn in flight, streamed from the transcript. Rendered like a
+         finished reply so text does not jump when it settles, with a caret to
+         show it is still arriving. -->
+    {#if pending}
+      <div class="flex flex-col gap-1.5">
+        <span class="flex items-center gap-1.5 text-[11px] font-semibold text-mk-green">
+          <Sparkles size={11} />
+          {config.agent === 'claude' ? 'Claude' : 'Codex'}
+        </span>
+        <div class="chat-prose text-[13px] leading-relaxed text-mk-fg">
+          {@html renderMarkdown(pending)}<span class="chat-caret"></span>
+        </div>
+      </div>
+    {/if}
     {#if working}
       <div class="flex items-center gap-2 text-[11px] text-mk-comment">
         <Loader size={11} class="animate-spin" />
-        {busyDetail || 'Working…'}
+        <span>{busyDetail || 'Generating'}<span class="chat-dots"></span></span>
       </div>
     {/if}
   </div>
+
+  {#if !atBottom}
+    <button
+      class="mx-auto -mt-1 mb-1 flex shrink-0 items-center gap-1 rounded-full border border-mk-line
+             bg-mk-input px-2.5 py-0.5 text-[11px] text-mk-comment shadow hover:text-mk-fg"
+      onclick={jumpToLatest}
+    >
+      <ChevronDown size={11} /> {working ? 'Jump to latest — still generating' : 'Jump to latest'}
+    </button>
+  {/if}
 
   <!-- Context/token status, as Claude Code shows above its prompt. Hidden until
        the agent has actually reported usage, so it never shows empty zeros. -->
@@ -573,4 +628,42 @@
   /* Only the non-code text wraps; a long code line scrolls instead. */
   .chat-prose { white-space: pre-wrap; overflow-wrap: anywhere; }
   .chat-prose :global(.chat-code) { white-space: pre; }
+
+  /* Streaming caret: shows the reply is still arriving without shifting the
+     text, which a spinner on its own line would do. */
+  .chat-caret {
+    display: inline-block;
+    width: 0.45em;
+    height: 1em;
+    margin-left: 0.12em;
+    background: currentColor;
+    opacity: 0.75;
+    vertical-align: text-bottom;
+    animation: chat-blink 1.1s steps(1) infinite;
+  }
+
+  @keyframes chat-blink {
+    0%, 50% { opacity: 0.75; }
+    50.01%, 100% { opacity: 0; }
+  }
+
+  /* Animated "…" so "Generating" reads as live rather than stuck. Rendered via
+     content so the label itself stays selectable text. */
+  .chat-dots::after {
+    content: '';
+    animation: chat-dots 1.4s steps(1) infinite;
+  }
+
+  @keyframes chat-dots {
+    0%   { content: ''; }
+    25%  { content: '.'; }
+    50%  { content: '..'; }
+    75%  { content: '...'; }
+    100% { content: ''; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chat-caret { animation: none; }
+    .chat-dots::after { content: '…'; animation: none; }
+  }
 </style>

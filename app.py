@@ -8448,10 +8448,32 @@ async def api_ide_chat_messages(request: Request, session_name: str, limit: int 
     # minutes the agent was actually working.
     activity = _activity_state.get(session_name) or {}
     busy = str(activity.get("status") or "") == "busy"
+    # While a turn is in flight, hand back what the agent has written SO FAR.
+    #
+    # Both CLIs append their assistant blocks to the transcript as the turn
+    # progresses, so re-reading it each poll streams the reply in. This is
+    # deliberately not persisted: the stored message is still written once, when
+    # the turn settles, so a partial read can never become the saved reply.
+    pending = ""
+    if busy:
+        try:
+            last_user = next(
+                (m.get("text", "") for m in reversed(messages) if m.get("role") == "user"),
+                "",
+            )
+            draft = await asyncio.to_thread(
+                _extract_last_assistant_turn, session_name, last_user
+            )
+            draft = (draft or "").strip()
+            if draft and not _turn_is_only_status(draft):
+                pending = _turn_full_text(draft)
+        except Exception:  # noqa: BLE001 - a missing draft must not fail the poll
+            logger.debug("pending turn read failed for %s", session_name, exc_info=True)
     return JSONResponse({
         "messages": messages[-bounded:],
         "busy": busy,
         "detail": str(activity.get("detail") or "") if busy else "",
+        "pending": pending,
     })
 
 

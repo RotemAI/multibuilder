@@ -1200,6 +1200,27 @@ class TestSshIdeSafety:
         )
         assert not app._claude_is_user_turn({"type": "assistant", "message": {}})
 
+    def test_chat_streams_the_in_flight_turn_without_persisting_it(self):
+        """A partial read must never become the stored reply.
+
+        The endpoint returns the turn so far as `pending` so the panel can
+        stream it, but the saved message is still written once, when the turn
+        settles. Persisting a partial read would pin the transcript to a
+        half-finished answer -- the same failure mode as capturing a status
+        line.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_ide_chat_messages)
+        assert '"pending"' in source
+        # Only read while busy, and never stored.
+        assert "if busy:" in source
+        assert "_append_assistant_msg" not in source
+        # A status line is not a draft worth showing.
+        assert "_turn_is_only_status" in source
+
     def test_chat_endpoint_reports_agent_busy_state(self):
         """The panel needs a live signal, not just its own request lifetime."""
         import inspect
