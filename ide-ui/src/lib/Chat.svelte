@@ -11,6 +11,7 @@
   let question = $state('')
   let target = $state(session || sessions[0] || '')
   let sending = $state(false)
+  let pollRate = 0
   let agentBusy = $state(false)
   let busyDetail = $state('')
   // "Working" covers both: our request in flight, and the agent still writing.
@@ -88,7 +89,6 @@
   // off when idle so an open panel is not hammering the server.
   const POLL_IDLE = 3000
   const POLL_BUSY = 1000
-  let pollRate = 0
   $effect(() => {
     const wanted = working ? POLL_BUSY : POLL_IDLE
     if (!target || pollRate === wanted) return
@@ -105,10 +105,12 @@
     const current = target
     messages = []
     if (timer) clearInterval(timer)
+    // Force the polling effect below to re-arm for the new session; it owns the
+    // timer, so setting one here too would leave two running.
+    pollRate = 0
     if (!current) return
     loadMessages()
     loadConfig()
-    timer = setInterval(loadMessages, 3000)
   })
 
   onDestroy(() => { if (timer) clearInterval(timer) })

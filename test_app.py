@@ -1156,6 +1156,60 @@ class TestSshIdeSafety:
             else:
                 raise AssertionError(f"{path}: configure() accepted an unknown name")
 
+    def test_claude_transcript_replies_are_extracted(self):
+        """Claude's transcript shape must be parsed, not fall back to the pane.
+
+        Claude writes {"type":"assistant","message":{"content":[{"type":"text"}]}}
+        while Codex writes an event_msg/agent_message envelope. Understanding
+        only the latter meant a Claude turn extracted nothing and the code fell
+        back to scraping the terminal -- which returns WRAPPED on-screen text,
+        so long replies were cut off mid-sentence and tables arrived mangled.
+        """
+        import app
+
+        assistant = {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Here is the full answer."},
+                {"type": "tool_use", "name": "Bash", "input": {}},
+            ]},
+        }
+        assert app._claude_turn_text(assistant) == "Here is the full answer."
+
+        # Tool-use only: nothing the agent actually said.
+        assert app._claude_turn_text(
+            {"type": "assistant", "message": {"content": [{"type": "tool_use"}]}}
+        ) is None
+        # Codex events must not be mistaken for Claude ones.
+        assert app._claude_turn_text({"type": "event_msg", "payload": {}}) is None
+
+    def test_claude_tool_results_are_not_treated_as_user_prompts(self):
+        """A tool result arrives as a "user" event; it must not reset the turn.
+
+        Treating it as a new prompt would discard everything the agent had
+        already written, truncating the reply at the last tool call.
+        """
+        import app
+
+        assert app._claude_is_user_turn(
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}
+        )
+        assert app._claude_is_user_turn({"type": "user", "message": {"content": "hi"}})
+        assert not app._claude_is_user_turn(
+            {"type": "user", "message": {"content": [{"type": "tool_result"}]}}
+        )
+        assert not app._claude_is_user_turn({"type": "assistant", "message": {}})
+
+    def test_chat_endpoint_reports_agent_busy_state(self):
+        """The panel needs a live signal, not just its own request lifetime."""
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_ide_chat_messages)
+        assert '"busy"' in source
+        assert "_activity_state" in source
+
     def test_agent_status_lines_are_detected_as_busy(self):
         """A multi-word status line must mark the session busy.
 
