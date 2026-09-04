@@ -97,6 +97,23 @@
     if (result) ide.openDiffTab(item.path, result.output || 'No changes to show.')
   }
 
+  // Load status when the panel first renders, and again whenever the workspace
+  // changes. Nothing did this before: runGit only ran from user actions, so
+  // opening Source Control showed an empty list with no branch and no "not a
+  // repository" message -- indistinguishable from a clean repo.
+  let loadedFor = $state('')
+  $effect(() => {
+    const connection = ide.connectionId
+    const state = ide.connectionState
+    // Keyed on both: a reconnect to the SAME workspace clears the store's git
+    // state, so the panel must refetch rather than sit on an emptied view.
+    const key = connection ? `${connection}|${state}` : ''
+    if (!connection || state !== 'connected') return
+    if (loadedFor === key) return
+    loadedFor = key
+    run('status')
+  })
+
   // Load the log lazily: history costs a round trip to the remote host, so
   // fetch it when the section is first opened rather than on every status poll.
   async function toggleHistory() {
@@ -155,7 +172,11 @@
     </div>
   </div>
 
-  {#if ide.notARepo}
+  {#if !loadedFor || (ide.gitBusy === 'status' && !ide.gitStatus && !ide.notARepo)}
+    <p class="mx-3 flex items-center gap-1.5 text-xs text-vs-muted">
+      <Loader size={12} class="animate-spin" /> Reading repository…
+    </p>
+  {:else if ide.notARepo}
     <p class="mx-3 text-xs leading-relaxed text-vs-muted">
       This folder isn't a Git repository.<br />
       Open a folder containing a <code class="rounded-sm bg-vs-input px-1">.git</code> directory,

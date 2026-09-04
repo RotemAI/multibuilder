@@ -1156,6 +1156,25 @@ class TestSshIdeSafety:
             else:
                 raise AssertionError(f"{path}: configure() accepted an unknown name")
 
+    def test_git_panel_loads_status_on_mount(self):
+        """Source Control must fetch status when it opens, not only on click.
+
+        runGit previously ran only from user actions, so opening the panel
+        showed an empty file list, no branch, and no "not a repository" notice
+        -- a non-repo workspace and a clean repo looked identical, and both
+        looked broken.
+        """
+        from pathlib import Path
+
+        panel = Path("ide-ui/src/lib/GitPanel.svelte").read_text()
+        assert "$effect(" in panel, "GitPanel has no reactive load"
+        # The effect must actually request status, keyed on the connection so a
+        # workspace switch refetches.
+        effect = panel.split("$effect(")[1].split("})")[0]
+        assert "run('status')" in effect
+        assert "ide.connectionId" in effect
+        assert "connectionState" in effect
+
     def test_ssh_terminal_starts_in_the_workspace_root(self):
         """A remote terminal must open in the workspace, not the login home.
 
