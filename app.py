@@ -5430,6 +5430,27 @@ def _extract_codex_text(terminal_output: str) -> str:
     return "\n\n".join(b for b in text_blocks if b.strip())
 
 
+# CLI chrome that shares the pane with the reply. These are the agent's own
+# notices, not anything it said, and they were being captured as part of the
+# answer ("✘ Auto-update failed: no write permission to npm prefix").
+_AGENT_CHROME_RES = (
+    re.compile(r"^\s*[✘✗×]?\s*Auto-update failed\b", re.IGNORECASE),
+    re.compile(r"\brun\s+claude\s+doctor\b", re.IGNORECASE),
+    re.compile(r"^\s*Tip:.*\bcodex\b", re.IGNORECASE),
+    re.compile(r"^\s*[✘✗×]\s*\S.*\bnpm\b.*\bpermission\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:⚠|warning:)\s*.*\bnew version\b", re.IGNORECASE),
+)
+
+
+def _strip_agent_chrome(text: str) -> str:
+    """Drop the CLI's own banners from scraped pane text."""
+    kept = [
+        line for line in (text or "").splitlines()
+        if not any(pattern.search(line) for pattern in _AGENT_CHROME_RES)
+    ]
+    return "\n".join(kept).strip()
+
+
 def _extract_codex_response_since_last_user(terminal_output: str) -> str:
     """Extract Codex's text response since the last user message (❯ prompt).
 
@@ -5461,7 +5482,7 @@ def _extract_codex_response_since_last_user(terminal_output: str) -> str:
     else:
         section = "\n".join(lines[last_prompt_idx + 1:])
 
-    return _extract_codex_text(section)
+    return _strip_agent_chrome(_extract_codex_text(section))
 
 
 _extract_claude_response_since_last_user = _extract_codex_response_since_last_user
@@ -5802,7 +5823,33 @@ def _last_genuine_user_text(path: str) -> str:
         payload = _codex_event_payload(o, "user_message")
         if payload and isinstance(payload.get("message"), str):
             last = payload["message"]
+            continue
+        # Claude's shape, so a Claude transcript can be matched to its session
+        # too. Without this, resolution failed whenever a cwd had more than one
+        # transcript and every reply fell back to the terminal scrape.
+        if _claude_is_user_turn(o):
+            text = _claude_user_text(o)
+            if text:
+                last = text
     return last.strip()
+
+
+def _claude_user_text(event: dict) -> str:
+    """The human-typed text of one Claude user event."""
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        return "\n".join(part for part in parts if part.strip()).strip()
+    return ""
 
 
 def _resolve_session_transcript(session_name: str, last_user_text: str):
@@ -7348,6 +7395,7 @@ usage_service.configure(
     _api_http=_api_http,
     _iter_prompt_audit_reverse=_iter_prompt_audit_reverse,
     _session_config_base=_session_config_base,
+    _session_agent_kind=_session_agent_kind,
     _user_codex_config_dir=_user_codex_config_dir,
     AUTH_SECRET=AUTH_SECRET,
     DEFAULT_MODEL=DEFAULT_MODEL,

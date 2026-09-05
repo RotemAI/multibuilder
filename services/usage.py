@@ -38,6 +38,7 @@ logger = logging.getLogger("codex-dashboard")
 _api_http = None
 _iter_prompt_audit_reverse = None
 _session_config_base = None
+_session_agent_kind = None
 _user_codex_config_dir = None
 # Injected as accessors, not values: both are rebound at runtime in app.py, so a
 # snapshot taken at import would go stale.
@@ -762,6 +763,12 @@ def _find_session_jsonl_files(session_name: str) -> list:
     if not cwd:
         return []
     cwd_norm = cwd.rstrip("/")
+    # Pick the store that belongs to THIS session's agent. A directory commonly
+    # holds both Codex rollouts and Claude transcripts, so searching Codex first
+    # and falling back would hand a Claude session someone else's Codex file --
+    # which then fails to match and drops it onto the terminal scrape.
+    if _session_agent_kind is not None and _session_agent_kind(session_name) == "claude":
+        return _find_claude_transcripts(cwd_norm)
     sessions_home = _session_config_base(session_name)
     sessions_dir = sessions_home / "sessions"
     if not sessions_dir.exists():
@@ -788,7 +795,31 @@ def _find_session_jsonl_files(session_name: str) -> list:
                 matches.append(str(fpath))
         except Exception:
             logger.debug("Failed to peek rollout %s", fpath, exc_info=True)
-    return matches
+    return matches or _find_claude_transcripts(cwd_norm)
+
+
+def _find_claude_transcripts(cwd: str) -> list:
+    """Claude's transcripts for a working directory, newest first.
+
+    Claude stores them at ~/.claude/projects/<cwd with / replaced by ->/<uuid>.jsonl
+    rather than in Codex's ~/.codex/sessions tree. Without this a Claude session
+    matched no transcript at all, so every reply fell back to scraping the
+    terminal pane -- which truncates long answers and drags the CLI's own
+    chrome ("Auto-update failed…") in with the text.
+    """
+    if not cwd:
+        return []
+    root = Path.home() / ".claude" / "projects" / cwd.replace("/", "-")
+    if not root.is_dir():
+        return []
+    try:
+        files = [f for f in root.glob("*.jsonl") if f.is_file()]
+    except OSError:
+        return []
+    cutoff = time.time() - 30 * 86400
+    fresh = [f for f in files if f.stat().st_mtime > cutoff]
+    fresh.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return [str(f) for f in fresh]
 
 
 def _parse_session_stats(session_name: str) -> dict:

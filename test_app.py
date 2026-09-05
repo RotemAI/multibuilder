@@ -1156,6 +1156,51 @@ class TestSshIdeSafety:
             else:
                 raise AssertionError(f"{path}: configure() accepted an unknown name")
 
+    def test_claude_sessions_find_claude_transcripts(self):
+        """A Claude session must read Claude's transcript store, not Codex's.
+
+        A working directory commonly holds BOTH ~/.codex/sessions rollouts and
+        ~/.claude/projects transcripts. Searching Codex first and only falling
+        back on an empty result handed a Claude session a Codex file, which
+        then failed to match and dropped every reply onto the terminal scrape --
+        the source of the truncated replies and the leaked CLI banner.
+        """
+        import inspect
+
+        from services import usage as usage_service
+
+        source = inspect.getsource(usage_service._find_session_jsonl_files)
+        assert "_session_agent_kind" in source, "discovery is not agent-aware"
+        assert "_find_claude_transcripts" in source
+
+        # The Claude path resolves the documented directory encoding.
+        finder = inspect.getsource(usage_service._find_claude_transcripts)
+        assert 'replace("/", "-")' in finder
+        assert usage_service._find_claude_transcripts("/definitely/not/here") == []
+
+    def test_cli_chrome_is_stripped_from_scraped_panes(self):
+        """The agent's own banners are not part of what it said.
+
+        "✘ Auto-update failed: no write permission to npm prefix · Run claude
+        doctor" was being captured into the middle of replies.
+        """
+        import app
+
+        noisy = "\n".join([
+            "Created test/index.html, so the page lives at /test.",
+            "✘ Auto-update failed: no write permission to npm prefix · Run claude doctor",
+            "Two deliberate choices:",
+            "Tip: use codex --help for more",
+            "- first choice",
+        ])
+        cleaned = app._strip_agent_chrome(noisy)
+        assert "Auto-update failed" not in cleaned
+        assert "claude doctor" not in cleaned
+        assert "Tip:" not in cleaned
+        # Real content survives untouched.
+        assert "Created test/index.html" in cleaned
+        assert "- first choice" in cleaned
+
     def test_claude_transcript_replies_are_extracted(self):
         """Claude's transcript shape must be parsed, not fall back to the pane.
 
