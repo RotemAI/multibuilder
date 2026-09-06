@@ -5595,3 +5595,158 @@ class TestWatchdogRestartMode:
             _app._away_mode_state.pop("restart-dead", None)
 
         assert state["enabled"] is False
+
+
+class TestParseClaudeSessionStats:
+    """Claude records usage in a completely different transcript shape from
+    Codex, and the Codex parser silently reported no usage for it — which hid
+    the whole status bar, including the Compact button."""
+
+    @staticmethod
+    def _transcript(tmp_path, today, turns):
+        path = tmp_path / "claude.jsonl"
+        lines = []
+        for index, turn in enumerate(turns):
+            lines.append(json.dumps({
+                "type": "assistant",
+                "timestamp": f"{today}T12:{index:02d}:00.000Z",
+                "message": {
+                    "model": turn.get("model", "claude-opus-5"),
+                    "usage": {
+                        "input_tokens": turn.get("inp", 100),
+                        "output_tokens": turn.get("out", 200),
+                        "cache_read_input_tokens": turn.get("cache_read", 0),
+                        "cache_creation_input_tokens": turn.get("cache_write", 0),
+                    },
+                },
+            }))
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def _today(self):
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def test_reports_usage_for_a_claude_transcript(self, tmp_path):
+        from services import usage as usage_service
+
+        path = self._transcript(tmp_path, self._today(), [
+            {"inp": 100, "out": 200, "cache_read": 1000, "cache_write": 500},
+            {"inp": 50, "out": 300, "cache_read": 2000, "cache_write": 0},
+        ])
+
+        result = usage_service._parse_claude_session_stats("s", [str(path)], time.time())
+
+        assert result["available"] is True
+        assert result["messageCount"] == 2
+        assert result["totalInput"] == 150
+        assert result["totalOutput"] == 500
+        assert result["cacheRead"] == 3000
+        assert result["cacheCreate"] == 500
+        # Cache tokens are real billed prompt tokens, so they count in the total.
+        assert result["totalTokens"] == 150 + 500 + 3000 + 500
+        assert result["model"] == "claude-opus-5"
+
+    def test_codex_parser_alone_would_have_found_nothing(self, tmp_path):
+        """Guards the actual regression: a Claude transcript has no event_msg
+        records, so the Codex path reports the session as having no usage."""
+        from services import usage as usage_service
+
+        path = self._transcript(tmp_path, self._today(), [{"inp": 100, "out": 200}])
+        text = path.read_text()
+
+        assert '"event_msg"' not in text
+        assert '"token_count"' not in text
+        # The Claude parser reads the same file successfully.
+        assert usage_service._parse_claude_session_stats(
+            "s", [str(path)], time.time()
+        )["available"] is True
+
+    def test_context_percentage_uses_the_newest_turn(self, tmp_path):
+        """Context is what the model read on its latest turn — cached or not —
+        not the running total across the session."""
+        from services import usage as usage_service
+
+        path = self._transcript(tmp_path, self._today(), [
+            {"inp": 10, "out": 10, "cache_read": 10, "cache_write": 0},
+            {"inp": 1000, "out": 10, "cache_read": 98_000, "cache_write": 1000},
+        ])
+
+        result = usage_service._parse_claude_session_stats("s", [str(path)], time.time())
+
+        assert result["ctxWindowSize"] == 1_000_000
+        assert result["contextPct"] == 10.0  # (1000 + 98000 + 1000) / 1M
+
+    def test_haiku_uses_its_smaller_context_window(self, tmp_path):
+        from services import usage as usage_service
+
+        path = self._transcript(tmp_path, self._today(), [
+            {"model": "claude-haiku-4-5", "inp": 20_000, "out": 10, "cache_read": 0},
+        ])
+
+        result = usage_service._parse_claude_session_stats("s", [str(path)], time.time())
+
+        assert result["ctxWindowSize"] == 200_000
+        assert result["contextPct"] == 10.0
+
+    @pytest.mark.parametrize(
+        "model,inp,out,cache_read,cache_write,expected",
+        [
+            ("claude-opus-5", 1_000_000, 0, 0, 0, 5.00),
+            ("claude-opus-5", 0, 1_000_000, 0, 0, 25.00),
+            # Cache reads bill at 0.1x input, writes at 1.25x.
+            ("claude-opus-5", 0, 0, 1_000_000, 0, 0.50),
+            ("claude-opus-5", 0, 0, 0, 1_000_000, 6.25),
+            ("claude-sonnet-5", 1_000_000, 0, 0, 0, 2.00),
+            ("claude-haiku-4-5", 1_000_000, 0, 0, 0, 1.00),
+        ],
+    )
+    def test_pricing_matches_published_rates(
+        self, model, inp, out, cache_read, cache_write, expected
+    ):
+        from services import usage as usage_service
+
+        cost = usage_service._claude_turn_cost(inp, out, cache_read, cache_write, model)
+
+        assert round(cost, 4) == expected
+
+    def test_cache_tokens_are_not_treated_as_a_subset_of_input(self):
+        """Codex reports cached tokens as a subset of input_tokens; Claude
+        reports them separately. Billing them the Codex way would under-charge
+        a cache-heavy session by most of its real cost."""
+        from services import usage as usage_service
+
+        cost = usage_service._claude_turn_cost(1_000, 0, 1_000_000, 0, "claude-opus-5")
+
+        # Full input rate on the 1k, plus the cache rate on the 1M read.
+        assert round(cost, 4) == round(1_000 * 5.0 / 1e6 + 0.50, 4)
+
+    def test_ignores_records_without_usage(self, tmp_path):
+        from services import usage as usage_service
+
+        today = self._today()
+        path = tmp_path / "mixed.jsonl"
+        path.write_text("\n".join([
+            json.dumps({"type": "user", "timestamp": f"{today}T12:00:00.000Z"}),
+            json.dumps({"type": "assistant", "timestamp": f"{today}T12:01:00.000Z",
+                        "message": {"model": "claude-opus-5"}}),
+            json.dumps({"type": "assistant", "timestamp": f"{today}T12:02:00.000Z",
+                        "message": {"model": "claude-opus-5",
+                                    "usage": {"input_tokens": 7, "output_tokens": 3}}}),
+            "not json at all",
+        ]) + "\n")
+
+        result = usage_service._parse_claude_session_stats("s", [str(path)], time.time())
+
+        assert result["messageCount"] == 1
+        assert result["totalInput"] == 7
+
+    def test_reports_unavailable_when_nothing_is_from_today(self, tmp_path):
+        from services import usage as usage_service
+
+        path = self._transcript(tmp_path, "2020-01-01", [{"inp": 100, "out": 200}])
+
+        result = usage_service._parse_claude_session_stats("s", [str(path)], time.time())
+
+        assert result["available"] is False

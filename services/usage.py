@@ -822,6 +822,165 @@ def _find_claude_transcripts(cwd: str) -> list:
     return [str(f) for f in fresh]
 
 
+# Claude's published list prices, USD per million tokens: (input, output).
+# Cache reads bill at 0.1x input and cache writes at 1.25x input.
+_CLAUDE_PRICES = {
+    "opus": (5.0, 25.0),
+    "sonnet": (2.0, 10.0),
+    "haiku": (1.0, 5.0),
+}
+_CLAUDE_DEFAULT_CONTEXT = 1_000_000
+# Haiku is the one current model that is not a 1M-token window.
+_CLAUDE_CONTEXT_OVERRIDES = {"haiku": 200_000}
+
+
+def _claude_model_family(model: str) -> str:
+    name = (model or "").lower()
+    for family in ("opus", "sonnet", "haiku"):
+        if family in name:
+            return family
+    return "opus"
+
+
+def _claude_turn_cost(inp: int, out: int, cache_read: int, cache_write: int, model: str) -> float:
+    """List-price estimate for one Claude turn.
+
+    Unlike Codex, Claude reports cache reads and cache writes as counts that are
+    SEPARATE from ``input_tokens`` rather than subsets of it, so each is billed
+    at its own rate and none of them is subtracted from the others.
+    """
+    rate_in, rate_out = _CLAUDE_PRICES[_claude_model_family(model)]
+    return (
+        inp * rate_in
+        + out * rate_out
+        + cache_read * rate_in * 0.1
+        + cache_write * rate_in * 1.25
+    ) / 1e6
+
+
+def _parse_claude_session_stats(session_name: str, files: list, now: float) -> dict:
+    """Per-session token stats from Claude's transcript format.
+
+    Claude records usage on ``assistant`` messages under ``message.usage``; it
+    has no ``event_msg``/``token_count`` events at all. Running the Codex parser
+    over these files therefore matched nothing and reported the session as
+    having no usage, which hid the whole status bar -- and with it the Compact
+    button, since that lives inside the same block.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    entries = []
+    total_input = total_output = total_cache_read = total_cache_create = 0
+    msg_count = 0
+    models_seen: dict = {}
+    latest_model = "unknown"
+    latest_model_ts = ""
+    latest_input_tokens = 0
+    latest_context_tokens = 0
+    estimated_cost = 0.0
+
+    for fpath in files:
+        try:
+            path = Path(fpath)
+            if datetime.fromtimestamp(
+                path.stat().st_mtime, timezone.utc
+            ).strftime("%Y-%m-%d") < today:
+                continue
+            with path.open() as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if record.get("type") != "assistant":
+                        continue
+                    message = record.get("message") or {}
+                    usage = message.get("usage") or {}
+                    if not usage:
+                        continue
+                    ts_str = str(record.get("timestamp") or "")
+                    if not ts_str.startswith(today):
+                        continue
+                    inp = int(usage.get("input_tokens") or 0)
+                    out = int(usage.get("output_tokens") or 0)
+                    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+                    cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+                    model = str(message.get("model") or "unknown")
+
+                    total_input += inp
+                    total_output += out
+                    total_cache_read += cache_read
+                    total_cache_create += cache_write
+                    msg_count += 1
+                    models_seen[model] = models_seen.get(model, 0) + 1
+                    estimated_cost += _claude_turn_cost(inp, out, cache_read, cache_write, model)
+
+                    if ts_str >= latest_model_ts:
+                        latest_model_ts = ts_str
+                        latest_model = model
+                        latest_input_tokens = inp
+                        # Everything the model read on its newest turn IS the
+                        # live context, whether it was cached or not.
+                        latest_context_tokens = inp + cache_read + cache_write
+                    try:
+                        epoch = datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        ).timestamp()
+                        entries.append((epoch, inp, out, cache_read, cache_write))
+                    except ValueError:
+                        logger.debug("Unparseable Claude transcript timestamp", exc_info=True)
+        except (OSError, ValueError):
+            logger.debug("Failed to read Claude transcript for '%s'", session_name, exc_info=True)
+
+    if not entries:
+        return {"available": False, "_ts": now}
+
+    entries.sort(key=lambda item: item[0])
+    family = _claude_model_family(latest_model)
+    context_window = _CLAUDE_CONTEXT_OVERRIDES.get(family, _CLAUDE_DEFAULT_CONTEXT)
+
+    buckets: dict = {}
+    for epoch, _inp, out, _cr, _cw in entries:
+        minute = int(epoch // 60) * 60
+        buckets[minute] = buckets.get(minute, 0) + out
+    active_minutes = sorted(m for m, out in buckets.items() if out > 10)
+    output_rates = sorted((out for out in buckets.values() if out > 10), reverse=True)
+    peak_output_rate = output_rates[: 5][len(output_rates[:5]) // 2] if output_rates else 0
+
+    recent_output_rate = 0
+    recent_active = [m for m in active_minutes if m >= now - 600]
+    if recent_active:
+        recent = recent_active[-3:]
+        recent_output_rate = int(sum(buckets[m] for m in recent) / len(recent))
+
+    return {
+        "available": True,
+        "model": latest_model,
+        "messageCount": msg_count,
+        "totalInput": total_input,
+        "totalOutput": total_output,
+        "cacheRead": total_cache_read,
+        "cacheCreate": total_cache_create,
+        # Cache reads/writes are real prompt tokens the user paid for, so they
+        # belong in the session total even though they are not "input_tokens".
+        "totalTokens": total_input + total_output + total_cache_read + total_cache_create,
+        "estimatedCost": round(estimated_cost, 4),
+        "peakOutputRate": peak_output_rate,
+        "peakTotalRate": peak_output_rate,
+        "recentOutputRate": recent_output_rate,
+        "recentTotalRate": recent_output_rate,
+        "rateStatus": "normal",
+        "ratePct": 100 if recent_active else 0,
+        "activeMinutes": len(active_minutes),
+        "sessionDurationMin": int((entries[-1][0] - entries[0][0]) / 60) if len(entries) > 1 else 0,
+        "secsSinceLastActivity": int(now - entries[-1][0]),
+        "modelsUsed": models_seen,
+        "contextPct": round(latest_context_tokens / context_window * 100, 1) if context_window else 0,
+        "lastInputTokens": latest_input_tokens,
+        "ctxWindowSize": context_window,
+        "_ts": now,
+    }
+
+
 def _parse_session_stats(session_name: str) -> dict:
     """Parse JSONL files and compute per-session token stats with rate tracking."""
     now = time.time()
@@ -832,6 +991,13 @@ def _parse_session_stats(session_name: str) -> dict:
     files = _find_session_jsonl_files(session_name)
     if not files:
         result = {"available": False, "_ts": now}
+        _session_stats_cache[session_name] = result
+        return result
+
+    # Claude and Codex write completely different transcript formats; running the
+    # Codex parser over a Claude transcript matches nothing and reports no usage.
+    if _session_agent_kind is not None and _session_agent_kind(session_name) == "claude":
+        result = _parse_claude_session_stats(session_name, files, now)
         _session_stats_cache[session_name] = result
         return result
 

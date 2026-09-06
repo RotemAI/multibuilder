@@ -452,8 +452,8 @@
 
   <!-- Context/token status, as Claude Code shows above its prompt. Hidden until
        the agent has actually reported usage, so it never shows empty zeros. -->
-  {#if usage}
-    <div class="flex shrink-0 items-center gap-2 border-t border-mk-line px-3 py-1 text-[10px] text-mk-comment">
+  <div class="flex shrink-0 items-center gap-2 border-t border-mk-line px-3 py-1 text-[10px] text-mk-comment">
+    {#if usage}
       {#if usage.ctxWindowSize}
         <span class={usageTone(usage.contextPct || 0)} title="Context used of the model's window">
           {usage.contextPct ?? 0}% context
@@ -469,21 +469,32 @@
           ></span>
         </span>
       {/if}
-      <span title="Total tokens this session">{compactNumber(usage.totalTokens)} tokens</span>
+      <span title="{usage.messageCount} turns · {compactNumber(usage.totalInput)} in · {compactNumber(usage.totalOutput)} out">
+        {compactNumber(usage.totalTokens)} tokens
+      </span>
       {#if usage.estimatedCost}
-        <span title="Estimated cost">${Number(usage.estimatedCost).toFixed(2)}</span>
+        <span title="Estimated cost at list prices">${Number(usage.estimatedCost).toFixed(2)}</span>
       {/if}
-      <button
-        class="ml-auto flex items-center gap-1 rounded-sm px-1.5 py-0.5 hover:bg-mk-line hover:text-mk-fg disabled:opacity-40"
-        title="Compact the conversation to free up context (/compact)"
-        disabled={compacting}
-        onclick={compact}
-      >
-        {#if compacting}<Loader size={10} class="animate-spin" />{:else}<Minimize2 size={10} />{/if}
-        Compact
-      </button>
-    </div>
-  {/if}
+      {#if usage.model && usage.model !== 'unknown'}
+        <span class="truncate text-mk-muted" title="Model for the most recent turn">{usage.model}</span>
+      {/if}
+    {:else}
+      <span class="text-mk-muted">No usage reported yet</span>
+    {/if}
+
+    <!-- Outside the usage block on purpose: compaction is most needed exactly
+         when usage has not been read yet, and hiding the control there left no
+         way to run /compact at all. -->
+    <button
+      class="ml-auto flex items-center gap-1 rounded-sm px-1.5 py-0.5 hover:bg-mk-line hover:text-mk-fg disabled:opacity-40"
+      title="Compact the conversation to free up context (/compact)"
+      disabled={compacting || !target}
+      onclick={compact}
+    >
+      {#if compacting}<Loader size={10} class="animate-spin" />{:else}<Minimize2 size={10} />{/if}
+      Compact
+    </button>
+  </div>
 
   <!-- Composer: input first, controls beneath — the Claude Code arrangement -->
   <div class="border-t border-mk-line p-2">
