@@ -1156,6 +1156,65 @@ class TestSshIdeSafety:
             else:
                 raise AssertionError(f"{path}: configure() accepted an unknown name")
 
+    def test_slash_commands_are_not_written_into_chat_history(self):
+        """/compact is a control the UI issued, not something the user said.
+
+        Recording it put a "/compact" bubble in the transcript every time the
+        Compact button was pressed.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_send_command)
+        assert 'if not body.command.lstrip().startswith("/"):' in source
+
+    def test_slash_commands_get_time_for_the_command_menu(self):
+        """Enter must land after the agent's slash menu has filtered.
+
+        Typing "/compact" opens a command menu; Enter sent 250ms later selected
+        nothing and the text sat unsubmitted in the input box -- the reason the
+        Compact button appeared to do nothing.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_send_command)
+        assert 'startswith("/") else 0.25' in source
+
+    def test_sessions_sharing_a_cwd_do_not_share_history(self):
+        """Two sessions in one folder must not read each other's transcript.
+
+        Both agents store transcripts BY DIRECTORY, and several tmux sessions
+        routinely share a working directory -- so every session there sees the
+        same candidate files. Once a session is matched to a transcript the
+        binding is remembered, or later turns drift onto a sibling's chat.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app._resolve_session_transcript)
+        assert "transcript_path" in source, "no sticky per-session binding"
+        # The binding is validated before reuse, so a deleted file re-resolves.
+        assert "os.path.exists" in source
+
+    def test_connection_update_keeps_a_blank_password(self):
+        """A blank password field means "keep", never "clear".
+
+        The stored secret is never sent to the browser, so treating an empty
+        field as a deletion would wipe the credential on every save.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_update_ssh_connection)
+        assert "if body.password:" in source, "blank password must be ignored"
+        # Editing must not be able to change ownership or kind.
+        assert '"id"' not in source.split("changes: dict")[1].split("await")[0]
+
     def test_claude_sessions_find_claude_transcripts(self):
         """A Claude session must read Claude's transcript store, not Codex's.
 

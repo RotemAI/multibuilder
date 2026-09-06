@@ -5864,7 +5864,21 @@ def _resolve_session_transcript(session_name: str, last_user_text: str):
     files = _find_session_jsonl_files(session_name)
     if not files:
         return None
+
+    # Stick to the transcript this session has already been matched to.
+    #
+    # Several tmux sessions routinely share one working directory, and both
+    # agents store transcripts BY DIRECTORY -- so every session in that folder
+    # sees the same candidate files and their histories bleed into each other.
+    # Once a session is matched, the binding is remembered so later turns
+    # cannot drift onto a sibling's conversation.
+    entry = cache.setdefault(session_name, {})
+    bound = entry.get("transcript_path")
+    if bound and bound in files and os.path.exists(bound):
+        return bound
+
     if len(files) == 1:
+        entry["transcript_path"] = files[0]
         return files[0]
     want = _norm_text(last_user_text)
     if not want:
@@ -5873,6 +5887,7 @@ def _resolve_session_transcript(session_name: str, last_user_text: str):
     for path in sorted(files, key=os.path.getmtime, reverse=True):
         lu = _norm_text(_last_genuine_user_text(path))
         if lu and (lu.startswith(key) or key in lu):
+            entry["transcript_path"] = path
             return path
     return None
 
@@ -8816,6 +8831,84 @@ async def api_set_workspace_root(
     return JSONResponse({"ok": True, "connection": _ssh_public_profile(updated or {})})
 
 
+@app.patch("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}")
+async def api_update_ssh_connection(
+    request: Request, session_name: str, connection_id: str, body: SSHConnectionBody
+):
+    """Edit a stored connection's settings.
+
+    Only the fields a user can meaningfully change are writable; the id, kind
+    and owner are fixed. Credentials are re-sealed through the same vault path
+    as creation, and an empty password/key means "leave the stored one alone"
+    rather than "clear it" -- the form never receives the existing secret, so
+    treating blank as a delete would wipe it on every save.
+    """
+    _session, error = _ssh_ide_session_or_response(request, session_name)
+    if error:
+        return error
+    profile, error = _ssh_profile_or_response(request, session_name, connection_id)
+    if error:
+        return error
+
+    changes: dict = {}
+    label = body.label.strip()[:80]
+    if label:
+        changes["label"] = label
+
+    if not _is_local_profile(profile):
+        host = body.host.strip()
+        username = body.username.strip()
+        if host and not _valid_ssh_host(host):
+            return JSONResponse({"error": "Enter a valid hostname or IP address"}, status_code=400)
+        if username and not _SSH_USER_RE.fullmatch(username):
+            return JSONResponse({"error": "Enter a valid SSH username"}, status_code=400)
+        if not 1 <= body.port <= 65535:
+            return JSONResponse({"error": "SSH port must be between 1 and 65535"}, status_code=400)
+        identity_file = _normalized_ssh_identity_file(body.identity_file)
+        if identity_file is None and body.identity_file.strip():
+            return JSONResponse({"error": "Identity file must be a readable path"}, status_code=400)
+        if host:
+            changes["host"] = host
+        if username:
+            changes["username"] = username
+        changes["port"] = int(body.port)
+        if identity_file:
+            changes["identity_file"] = identity_file
+        auth_mode = body.auth_mode.strip().lower()
+        if auth_mode in {"agent", "password", "key"}:
+            changes["auth_mode"] = auth_mode
+        if body.password:
+            changes["password_enc"] = _ssh_vault_encrypt(body.password, connection_id)
+            changes["has_password"] = True
+
+    root = body.workspace_root.strip()
+    if root:
+        if _is_local_profile(profile):
+            denied = _local_root_denied(request, root)
+            if denied:
+                return denied
+            normalized = _normalized_local_root(root)
+            if normalized is None:
+                return JSONResponse(
+                    {"error": "Local workspace folder is missing or is not a directory"},
+                    status_code=400,
+                )
+            changes["workspace_root"] = normalized
+        else:
+            changes["workspace_root"] = root
+
+    if not changes:
+        return JSONResponse({"error": "Nothing to update"}, status_code=400)
+
+    await asyncio.to_thread(_ssh_update_profile, session_name, connection_id, changes)
+    await asyncio.to_thread(
+        _append_ssh_ide_audit, _current_user(request), session_name, profile,
+        "connection_updated",
+    )
+    updated, _err = _ssh_profile_or_response(request, session_name, connection_id)
+    return JSONResponse({"ok": True, "connection": _ssh_public_profile(updated or profile)})
+
+
 @app.delete("/api/sessions/{session_name}/ide/ssh-connections/{connection_id}")
 async def api_delete_ssh_connection(request: Request, session_name: str, connection_id: str):
     _session, error = _ssh_ide_session_or_response(request, session_name)
@@ -11751,21 +11844,31 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
                 ["tmux", "send-keys", "-t", agent_target, "-l", cmd_text],
                 capture_output=True, text=True, timeout=5
             )
-            await asyncio.sleep(0.25)
+            # A leading "/" opens the agent's slash-command menu, which filters
+            # as the text arrives. Enter sent too early selects nothing (or the
+            # wrong entry) and the command sits unsubmitted in the box, which is
+            # why /compact appeared to do nothing.
+            await asyncio.sleep(0.9 if cmd_text.lstrip().startswith("/") else 0.25)
             # Submit as a separate, explicit carriage-return key event.
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", agent_target, "C-m"],
                 capture_output=True, text=True, timeout=5
             )
-        # Record user message in chat history
+        # Record user message in chat history.
+        #
+        # A slash command (/compact, /clear) is a control the UI issued, not
+        # something the user said, so it is not written into the transcript --
+        # it would otherwise show up as a chat bubble every time the Compact
+        # button was pressed.
         now = time.time()
-        entry = cache.setdefault(session_name, {})
-        if "messages" not in entry:
-            entry["messages"] = _load_session_messages(session_name)
-        entry["messages"].append({
-            "role": "user", "text": body.command, "ts": now
-        })
-        _save_messages()
+        if not body.command.lstrip().startswith("/"):
+            entry = cache.setdefault(session_name, {})
+            if "messages" not in entry:
+                entry["messages"] = _load_session_messages(session_name)
+            entry["messages"].append({
+                "role": "user", "text": body.command, "ts": now
+            })
+            _save_messages()
         try:
             prompt_user = _current_user(request) or _user_for_session(session_name)
             if prompt_user:

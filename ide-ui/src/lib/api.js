@@ -170,6 +170,13 @@ export const api = {
 
   // tmux is the source of truth for which terminals exist, so the tab bar is
   // restored from the server rather than from browser state that can drift.
+  updateConnection: (id, body) =>
+    request(conn(id, ''), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
   listTerminals: (id) => request(conn(id, '/terminals')),
 
   closeTerminal: (id, index) =>

@@ -6,10 +6,17 @@
 
   // Codex and Claude are both agents running inside a tmux session, so the
   // "provider" is really which session the prompt is delivered to.
-  let { sessions = [], session = '', rootPath = '' } = $props()
+  // `target` is bindable so the panel header (in Ide.svelte) can own the
+  // session picker: the header is where the close button lives, and two
+  // "AI Agent" titles stacked on top of each other read as a bug.
+  let { sessions = [], session = '', rootPath = '', target = $bindable('') } = $props()
+
+  // Adopt a sensible default when the parent has not chosen one yet.
+  $effect(() => {
+    if (!target && (session || sessions[0])) target = session || sessions[0]
+  })
 
   let question = $state('')
-  let target = $state(session || sessions[0] || '')
   let sending = $state(false)
   let pollRate = 0
   let agentBusy = $state(false)
@@ -359,20 +366,6 @@
 <svelte:window onclick={(e) => { if (!e.target.closest?.('[data-menu]')) menu = '' }} />
 
 <div class="flex h-full min-h-0 flex-col bg-mk-bg text-mk-fg">
-  <!-- Header: which session answers -->
-  <div class="flex items-center gap-2 border-b border-mk-line px-3 py-1.5">
-    <Sparkles size={13} class="shrink-0 text-mk-green" />
-    <span class="text-[11px] font-semibold tracking-wide text-mk-muted uppercase">AI Agent</span>
-    <select
-      class="ml-auto min-w-0 max-w-[55%] truncate rounded-sm border border-mk-line bg-mk-input px-1.5 py-0.5 text-[11px] text-mk-fg outline-none focus:border-mk-green"
-      bind:value={target}
-      title="Agent session that answers"
-    >
-      {#each sessions as name (name)}
-        <option value={name}>{name}</option>
-      {/each}
-    </select>
-  </div>
 
   <!-- Transcript -->
   <div
@@ -472,9 +465,6 @@
       <span title="{usage.messageCount} turns · {compactNumber(usage.totalInput)} in · {compactNumber(usage.totalOutput)} out">
         {compactNumber(usage.totalTokens)} tokens
       </span>
-      {#if usage.estimatedCost}
-        <span title="Estimated cost at list prices">${Number(usage.estimatedCost).toFixed(2)}</span>
-      {/if}
       {#if usage.model && usage.model !== 'unknown'}
         <span class="truncate text-mk-muted" title="Model for the most recent turn">{usage.model}</span>
       {/if}

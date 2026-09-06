@@ -17,10 +17,98 @@
     Files, GitBranch, MessageSquare, Server, Plus, Trash2, SquareTerminal,
     ExternalLink, FolderOpen, FileCode2, X, PanelBottom, Circle, CircleDot,
     CircleCheck, CircleAlert, Search, MonitorSmartphone, Settings, CircleUser,
-    Ellipsis, PanelLeft, ChevronDown,
+    Ellipsis, PanelLeft, ChevronDown, Loader, Settings2,
   } from 'lucide-svelte'
 
   let { sessions = [], session = '', rootPath = '' } = $props()
+
+  // The agent panel's own session list and selection. Kept here because the
+  // picker lives in the panel header; a newly created session is appended
+  // without a page reload so it can be used immediately.
+  let chatSessions = $state([...sessions])
+  let chatTarget = $state(session || sessions[0] || '')
+  let creatingSession = $state(false)
+
+  // Editing an existing connection's settings.
+  let showSettings = $state(false)
+  let savingSettings = $state(false)
+  let settingsForm = $state({
+    label: '', host: '', username: '', port: 22,
+    identity_file: '', password: '', workspace_root: '',
+  })
+
+  /** Open the settings form from anywhere: reveal the panel that holds it. */
+  function showConnectionSettings() {
+    if (!ide.connection) return
+    view = 'remote'
+    sidebarOpen = true
+    if (!showSettings) openConnectionSettings()
+  }
+
+  function openConnectionSettings() {
+    const c = ide.connection
+    if (!c) return
+    settingsForm = {
+      label: c.label || '',
+      host: c.host || '',
+      username: c.username || '',
+      port: c.port || 22,
+      identity_file: c.identity_file || '',
+      // Never prefilled: the stored secret is not sent to the browser, and a
+      // blank field means "keep it".
+      password: '',
+      workspace_root: c.workspace_root || '',
+    }
+    showSettings = !showSettings
+  }
+
+  async function saveConnectionSettings() {
+    if (!ide.connection || savingSettings) return
+    savingSettings = true
+    try {
+      const body = { ...settingsForm, port: Number(settingsForm.port) || 22 }
+      if (!body.password) delete body.password
+      await api.updateConnection(ide.connection.id, body)
+      await ide.loadConnections?.()
+      showSettings = false
+      ide.setStatus('Connection settings saved')
+    } catch (error) {
+      ide.setStatus(error.message || 'Could not save connection settings')
+    } finally {
+      savingSettings = false
+    }
+  }
+
+  async function newAgentSession() {
+    if (creatingSession) return
+    creatingSession = true
+    try {
+      // Name it after the workspace so the list stays readable, and keep it
+      // unique — the API rejects a duplicate name outright.
+      const stem = (ide.connection?.label || session || 'agent')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 20) || 'agent'
+      let name = stem
+      for (let n = 2; chatSessions.includes(name); n += 1) name = `${stem}-${n}`
+      const response = await fetch(`${rootPath}/api/sessions/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, agent: 'claude' }),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.error || 'Could not create session')
+      const created = data.session || data.name || name
+      if (!chatSessions.includes(created)) chatSessions = [...chatSessions, created]
+      chatTarget = created
+      ide.setStatus(`Agent session "${created}" created`)
+    } catch (error) {
+      ide.setStatus(error.message || 'Could not create agent session')
+    } finally {
+      creatingSession = false
+    }
+  }
 
   let view = $state('files')          // files | git | remote
   // Chat lives in its own right-hand pane (like VS Code's secondary side bar)
@@ -429,12 +517,56 @@
                 <Plus size={13} />
               </button>
               {#if ide.connection}
+                <button class="rounded-sm border border-vs-line px-2 py-1 text-xs hover:bg-vs-hover"
+                  title="Connection settings" aria-label="Connection settings"
+                  onclick={openConnectionSettings}>
+                  <Settings2 size={13} />
+                </button>
                 <button class="rounded-sm border border-vs-line px-2 py-1 text-xs hover:bg-vs-hover hover:text-vs-red"
                   title="Remove workspace" aria-label="Remove workspace" onclick={removeConnection}>
                   <Trash2 size={13} />
                 </button>
               {/if}
             </div>
+
+            {#if showSettings && ide.connection}
+              <!-- Editing an existing connection. Password and key are never
+                   sent back to the browser, so a blank field here means "keep
+                   what is stored", not "clear it". -->
+              <div class="flex flex-col gap-1.5 rounded-sm border border-vs-line bg-vs-panel p-2">
+                <span class="text-[11px] font-semibold tracking-wide uppercase text-vs-muted">
+                  {isLocal ? 'Folder settings' : 'SSH connection settings'}
+                </span>
+                <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+                  placeholder="Label" bind:value={settingsForm.label} />
+                {#if !isLocal}
+                  <div class="flex gap-1">
+                    <input class="min-w-0 flex-1 rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+                      placeholder="Host" bind:value={settingsForm.host} />
+                    <input class="w-16 rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+                      type="number" min="1" max="65535" placeholder="Port" bind:value={settingsForm.port} />
+                  </div>
+                  <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+                    placeholder="Username" bind:value={settingsForm.username} />
+                  <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+                    placeholder="Identity file (optional)" bind:value={settingsForm.identity_file} />
+                  <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+                    type="password" autocomplete="new-password"
+                    placeholder="Password — leave blank to keep current"
+                    bind:value={settingsForm.password} />
+                {/if}
+                <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
+                  placeholder="Workspace folder" bind:value={settingsForm.workspace_root} />
+                <div class="flex gap-1">
+                  <button class="flex-1 rounded-sm bg-vs-status px-2 py-1 text-xs text-white hover:brightness-110 disabled:opacity-40"
+                    disabled={savingSettings} onclick={saveConnectionSettings}>
+                    {savingSettings ? 'Saving…' : 'Save'}
+                  </button>
+                  <button class="rounded-sm border border-vs-line px-2 py-1 text-xs hover:bg-vs-hover"
+                    onclick={() => (showSettings = false)}>Cancel</button>
+                </div>
+              </div>
+            {/if}
 
             {#if ide.connection && ide.connectionState !== 'connected'}
               {#if !isLocal && !ide.connection.has_password}
@@ -620,13 +752,36 @@
         class="flex shrink-0 flex-col overflow-hidden border-l border-vs-border bg-vs-panel"
         style="width: {chatWidth}px"
       >
-        <div class="flex items-center gap-2 border-b border-vs-border px-3 py-1.5">
-          <MessageSquare size={13} />
-          <span class="flex-1 text-[11px] font-semibold tracking-wide uppercase">AI Agent</span>
-          <button class="rounded-sm p-0.5 hover:bg-vs-hover" title="Hide chat" aria-label="Hide chat"
+        <div class="flex items-center gap-1.5 border-b border-vs-border px-3 py-1.5">
+          <MessageSquare size={13} class="shrink-0" />
+          <span class="shrink-0 text-[11px] font-semibold tracking-wide uppercase">AI Agent</span>
+          <!-- Session picker sits with the close button rather than in a second
+               header of its own. Each session keeps its own conversation, so
+               this is also what switches which history is shown. -->
+          <select
+            class="ml-auto min-w-0 flex-1 truncate rounded-sm border border-vs-line bg-vs-input px-1.5 py-0.5
+                   text-[11px] text-vs-fg outline-none focus:border-vs-accent"
+            bind:value={chatTarget}
+            title="Agent session — each has its own history"
+          >
+            {#each chatSessions as name (name)}
+              <option value={name}>{name}</option>
+            {/each}
+          </select>
+          <button
+            class="shrink-0 rounded-sm p-0.5 hover:bg-vs-hover disabled:opacity-40"
+            title="New agent session" aria-label="New agent session"
+            disabled={creatingSession}
+            onclick={newAgentSession}
+          >
+            {#if creatingSession}<Loader size={13} class="animate-spin" />{:else}<Plus size={14} />{/if}
+          </button>
+          <button class="shrink-0 rounded-sm p-0.5 hover:bg-vs-hover" title="Hide AI Agent" aria-label="Hide AI Agent"
             onclick={() => (showChat = false)}><X size={14} /></button>
         </div>
-        <div class="min-h-0 flex-1"><Chat {sessions} {session} {rootPath} /></div>
+        <div class="min-h-0 flex-1">
+          <Chat sessions={chatSessions} {session} {rootPath} bind:target={chatTarget} />
+        </div>
       </aside>
     {/if}
   </div>
@@ -634,10 +789,18 @@
   <!-- Status bar -->
   <footer class="flex shrink-0 items-center gap-3 bg-vs-status px-3 py-0.5 text-[12px] text-white">
     {#if ide.connection}
-      <span class="flex items-center gap-1" title={ide.connection.workspace_root}>
+      <!-- Clicking the connection opens its settings, VS Code's remote-indicator
+           pattern. The gear in the Workspaces panel is only visible on that
+           view, so this is the way to reach it from the editor or terminal. -->
+      <button
+        class="flex items-center gap-1 rounded-sm px-1 hover:bg-white/20"
+        title="{ide.connection.workspace_root} — click for connection settings"
+        onclick={showConnectionSettings}
+      >
         {#if isLocal}<FolderOpen size={12} />{:else}<Server size={12} />{/if}
         {ide.connection.label}
-      </span>
+        <Settings2 size={11} class="opacity-70" />
+      </button>
     {/if}
     {#if ide.gitBranch}
       <span class="flex items-center gap-1"><GitBranch size={12} /> {ide.gitBranch}</span>
