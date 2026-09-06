@@ -333,8 +333,11 @@
     if (!target || compacting) return
     compacting = true
     try {
+      // Dedicated endpoint: it submits the command AND reads back what the
+      // agent said. The reply lands in the terminal, not the transcript, so
+      // without the outcome the button looked like it did nothing at all.
       const response = await fetch(
-        `${rootPath}/api/sessions/${encodeURIComponent(target)}/send`,
+        `${rootPath}/api/sessions/${encodeURIComponent(target)}/compact`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -343,6 +346,7 @@
       )
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(data.error || 'Could not compact')
+      ide.setStatus(data.outcome || 'Compact requested')
       setTimeout(loadUsage, 4000)
     } catch (error) {
       ide.setStatus(error.message || 'Could not compact context')

@@ -1156,6 +1156,30 @@ class TestSshIdeSafety:
             else:
                 raise AssertionError(f"{path}: configure() accepted an unknown name")
 
+    def test_compact_reports_the_agents_own_answer(self):
+        """The button must surface the outcome, not fire silently.
+
+        The agent answers a slash command in its TERMINAL, and slash commands
+        are deliberately not recorded as chat messages -- so the panel showed
+        nothing whatsoever even when the command had run and the agent had
+        replied "Not enough messages to compact".
+        """
+        import app
+
+        pane = "\n".join([
+            "❯ /compact",
+            "  ⎿  Not enough messages to compact.",
+            "   ✘ Auto-update failed: no write permission to npm prefix",
+        ])
+        assert app._compact_outcome(pane, "/compact") == "Not enough messages to compact."
+
+        ok = "❯ /compact\n  ⎿  Compacted conversation: 42 messages summarised."
+        assert app._compact_outcome(ok, "/compact").startswith("Compacted")
+
+        # No echoed command, or nothing after it, yields no false outcome.
+        assert app._compact_outcome("unrelated output", "/compact") == ""
+        assert app._compact_outcome("❯ /compact", "/compact") == ""
+
     def test_slash_commands_are_not_written_into_chat_history(self):
         """/compact is a control the UI issued, not something the user said.
 

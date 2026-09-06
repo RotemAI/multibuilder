@@ -11725,6 +11725,75 @@ def _get_session_model(session_name: str) -> str:
 
 
 
+class CompactBody(BaseModel):
+    command: str = "/compact"
+
+
+@app.post("/api/sessions/{session_name}/compact")
+async def api_compact_session(request: Request, session_name: str, body: CompactBody):
+    """Run /compact and report what the agent actually said.
+
+    The agent answers in its terminal, not in the chat transcript, and slash
+    commands are deliberately not recorded as chat messages -- so without this
+    the button fired, the agent replied "Not enough messages to compact", and
+    the panel showed nothing whatsoever.
+    """
+    _sessions, session = _find_session_for_user(session_name, _current_user(request))
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    command = (body.command or "/compact").strip()
+    if not command.startswith("/") or len(command) > 64:
+        return JSONResponse({"error": "Not a slash command"}, status_code=400)
+
+    target = _agent_pane_target(session_name)
+    try:
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", target, "-l", command],
+            capture_output=True, text=True, timeout=5,
+        )
+        # The command menu filters as the text arrives; Enter sent too early
+        # selects nothing and the text sits unsubmitted.
+        await asyncio.sleep(0.9)
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", target, "C-m"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+    # Give the agent a moment, then read back its answer line.
+    outcome = ""
+    for _ in range(8):
+        await asyncio.sleep(0.6)
+        try:
+            pane = await asyncio.to_thread(capture_pane_recent, session_name, 20)
+        except Exception:  # noqa: BLE001 - a failed read just means no detail
+            break
+        outcome = _compact_outcome(pane or "", command)
+        if outcome:
+            break
+    return JSONResponse({"ok": True, "outcome": outcome})
+
+
+def _compact_outcome(pane: str, command: str) -> str:
+    """The agent's reply to a slash command, read from its pane.
+
+    Results are printed on a "⎿" continuation line under the echoed command.
+    """
+    lines = [line.rstrip() for line in pane.splitlines()]
+    for index in range(len(lines) - 1, -1, -1):
+        if command in lines[index]:
+            for follow in lines[index + 1: index + 4]:
+                text = follow.strip().lstrip("⎿").strip()
+                if not text or text.startswith("✘"):
+                    continue
+                return text[:200]
+            break
+    return ""
+
+
 @app.get("/api/sessions/{session_name}/stats")
 async def api_session_stats(session_name: str):
     """Per-session token usage, cost, and rate limit detection."""
