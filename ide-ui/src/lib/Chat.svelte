@@ -23,7 +23,7 @@
   let pending = $state('')
   let busyDetail = $state('')
   // "Working" covers both: our request in flight, and the agent still writing.
-  const working = $derived(sending || agentBusy)
+  const working = $derived(sending || agentBusy || !!pending)
   let messages = $state([])
   let error = $state('')
   let listEl = $state(null)
@@ -93,7 +93,7 @@
       // Follow along while a reply streams in, not only when a message is
       // added -- otherwise the text grows below the fold and the user has to
       // chase it. Skipped if they have scrolled up to read history.
-      if ((grew || streamed) && atBottom) queueMicrotask(scrollToEnd)
+      if ((grew || streamed || working) && atBottom) queueMicrotask(scrollToEnd)
     } catch (exc) {
       error = exc.message || 'Could not load chat'
     }
@@ -101,8 +101,11 @@
 
   // Poll faster while a turn is in flight so the reply lands promptly, and back
   // off when idle so an open panel is not hammering the server.
+  // Streaming reads as laggy well before it is actually slow, so poll hard
+  // while a turn is live and back off sharply when idle. The endpoint costs
+  // ~55ms, so 600ms leaves the server almost entirely idle between polls.
   const POLL_IDLE = 3000
-  const POLL_BUSY = 1000
+  const POLL_BUSY = 600
   $effect(() => {
     const wanted = working ? POLL_BUSY : POLL_IDLE
     if (!target || pollRate === wanted) return
@@ -232,7 +235,11 @@
       if (textareaEl) textareaEl.style.height = 'auto'
       messages = [...messages, { role: 'user', text, ts: Date.now() / 1000, _local: true }]
       queueMicrotask(scrollToEnd)
-      setTimeout(loadMessages, 1200)
+      // Poll straight away rather than after a fixed delay: the agent starts
+      // working immediately, and waiting 1.2s just to notice was most of the
+      // gap between pressing send and seeing anything happen.
+      loadMessages()
+      setTimeout(loadMessages, 400)
     } catch (exc) {
       ide.setStatus(exc.message || 'Could not send prompt')
     } finally {
@@ -363,6 +370,19 @@
   }
 
   // VS Code's thresholds: quiet until it matters, then amber, then red.
+  // Compaction needs a conversation to compact. The agent refuses below its own
+  // internal threshold, so offer the control only once the context is actually
+  // carrying something: either a meaningful share of the window, or enough
+  // tokens to matter when no window size is reported.
+  const COMPACT_MIN_PCT = 15
+  const COMPACT_MIN_TOKENS = 20000
+  const canCompact = $derived(
+    !!target &&
+      !!usage &&
+      ((usage.ctxWindowSize && (usage.contextPct || 0) >= COMPACT_MIN_PCT) ||
+        (!usage.ctxWindowSize && (usage.lastInputTokens || 0) >= COMPACT_MIN_TOKENS)),
+  )
+
   const usageTone = (pct) =>
     pct >= 90 ? 'text-vs-red' : pct >= 70 ? 'text-vs-yellow' : 'text-vs-muted'
 </script>
@@ -469,6 +489,14 @@
       <span title="{usage.messageCount} turns · {compactNumber(usage.totalInput)} in · {compactNumber(usage.totalOutput)} out">
         {compactNumber(usage.totalTokens)} tokens
       </span>
+      {#if usage.shared}
+        <!-- Several agent sessions share this folder and transcripts are stored
+             per folder, so these totals cover all of them. Labelled rather than
+             hidden: silently attributing another session's usage to this one
+             would be worse than saying so. -->
+        <span class="text-mk-muted"
+          title="Several sessions share this folder — totals cover all of them">shared</span>
+      {/if}
       {#if usage.model && usage.model !== 'unknown'}
         <span class="truncate text-mk-muted" title="Model for the most recent turn">{usage.model}</span>
       {/if}
@@ -476,18 +504,20 @@
       <span class="text-mk-muted">No usage reported yet</span>
     {/if}
 
-    <!-- Outside the usage block on purpose: compaction is most needed exactly
-         when usage has not been read yet, and hiding the control there left no
-         way to run /compact at all. -->
-    <button
-      class="ml-auto flex items-center gap-1 rounded-sm px-1.5 py-0.5 hover:bg-mk-line hover:text-mk-fg disabled:opacity-40"
-      title="Compact the conversation to free up context (/compact)"
-      disabled={compacting || !target}
-      onclick={compact}
-    >
-      {#if compacting}<Loader size={10} class="animate-spin" />{:else}<Minimize2 size={10} />{/if}
-      Compact
-    </button>
+    <!-- Only offered once there is enough context to be worth compacting.
+         Below the threshold the agent just answers "Not enough messages to
+         compact", so the button was a control that could not do anything. -->
+    {#if canCompact}
+      <button
+        class="ml-auto flex items-center gap-1 rounded-sm px-1.5 py-0.5 hover:bg-mk-line hover:text-mk-fg disabled:opacity-40"
+        title="Compact the conversation to free up context (/compact)"
+        disabled={compacting}
+        onclick={compact}
+      >
+        {#if compacting}<Loader size={10} class="animate-spin" />{:else}<Minimize2 size={10} />{/if}
+        Compact
+      </button>
+    {/if}
   </div>
 
   <!-- Composer: input first, controls beneath — the Claude Code arrangement -->

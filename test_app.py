@@ -1156,6 +1156,21 @@ class TestSshIdeSafety:
             else:
                 raise AssertionError(f"{path}: configure() accepted an unknown name")
 
+    def test_session_usage_is_not_shared_across_a_cwd(self):
+        """Two sessions in one folder must not report each other's tokens.
+
+        Transcripts are stored BY DIRECTORY, so counting every file in the
+        folder gave every session there identical totals -- one session's usage
+        showing up as another's.
+        """
+        import inspect
+
+        from services import usage as usage_service
+
+        source = inspect.getsource(usage_service._parse_session_stats)
+        assert "_resolve_session_transcript" in source, "stats are not session-bound"
+        assert "files = [bound]" in source
+
     def test_compact_reports_the_agents_own_answer(self):
         """The button must surface the outcome, not fire silently.
 
@@ -1327,6 +1342,23 @@ class TestSshIdeSafety:
             {"type": "user", "message": {"content": [{"type": "tool_result"}]}}
         )
         assert not app._claude_is_user_turn({"type": "assistant", "message": {}})
+
+    def test_chat_detects_activity_rather_than_reading_a_stale_cache(self):
+        """The panel must probe activity, not trust whatever last wrote it.
+
+        _activity_state is only populated when something calls detect_activity
+        — the dashboard's session list, typically. With ONLY the IDE open it
+        stayed empty, so `busy` was permanently false: no streaming, no
+        "Generating", and the panel sat silent until the whole turn landed.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_ide_chat_messages)
+        assert "await async_detect_activity(session_name)" in source
+        # The cached view remains the fallback, not the primary source.
+        assert "_activity_state.get(session_name)" in source
 
     def test_chat_streams_the_in_flight_turn_without_persisting_it(self):
         """A partial read must never become the stored reply.

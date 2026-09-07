@@ -7406,11 +7406,27 @@ stores_service.configure(
 # Wire services/usage.py once its helpers exist. AUTH_SECRET and DEFAULT_MODEL
 # are passed as current values here and kept in step by the module-level
 # attribute forwarding below, which is what tests patch through.
+def _session_started_at(session_name: str) -> float:
+    """When this tmux session was created, or 0 when unknown."""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", f"{session_name}:",
+             "#{session_created}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return float(result.stdout.strip() or 0)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
+
+
 usage_service.configure(
     _api_http=_api_http,
     _iter_prompt_audit_reverse=_iter_prompt_audit_reverse,
     _session_config_base=_session_config_base,
     _session_agent_kind=_session_agent_kind,
+    _resolve_session_transcript=_resolve_session_transcript,
+    _session_messages=_load_session_messages,
+    _session_started_at=_session_started_at,
     _user_codex_config_dir=_user_codex_config_dir,
     AUTH_SECRET=AUTH_SECRET,
     DEFAULT_MODEL=DEFAULT_MODEL,
@@ -8509,7 +8525,15 @@ async def api_ide_chat_messages(request: Request, session_name: str, limit: int 
     # Report whether the agent is mid-turn. The composer only knew about its own
     # POST, which finishes in milliseconds, so the panel looked idle for the
     # minutes the agent was actually working.
-    activity = _activity_state.get(session_name) or {}
+    # Detect activity here rather than reading whatever the dashboard poll last
+    # left behind. With only the IDE open nothing refreshed that cache, so
+    # `busy` was permanently false: no streaming, no "Generating", and the
+    # panel sat silent until the whole turn finished. The probe is a pane
+    # capture and costs ~15ms.
+    try:
+        activity = await async_detect_activity(session_name)
+    except Exception:  # noqa: BLE001 - fall back to the cached view
+        activity = _activity_state.get(session_name) or {}
     busy = str(activity.get("status") or "") == "busy"
     # While a turn is in flight, hand back what the agent has written SO FAR.
     #
@@ -11775,6 +11799,8 @@ async def api_compact_session(request: Request, session_name: str, body: Compact
         if outcome:
             break
     return JSONResponse({"ok": True, "outcome": outcome})
+
+
 
 
 def _compact_outcome(pane: str, command: str) -> str:

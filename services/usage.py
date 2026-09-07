@@ -39,6 +39,9 @@ _api_http = None
 _iter_prompt_audit_reverse = None
 _session_config_base = None
 _session_agent_kind = None
+_resolve_session_transcript = None
+_session_messages = None
+_session_started_at = None
 _user_codex_config_dir = None
 # Injected as accessors, not values: both are rebound at runtime in app.py, so a
 # snapshot taken at import would go stale.
@@ -858,7 +861,9 @@ def _claude_turn_cost(inp: int, out: int, cache_read: int, cache_write: int, mod
     ) / 1e6
 
 
-def _parse_claude_session_stats(session_name: str, files: list, now: float) -> dict:
+def _parse_claude_session_stats(
+    session_name: str, files: list, now: float, shared: bool = False
+) -> dict:
     """Per-session token stats from Claude's transcript format.
 
     Claude records usage on ``assistant`` messages under ``message.usage``; it
@@ -954,6 +959,7 @@ def _parse_claude_session_stats(session_name: str, files: list, now: float) -> d
 
     return {
         "available": True,
+        "shared": shared,
         "model": latest_model,
         "messageCount": msg_count,
         "totalInput": total_input,
@@ -989,6 +995,48 @@ def _parse_session_stats(session_name: str) -> dict:
         return cached
 
     files = _find_session_jsonl_files(session_name)
+    # Narrow to the transcript this session is actually bound to. Several tmux
+    # sessions commonly share a working directory, and transcripts are stored
+    # BY DIRECTORY -- so counting every file in the folder reported the same
+    # totals for every session in it, mixing one session's usage into another.
+    if len(files) > 1 and _resolve_session_transcript is not None:
+        # Match on this session's own last prompt, which is what tells two
+        # transcripts in the same folder apart. Passing nothing here made the
+        # match impossible and every session fell back to the folder-wide view.
+        last_user = ""
+        if _session_messages is not None:
+            try:
+                last_user = next(
+                    (
+                        m.get("text", "")
+                        for m in reversed(_session_messages(session_name) or [])
+                        if m.get("role") == "user"
+                    ),
+                    "",
+                )
+            except Exception:  # noqa: BLE001 - no history just means no hint
+                last_user = ""
+        try:
+            bound = _resolve_session_transcript(session_name, last_user)
+        except Exception:  # noqa: BLE001
+            bound = None
+        if bound and bound in files:
+            files = [bound]
+        else:
+            # A transcript last written BEFORE this tmux session existed cannot
+            # belong to it. Pruning those often leaves exactly one candidate,
+            # which is then unambiguous.
+            started = _session_started_at(session_name) if _session_started_at else 0
+            if started:
+                live = [f for f in files if os.path.getmtime(f) >= started]
+                if len(live) == 1:
+                    files = live
+                    bound = live[0]
+        # If it still cannot be attributed, the totals below cover every
+        # transcript in this folder -- which may include a sibling session's.
+        # That is flagged rather than hidden: showing nothing was worse, and
+        # showing it unlabelled as this session's usage would be wrong.
+        shared = not bound and len(files) > 1
     if not files:
         result = {"available": False, "_ts": now}
         _session_stats_cache[session_name] = result
@@ -997,7 +1045,7 @@ def _parse_session_stats(session_name: str) -> dict:
     # Claude and Codex write completely different transcript formats; running the
     # Codex parser over a Claude transcript matches nothing and reports no usage.
     if _session_agent_kind is not None and _session_agent_kind(session_name) == "claude":
-        result = _parse_claude_session_stats(session_name, files, now)
+        result = _parse_claude_session_stats(session_name, files, now, shared)
         _session_stats_cache[session_name] = result
         return result
 
