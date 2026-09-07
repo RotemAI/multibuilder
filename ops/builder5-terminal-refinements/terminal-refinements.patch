@@ -1,0 +1,646 @@
+--- a/app.py
++++ b/app.py
+@@ -5581,6 +5581,52 @@
+     if not _strict_session_owner(session_name, owner_id) or str(_session_lifecycle.get(session_name).get("generation") or "") != generation:
+         return JSONResponse({"error": "Session changed"}, status_code=409)
+     return JSONResponse(result, headers={"Cache-Control": "no-store"})
++
++
++class RenameSessionBody(BaseModel):
++    name: str = Field(max_length=128, strict=True)
++
++
++@app.patch("/api/sessions/{session_name}/name")
++async def api_rename_session(request: Request, session_name: str, body: RenameSessionBody):
++    """Edit the visible name while preserving the session, project and conversation."""
++    user = _current_user(request)
++    if not user:
++        return JSONResponse({"error": "Not logged in"}, status_code=401)
++    owner_id = str(user["id"])
++    if not _is_valid_session_name(session_name) or not _strict_session_owner(session_name, owner_id):
++        return JSONResponse({"error": "Session not found"}, status_code=404)
++    label = body.name.strip()
++    if not label or any(ord(char) < 32 or ord(char) == 127 for char in label):
++        return JSONResponse({"error": "Enter a session name without control characters."}, status_code=400)
++    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
++
++    def mutate(data):
++        current = _session_lifecycle.get(session_name)
++        if (
++            not _strict_session_owner(session_name, owner_id)
++            or str(current.get("generation") or "") != generation
++            or current.get("desired_state") in {"deleting", "deleted", "closing"}
++        ):
++            return False
++        data.setdefault("sessions", {})[session_name] = {
++            "owner_id": owner_id, "generation": generation,
++            "manual_label": label, "updated_at": time.time(),
++        }
++        return True
++
++    def save_label():
++        # Serialize metadata changes with close/recovery for this exact session.
++        with _session_operation_lock(session_name):
++            return _session_tab_labels.update(mutate)[1]
++
++    try:
++        saved = await asyncio.to_thread(save_label)
++    except _SessionOperationBusy:
++        saved = False
++    if not saved:
++        return JSONResponse({"error": "Session changed. Refresh and try again."}, status_code=409)
++    return JSONResponse({"ok": True, "name": session_name, "tab_label": label}, headers={"Cache-Control": "no-store"})
+ 
+ 
+ @app.get("/api/me")
+@@ -18786,7 +18832,7 @@
+         row["session_id"] = secrets.token_hex(5)
+         changed = True
+     if "enabled" not in row:
+-        row["enabled"] = True
++        row["enabled"] = False
+         changed = True
+     if changed:
+         _proxy_save(conf)
+@@ -19265,7 +19311,7 @@
+     total = sum(int(u.get("bytes_up", 0)) + int(u.get("bytes_down", 0)) for u in usage.values())
+     return JSONResponse({
+         "installed": BROWSER_PROXY_CONF.parent.exists() and (CB_ROOT / "bin" / "proxy_relay.py").exists(),
+-        "enabled": bool(conf.get("enabled")),
++        "enabled": bool(conf.get("enabled") and ((conf.get("sessions") or {}).get("default") or {}).get("enabled", False)),
+         "provider": conf.get("provider", ""),
+         "host": conf.get("host", ""), "port": conf.get("port", 0),
+         "username": conf.get("username", ""), "zone": conf.get("zone", ""),
+@@ -19278,6 +19324,7 @@
+ 
+ class BrowserProxyBody(BaseModel):
+     enabled: bool | None = None
++    direct_failed: bool = Field(default=False, strict=True)
+     provider: str | None = None
+     host: str | None = None
+     port: int | None = None
+@@ -19291,6 +19338,8 @@
+ async def api_browser_proxy_set(body: BrowserProxyBody, request: Request):
+     if not _auth_admin_ok(request):
+         return JSONResponse({"error": "admin only"}, status_code=403)
++    if body.enabled is True and not body.direct_failed:
++        return JSONResponse({"error": "Try the normal IP first. Use residential only after a direct connection fails."}, status_code=400)
+     conf = _proxy_conf()
+     presets = _proxy_presets()
+     if body.provider and body.provider in presets:
+@@ -19313,13 +19362,11 @@
+     if body.country is not None:
+         conf["country"] = body.country.strip().lower()
+     if body.enabled is not None:
+-        conf["enabled"] = bool(body.enabled)
+-        # The cached exit-IP timezone belongs to the old route.
+-        for f in (CB_ROOT / "state").glob("*.geo.json"):
+-            try:
+-                f.unlink()
+-            except Exception:
+-                pass
++        conf.setdefault("sessions", {}).setdefault("default", {})["enabled"] = bool(body.enabled)
++        if body.enabled:
++            conf["enabled"] = True
++        # Only this account's cached timezone belongs to the changed route.
++        (CB_ROOT / "state" / "default.geo.json").unlink(missing_ok=True)
+     _proxy_save(conf)
+     logger.info("Browser proxy config updated (enabled=%s provider=%s user=%s)",
+                 conf.get("enabled"), conf.get("provider"), conf.get("username"))
+@@ -28660,6 +28707,11 @@
+   .tab-more-icon{display:inline-block}
+   .tab-more-model-block{display:block}
+ }
++.terminal-read-controls{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px 0;flex-shrink:0}
++.terminal-read-controls .key-btn{padding:6px 10px}
++.nav-browser-badge.working .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299;animation:nbb-blink 1s ease-in-out infinite}
++.nav-browser-badge.working{border-color:#d29922}
++.nav-browser-badge.working .nbb-glyph{filter:none}
+ .nav-plan-bars{display:flex;flex-direction:column;gap:4px;font-size:10px;min-width:125px}
+ .nav-plan-window{display:flex;align-items:center;gap:5px;white-space:nowrap}
+ .nav-plan-window>span:first-child{min-width:25px}
+@@ -28684,6 +28736,9 @@
+     <span id="plan-primary" class="nav-plan-window" style="display:none"><span id="plan-primary-label"></span><span class="nav-usage-bar" id="plan-primary-meter" role="progressbar" aria-label="Primary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-primary-fill"></span></span><span id="plan-primary-value"></span></span>
+     <span id="plan-secondary" class="nav-plan-window" style="display:none"><span id="plan-secondary-label"></span><span class="nav-usage-bar" id="plan-secondary-meter" role="progressbar" aria-label="Secondary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-secondary-fill"></span></span><span id="plan-secondary-value"></span></span>
+   </span>
++  <button class="nav-browser-badge bad" id="nav-browser-badge" type="button" title="Browser not connected" aria-label="Browser not connected" onclick="onBrowserBadgeClick()">
++    <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
++  </button>
+   <div class="nav-status-wrap">
+     <button class="nav-status-toggle" id="nav-status-toggle" type="button"
+             aria-expanded="false" aria-haspopup="menu" aria-controls="nav-status-menu"
+@@ -28721,13 +28776,6 @@
+           <span class="nav-codex-alert" id="nav-codex-alert"
+                 title="Codex health alerts — click for details"
+                 onclick="openStats();closeStatusMenu()"></span>
+-        </div>
+-        <div class="nav-status-control">
+-          <span>Browser</span>
+-          <span class="nav-browser-badge unknown" id="nav-browser-badge" style="display:none"
+-                title="Browser sign-in status" onclick="onBrowserBadgeClick()">
+-            <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
+-          </span>
+         </div>
+         <div class="codex-auth" id="codex-auth" onclick="toggleAuthPanel(event)">
+           <span class="status-dot unknown" id="codex-auth-dot"></span>
+@@ -28992,7 +29040,7 @@
+ // with a word like "Read"/"Write"/"Update"/"Add"/"Task" is never swallowed.
+ const _TOOL_PAREN_RE=/^(?:(?:Bash|BashOutput|Fetch|WebFetch|Read|Edit|MultiEdit|Write|NotebookEdit|Update|Grep|Glob|Task|Search|WebSearch|TodoWrite|Kill|Add|Agent|Artifact|Skill|Workflow|ToolSearch)\s*\(|mcp__[^(\s]+\s*\()/i;
+ // Codex verbs that are only ever emitted as a tool header, never as prose.
+-const _CODEX_VERB_RE=/^(?:Ran|Explored|Called|Searched|Listed|Viewed|Applied patch|Proposed patch|Reviewed|Running|Exploring|Reading|Editing|Writing)\b/;
++const _CODEX_VERB_RE=/^(?:Wait(?:ed|ing) for background terminal|Ran|Explored|Called|Searched|Listed|Viewed|Applied patch|Proposed patch|Reviewed|Running|Exploring|Reading|Editing|Writing)\b/;
+ // Codex file ops carry a diff stat: "Edited app.py (+12 -3)", "Added x.md (+40)".
+ // The stat is what tells them apart from prose ("Added swap and a monitor").
+ const _CODEX_FILEOP_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
+@@ -29991,7 +30039,7 @@
+   if(!rawEl)return;
+   // The live counter comes off FIRST, in both views. It changes every second,
+   // and everything below this line would otherwise re-run every second.
+-  const split=splitLiveTail((st.fullText||'').split('\n'));
++  const split=splitLiveTail(_rawVisibleText(st).split('\n'));
+   if(split.live.seen){
+     split.live.at=_nowMs();
+     st.live=split.live;
+@@ -30420,9 +30468,20 @@
+ // "Stop moving so I can read this." Freezing holds the PAINT only: polling keeps
+ // running, st.fullText keeps growing, and the agent never notices. Unfreezing
+ // renders everything that arrived in between in one go.
++async function readTerminal(action,name){
++  if((activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw'))!=='raw')switchTab(name,'raw');
++  if(!getRawState(name).fullText)await loadRaw(name);
++  if(action==='last')jumpToLastUserMessage(name);
++  else if(action==='freeze')toggleRawFreeze(name);
++  else jumpToLive(name);
++}
++function _rawVisibleText(st){
++  return st.frozen&&typeof st.frozenText==='string'?st.frozenText:(st.fullText||'');
++}
+ function toggleRawFreeze(name){
+   const st=getRawState(name);
+   st.frozen=!st.frozen;
++  if(st.frozen)st.frozenText=st.fullText||'';else delete st.frozenText;
+   st.frozenAtLines=st.frozen?(st.fullText||'').split('\n').length:0;
+   if(st.frozen){
+     updateFreezeUi(name);
+@@ -30438,13 +30497,15 @@
+ function updateFreezeUi(name){
+   const st=getRawState(name);
+   const held=_frozenNewLines(st);
+-  const btn=document.getElementById('freeze-btn-'+name);
++  for(const id of ['freeze-btn-'+name,'freeze-btn-chat-'+name]){
++  const btn=document.getElementById(id);
+   if(btn){
+     btn.classList.toggle('active',!!st.frozen);
+     btn.innerHTML=st.frozen?('&#10052; Frozen'+(held?' &middot; '+held+' new':'')):'&#10052; Freeze';
+     btn.title=st.frozen
+       ? 'The view is held still. The agent is still working and everything it writes appears the moment you unfreeze. Click to resume.'
+       : 'Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.';
++  }
+   }
+   const pill=document.getElementById('raw-frozen-'+name);
+   if(pill){
+@@ -31036,6 +31097,40 @@
+   return ((session&&session.tab_label)||(session&&session.name)||'').trim();
+ }
+ 
++function showRenameSession(name){
++  const session=sessions.find(s=>s.name===name);
++  if(!session)return;
++  const modal=document.getElementById('modal-content');
++  modal.classList.remove('modal-wide');
++  modal.innerHTML=`<h3>Rename session</h3>
++    <label for="session-rename-input">Session name</label>
++    <input id="session-rename-input" type="text" maxlength="128" value="${esc(sessionTabLabel(session))}" style="width:100%;margin:10px 0" onkeydown="if(event.key==='Enter'){event.preventDefault();renameSession('${esc(name)}')}">
++    <p id="session-rename-error" role="alert" style="color:#f85149"></p>
++    <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
++    <button id="session-rename-save" class="modal-confirm-create" onclick="renameSession('${esc(name)}')">Save name</button></div>`;
++  document.getElementById('modal-overlay').classList.add('active');
++  setTimeout(()=>{const input=document.getElementById('session-rename-input');if(input){input.focus();input.select()}},50);
++}
++async function renameSession(name){
++  const input=document.getElementById('session-rename-input');
++  const save=document.getElementById('session-rename-save');
++  const error=document.getElementById('session-rename-error');
++  if(!input||!save||save.disabled)return;
++  if(!input.value.trim()){error.textContent='Enter a session name.';input.focus();return}
++  save.disabled=true;
++  try{
++    const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/name',{
++      method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:input.value.trim()})
++    });
++    const data=await response.json();
++    if(!response.ok)throw new Error(data.error||'Could not rename the session.');
++    const session=sessions.find(s=>s.name===name);
++    if(session){session.tab_label=data.tab_label;_paintSessionTabLabel(name)}
++    if(document.getElementById('session-rename-input')===input)closeModal();
++  }catch(failure){if(document.getElementById('session-rename-error')===error)error.textContent=failure.message}
++  finally{save.disabled=false}
++}
++
+ function _paintSessionTabLabel(name){
+   const session=sessions.find(s=>s.name===name);
+   const label=document.getElementById('nav-label-'+name);
+@@ -31161,6 +31256,7 @@
+     item.dataset.session=s.name;
+     item.draggable=true;
+     item.onclick=()=>{if(!_tabOrderSuppressClick)selectSession(s.name)};
++    item.addEventListener('contextmenu',event=>{event.preventDefault();showRenameSession(s.name)});
+     item.addEventListener('dragstart',event=>{
+       _startTabOrderDrag(item);
+       event.dataTransfer.effectAllowed='move';
+@@ -31363,6 +31459,7 @@
+       <div class="tab-more-wrap">
+         <button type="button" class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" id="tab-more-toggle" aria-label="More session options" aria-expanded="false" aria-controls="tab-more-menu" onclick="toggleTabMore(event)" onkeydown="handleTabMoreKeydown(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-hidden="true">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></button>
+         <div class="tab-more-menu" id="tab-more-menu" onkeydown="handleTabMoreKeydown(event)">
++          <button type="button" class="tab-more-item" style="background:none;border:0;width:100%;text-align:left" onclick="closeTabMore();showRenameSession('${esc(s.name)}')">Rename session</button>
+           <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><button type="button" class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" aria-label="Select Codex model" aria-haspopup="true" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</button></div><div class="tab-more-model-row"><span class="tab-more-model-label">Effort</span><button type="button" class="tab-more-model-value" id="more-effort-${esc(s.name)}" title="Click to switch reasoning effort" aria-label="Select reasoning effort" aria-haspopup="true" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} &#9662;</button></div><div class="tab-more-model-sep"></div></div>
+           ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="tab-more-item tab-more-project-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab" onclick="closeTabMore()">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
+           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
+@@ -31617,6 +31714,7 @@
+   // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
+   renderSavedKeys(s.name, s);
+   refreshSavedProjectItems(s.name);
++  updateFreezeUi(s.name);
+   // Scroll chat to bottom
+   const chatEl=document.getElementById('chat-'+s.name);
+   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
+@@ -31634,10 +31732,10 @@
+         // freeze pins what is on screen, and there is nothing on screen yet.
+         const st=getRawState(s.name);
+         st.fullText=cached.text;
+-        st.userScrolledUp=false;
++        st.userScrolledUp=!!st.frozen;
+         st.painted=null;st._bodyText=null;
+-        if(st.frozen)st.frozenAtLines=(st.fullText||'').split('\n').length;
+         renderRawText(s.name,true);
++        if(st.frozen)_setRawScroll(rawEl,cached.scrollTop);
+         if(infoEl&&cached.lineCount)infoEl.textContent=cached.lineCount+' lines';
+         startRawPolling(s.name);
+       }else{
+@@ -32639,6 +32737,7 @@
+   if(notesEl&&s.notes)notesEl.textContent=s.notes;
+   renderSavedKeys(s.name, s);
+   refreshSavedProjectItems(s.name);
++  updateFreezeUi(s.name);
+   const tsDesc=document.getElementById('ts-desc-'+s.name);
+   const tsProg=document.getElementById('ts-prog-'+s.name);
+   const tsNotes=document.getElementById('ts-notes-'+s.name);
+@@ -33950,11 +34049,16 @@
+ 
+ // ── Key Bar + Slash Commands ──
+ function buildKeyBar(name,tab){
++  const readingControls=`<div class="terminal-read-controls" aria-label="Terminal reading controls">
++    <button class="key-btn" onclick="readTerminal('last','${esc(name)}')" title="Jump to the last message you submitted in the terminal. Click again for earlier messages.">&#8613; My last message</button>
++    <button class="key-btn key-freeze" id="freeze-btn-${tab==='raw'?'':'chat-'}${name}" onclick="readTerminal('freeze','${esc(name)}')" title="Freeze terminal updates while you scroll and read. The session keeps working.">&#10052; Freeze</button>
++    <button class="key-btn" onclick="readTerminal('latest','${esc(name)}')" title="Return to the latest output and follow new messages.">&#8595; Latest output</button>
++  </div>`;
+   // Simplified team members: no keys/commands — a COMPACT single-row upload
+   // control. Keeping the footer short means the terminal gets full height and the
+   // page doesn't overflow (page overflow would steal the terminal's scroll).
+   if(MEMBER_SIMPLE){
+-    return `<div class="key-bar expanded upload-bar" id="keybar-${tab}-${name}" style="border-top:none">
++    return readingControls+`<div class="key-bar expanded upload-bar" id="keybar-${tab}-${name}" style="border-top:none">
+     <div class="upload-drop" id="dropzone-${tab}-${name}"
+       ondragover="event.preventDefault();this.classList.add('drag-over')"
+       ondragleave="this.classList.remove('drag-over')"
+@@ -33965,13 +34069,12 @@
+       <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
+     </div>
+     <div class="uploaded-files" id="uploaded-files-${tab}-${name}"></div>
+-    ${tab==='raw'?`<button class="key-btn" onclick="jumpToLastUserMessage('${esc(name)}')">&#8613; My last message</button><button class="key-btn" onclick="jumpToLive('${esc(name)}')">&#8595; Latest output</button>`:''}
+     <div class="key-saved" id="keysaved-${tab}-${name}"></div>
+   </div>`;
+   }
+   const id='keybar-'+tab+'-'+name;
+   const isOpen=localStorage.getItem('keyBarOpen')==='true';
+-  return `<div class="key-bar-toggle${isOpen?' open':''}" onclick="toggleKeyBar('${id}',this)">
++  return readingControls+`<div class="key-bar-toggle${isOpen?' open':''}" onclick="toggleKeyBar('${id}',this)">
+     <span class="chevron">&#x25BC;</span> Keys &amp; Commands
+   </div>
+   <div class="key-bar${isOpen?' expanded':''}" id="${id}">
+@@ -33985,10 +34088,6 @@
+     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
+     <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
+     <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
+-    ${tab==='raw'?`<span class="key-bar-sep"></span>
+-    <button class="key-btn" onclick="jumpToLastUserMessage('${esc(name)}')" title="Jump to your last message. Click again for earlier messages.">&#8613; My last message</button>
+-    <button class="key-btn" onclick="jumpToLive('${esc(name)}')" title="Return to the latest output and follow new messages.">&#8595; Latest output</button>
+-    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>`:''}
+     <span class="key-bar-sep"></span>
+     <span class="key-bar-label">Cmds:</span>
+     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
+@@ -34684,23 +34783,26 @@
+ 
+ async function refreshBrowserAuthBadge(){
+   if(document.hidden)return;
+-  const el = document.getElementById('nav-browser-badge');
+-  if(!el) return;
+-  if(!(_currentUser && _currentUser.role === 'admin')){ el.style.display='none'; return; }
+-  let d;
++  const el=document.getElementById('nav-browser-badge');
++  if(!el)return;
++  el.style.display='inline-flex';
++  let browser=null;
+   try{
+-    const r = await fetch(BASE+'/api/browser/sessions');
+-    if(!r.ok){ el.style.display='none'; return; }
+-    d = await r.json();
+-  }catch(e){ return; }
+-  _browserAuth = d;
+-  el.style.display = 'inline-flex';
+-  el.classList.remove('ok','bad','active','unknown');
+-  const running=(d.sessions||[]).filter(s=>s.running).length;
+-  el.classList.add(running?'ok':'unknown');
+-  el.title=running
+-    ? running+' browser session'+(running===1?' is':'s are')+' running. Click to manage.'
+-    : 'No browser sessions are running. Click to manage.';
++    const admin=!!(_currentUser&&_currentUser.role==='admin');
++    const response=await fetch(BASE+(admin?'/api/browser/sessions':'/api/my/browser'),{cache:'no-store'});
++    if(response.ok){
++      const data=await response.json();
++      _browserAuth=data;
++      const rows=data.sessions||[];
++      browser=data.browser||rows.find(s=>s.id==='default')||rows.find(s=>s.account_browser)||rows[0]||null;
++    }
++  }catch(error){}
++  const connected=!!(browser&&(browser.connected??browser.running));
++  const working=connected&&Number(browser.active_leases)>0;
++  el.classList.remove('ok','bad','warn','active','unknown','busy','working');
++  el.classList.add(working?'working':connected?'ok':'bad');
++  el.title=working?'Browser working now':connected?'Browser connected':'Browser not connected';
++  el.setAttribute('aria-label',el.title);
+ }
+ 
+ function onBrowserBadgeClick(){
+@@ -34875,10 +34977,10 @@
+   if(!_bsProxyEdit){
+     return '<div class="bs-proxy">'+head+
+       '<div class="bs-proxy-actions">'+
+-        '<button class="btn" onclick="toggleBrowserProxy('+(on?'false':'true')+')">'+(on?'Turn off':'Turn on')+'</button> '+
++        '<button class="btn" onclick="toggleBrowserProxy('+(on?'false':'true')+')">'+(on?'Use direct IP':'Direct failed: use residential')+'</button> '+
+         '<button class="btn btn-ghost" onclick="editBrowserProxy()">Settings</button> '+
+         '<button class="btn btn-ghost" onclick="loadBrowserProxy(true)">Re-check exit IPs</button>'+
+-      '</div></div>';
++      '</div><p class="conn-note">Use the normal IP first. Return to direct when the blocked task is finished.</p></div>';
+   }
+   const opts = (p.providers||[]).map(x=>'<option value="'+esc(x)+'"'+(x===p.provider?' selected':'')+'>'+esc(x)+'</option>').join('');
+   return '<div class="bs-proxy">'+head+
+@@ -34928,7 +35030,7 @@
+ async function toggleBrowserProxy(on){
+   try{
+     const r = await fetch(BASE+'/api/browser/proxy',{method:'POST',
+-      headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled:!!on})});
++      headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled:!!on,direct_failed:!!on})});
+     const d = await r.json();
+     if(!r.ok){ alert(d.error||'Failed'); return; }
+   }catch(e){ alert('Failed: '+e.message); return; }
+--- a/test_api.py
++++ b/test_api.py
+@@ -303,6 +303,7 @@
+         tools_start = html.index('<div class="nav-tools-wrap">', status_menu_start)
+         nav_before_menu = html[nav_start:status_menu_start]
+ 
++        assert 'id="nav-browser-badge"' in nav_before_menu
+         assert 'id="nav-cpu-summary"' in nav_before_menu
+         assert 'id="nav-usage-cap-summary"' in nav_before_menu
+         assert '>Status <span class="nav-status-chevron">' in nav_before_menu
+@@ -312,7 +313,6 @@
+             "nav-server-stats",
+             "nav-usage",
+             "nav-codex-alert",
+-            "nav-browser-badge",
+             "codex-auth",
+             "nav-status-whoami",
+         ):
+@@ -333,7 +333,6 @@
+             "nav-server-stats",
+             "nav-usage",
+             "nav-codex-alert",
+-            "nav-browser-badge",
+             "codex-auth",
+             "nav-status-whoami",
+         ):
+--- /dev/null
++++ b/test_terminal_refinements.py
+@@ -0,0 +1,221 @@
++"""Regressions for tab renaming, visible reading controls and browser status."""
++import json
++import subprocess
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++from fastapi.testclient import TestClient
++import app as dashboard
++from test_terminal_render import _run
++
++
++def test_background_wait_heredoc_is_hidden_but_following_reply_remains():
++    pane = """› Please update this project
++
++• Waited for background terminal · cat > .work/browser-
++qa.cjs <<'JS'
++const fs=require('fs');
++const root='/tmp/project';
++(async()=>{
++ const vals=Object.fromEntries(fs.readFileSync('/tmp/example.env',
++'utf8').split('\\n'));
++})();
++JS
++
++• The browser test passed.
++  The project is ready.
++"""
++    output='\n'.join(_run(pane)['clean'])
++    assert 'Please update this project' in output
++    assert 'The browser test passed.' in output
++    assert 'const fs=' not in output
++    assert 'Waited for background terminal' not in output
++    assert "const fs=" in '\n'.join(_run(pane,clean_view=False)['clean'])
++
++
++def test_background_wait_phrase_in_a_user_message_or_code_block_is_preserved():
++    pane="› Why does it say Waited for background terminal?\n\n• Example:\n```text\n• Waited for background terminal · example\n```\n"
++    assert '• Waited for background terminal · example' in '\n'.join(_run(pane)['clean'])
++
++
++@pytest.fixture
++def rename_client(tmp_path,monkeypatch):
++    user={'id':'admin','username':'Tester','role':'admin'}
++    monkeypatch.setattr(dashboard,'_current_user',lambda request:user)
++    monkeypatch.setattr(dashboard,'_strict_session_owner',lambda name,owner=None: ('admin',user) if name=='test-session' else None)
++    monkeypatch.setattr(dashboard,'_user_can_access_session',lambda user,name:name=='test-session')
++    monkeypatch.setattr(dashboard,'_auto_session_names_enabled',lambda owner:False)
++    monkeypatch.setattr(dashboard,'_session_tab_labels',dashboard.LockedJsonStore(tmp_path/'labels.json',lambda:{'sessions':{}}))
++    monkeypatch.setattr(dashboard._session_lifecycle,'get',lambda name:{'owner_id':'admin','generation':'a'*32})
++    return TestClient(dashboard.app,cookies={dashboard.AUTH_COOKIE:dashboard._make_token('admin')})
++
++
++def test_session_name_can_be_edited_repeatedly_without_changing_routing(rename_client):
++    for name in ['First project','Revised name','Third name','First project']:
++        response=rename_client.patch('/api/sessions/test-session/name',json={'name':name})
++        assert response.status_code==200
++        assert response.json()['name']=='test-session'
++        assert response.json()['tab_label']==name
++        assert dashboard._session_tab_label('test-session')==name
++
++
++def test_rename_rejects_blank_and_other_owner(rename_client):
++    assert rename_client.patch('/api/sessions/test-session/name',json={'name':'   '}).status_code==400
++    assert rename_client.patch('/api/sessions/other/name',json={'name':'New'}).status_code==404
++
++
++def test_manual_rename_clears_pending_automatic_name(rename_client,monkeypatch):
++    dashboard._session_tab_labels.update(lambda d:d['sessions'].update({'test-session':{'owner_id':'admin','generation':'a'*32,'label':'Old Task','pending':{'id':'stale'}}}))
++    monkeypatch.setattr(dashboard,'_auto_session_names_enabled',lambda owner:True)
++    response=rename_client.patch('/api/sessions/test-session/name',json={'name':'My actual name'})
++    assert response.status_code==200
++    assert dashboard._session_tab_label('test-session')=='My actual name'
++    assert 'pending' not in dashboard._session_tab_label_rows()['test-session']
++
++
++UI_DRIVER=r'''
++const fs=require('fs'),vm=require('vm'),src=fs.readFileSync(process.argv[1],'utf8'),input=JSON.parse(process.argv[2]);
++const el={style:{},title:'',classList:{classes:new Set(),remove(...xs){xs.forEach(x=>this.classes.delete(x))},add(...xs){xs.forEach(x=>this.classes.add(x))}},setAttribute:()=>{}};
++const ctx=vm.createContext({console,BASE:'',MEMBER_SIMPLE:!!input.simple,esc:String,
++ localStorage:{getItem:()=>false},document:{hidden:false,getElementById:()=>el},_currentUser:{role:input.simple?'member':'admin'},_browserAuth:null,
++ fetch:async()=>({ok:true,json:async()=>input.payload}),});
++(async()=>{
++ if(input.action==='keys'){
++  vm.runInContext(src.slice(src.indexOf('function buildKeyBar(name,tab){'),src.indexOf('// ── Saved project keys')),ctx);
++  const html=ctx.buildKeyBar('test-session',input.tab||'raw');
++  process.stdout.write(JSON.stringify({html}));
++ }else{
++  vm.runInContext(src.slice(src.indexOf('async function refreshBrowserAuthBadge(){'),src.indexOf('function onBrowserBadgeClick(){')),ctx);
++  await ctx.refreshBrowserAuthBadge();
++  process.stdout.write(JSON.stringify({classes:[...el.classList.classes],display:el.style.display,title:el.title}));
++ }
++})().catch(e=>{console.error(e);process.exit(1)});
++'''
++
++
++def ui(**scenario):
++    result=subprocess.run(['node','-e',UI_DRIVER,str(Path(__file__).with_name('app.py')),json.dumps(scenario)],capture_output=True,text=True,timeout=10)
++    assert result.returncode==0,result.stderr
++    return json.loads(result.stdout)
++
++
++@pytest.mark.parametrize('simple',[False,True])
++@pytest.mark.parametrize('tab',['raw','chat'])
++def test_reading_controls_are_visible_outside_collapsed_keys(simple,tab):
++    html=ui(action='keys',simple=simple,tab=tab)['html']
++    visible=html.split('key-bar-toggle')[0].split('upload-bar')[0]
++    assert 'My last message</button>' in visible
++    assert 'Freeze</button>' in visible
++
++
++@pytest.mark.parametrize('running,leases,expected',[(False,0,'bad'),(True,0,'ok'),(True,1,'working')])
++@pytest.mark.parametrize('simple',[False,True])
++def test_browser_badge_reports_connection_and_work(simple,running,leases,expected):
++    browser={'id':'default','account_browser':True,'running':running,'connected':running,'active_leases':leases}
++    data=ui(action='badge',simple=simple,payload={'browser':browser} if simple else {'sessions':[browser]})
++    assert expected in data['classes']
++    assert data['display']!='none'
++
++
++def test_new_browser_proxy_routes_start_direct(monkeypatch):
++    conf={'enabled':True,'sessions':{}}
++    monkeypatch.setattr(dashboard,'_proxy_conf',lambda:conf)
++    monkeypatch.setattr(dashboard,'_proxy_save',lambda c:None)
++    dashboard._claim_browser_proxy_session({'id':'default','display':99})
++    assert conf['sessions']['default']['enabled'] is False
++
++
++def test_freeze_retains_visible_text_while_new_output_is_buffered():
++    source=Path(__file__).with_name('app.py')
++    script=r'''
++const fs=require('fs'),vm=require('vm'),src=fs.readFileSync(process.argv[1],'utf8');
++const st={fullText:'The original message',frozen:false};let renders=0;
++const ctx=vm.createContext({getRawState:()=>st,document:{getElementById:()=>null},renderRawText:()=>renders++});
++vm.runInContext(src.slice(src.indexOf('function _rawVisibleText(st){'),src.indexOf('const CLEAN_VIEW_ON=')),ctx);
++ctx.toggleRawFreeze('demo');st.fullText+='\nNew output';const held=ctx._rawVisibleText(st);
++ctx.toggleRawFreeze('demo');const resumed=ctx._rawVisibleText(st);
++process.stdout.write(JSON.stringify({held,resumed,renders}));
++'''
++    response=subprocess.run(['node','-e',script,str(source)],capture_output=True,text=True,timeout=10)
++    assert response.returncode==0,response.stderr
++    assert json.loads(response.stdout)=={'held':'The original message','resumed':'The original message\nNew output','renders':1}
++
++
++@pytest.mark.asyncio
++async def test_rename_checks_generation_inside_the_write(rename_client,monkeypatch):
++    from starlette.requests import Request
++    generations=iter(['a'*32,'b'*32])
++    monkeypatch.setattr(dashboard._session_lifecycle,'get',lambda n:{'generation':next(generations)})
++    response=await dashboard.api_rename_session(Request({'type':'http'}),'test-session',dashboard.RenameSessionBody(name='A different session'))
++    assert response.status_code==409
++    assert not dashboard._session_tab_label_rows()
++
++
++def test_frozen_scroll_position_survives_roster_redraw():
++    script=r'''
++const fs=require('fs'),vm=require('vm'),src=fs.readFileSync(process.argv[1],'utf8');
++const start=src.indexOf('        st.fullText=cached.text;'),end=src.indexOf('        startRawPolling(s.name);',start);
++const rawEl={scrollTop:0};const st={frozen:true};
++const ctx=vm.createContext({st,cached:{text:'New buffer',scrollTop:137},rawEl,s:{name:'demo'},infoEl:null,
++ renderRawText:()=>{rawEl.scrollTop=900},_setRawScroll:(el,top)=>{el.scrollTop=top}});
++vm.runInContext(src.slice(start,end),ctx);
++process.stdout.write(JSON.stringify({top:rawEl.scrollTop,reading:st.userScrolledUp}));
++'''
++    response=subprocess.run(['node','-e',script,str(Path(__file__).with_name('app.py'))],capture_output=True,text=True,timeout=10)
++    assert response.returncode==0,response.stderr
++    assert json.loads(response.stdout)=={'top':137,'reading':True}
++
++
++@pytest.mark.parametrize('simple,tab,switches',[(False,None,0),(True,None,1),(False,'raw',0),(False,'chat',1)])
++def test_reading_controls_only_switch_when_terminal_is_not_visible(simple,tab,switches):
++    script=r'''
++const fs=require('fs'),vm=require('vm'),src=fs.readFileSync(process.argv[1],'utf8'),input=JSON.parse(process.argv[2]);
++let switches=0,jumps=0;const activeTabs=input.tab?{demo:input.tab}:{};
++const ctx=vm.createContext({activeTabs,MEMBER_SIMPLE:input.simple,switchTab:()=>switches++,
++ getRawState:()=>({fullText:'Existing terminal'}),loadRaw:()=>{throw Error('Unexpected reload')},
++ jumpToLastUserMessage:()=>jumps++});
++vm.runInContext(src.slice(src.indexOf('async function readTerminal(action,name){'),src.indexOf('function _rawVisibleText(st){')),ctx);
++ctx.readTerminal('last','demo').then(()=>process.stdout.write(JSON.stringify({switches,jumps}))).catch(e=>{console.error(e);process.exit(1)});
++'''
++    response=subprocess.run(['node','-e',script,str(Path(__file__).with_name('app.py')),json.dumps({'simple':simple,'tab':tab})],capture_output=True,text=True,timeout=10)
++    assert response.returncode==0,response.stderr
++    assert json.loads(response.stdout)=={'switches':switches,'jumps':1}
++
++
++def test_a_closing_session_cannot_be_renamed(rename_client,monkeypatch):
++    monkeypatch.setattr(dashboard._session_lifecycle,'get',lambda name:{'generation':'a'*32,'desired_state':'deleting'})
++    response=rename_client.patch('/api/sessions/test-session/name',json={'name':'Too late'})
++    assert response.status_code==409
++    assert not dashboard._session_tab_label_rows()
++
++
++@pytest.fixture
++def proxy_client(monkeypatch):
++    conf={'enabled':True,'sessions':{'default':{'enabled':False,'local_port':3128},'other':{'enabled':True,'local_port':3130}}}
++    monkeypatch.setattr(dashboard,'_auth_admin_ok',lambda request:True)
++    monkeypatch.setattr(dashboard,'_proxy_conf',lambda:json.loads(json.dumps(conf)))
++    monkeypatch.setattr(dashboard,'_proxy_presets',lambda:{})
++    monkeypatch.setattr(dashboard,'_proxy_save',lambda value:conf.update(value))
++    return TestClient(dashboard.app,cookies={dashboard.AUTH_COOKIE:dashboard._make_token('admin')}),conf
++
++
++def test_residential_escalation_requires_a_direct_failure(proxy_client):
++    client,conf=proxy_client
++    assert client.post('/api/browser/proxy',json={'enabled':True}).status_code==400
++    assert conf['sessions']['default']['enabled'] is False
++
++
++def test_residential_can_be_used_after_direct_failure(proxy_client):
++    client,conf=proxy_client
++    assert client.post('/api/browser/proxy',json={'enabled':True,'direct_failed':True}).status_code==200
++    assert conf['sessions']['default']['enabled'] is True
++
++
++def test_returning_to_direct_does_not_change_another_browser(proxy_client):
++    client,conf=proxy_client
++    conf['sessions']['default']['enabled']=True
++    assert client.post('/api/browser/proxy',json={'enabled':False}).status_code==200
++    assert conf['sessions']['default']['enabled'] is False
++    assert conf['enabled'] is True
++    assert conf['sessions']['other']['enabled'] is True
