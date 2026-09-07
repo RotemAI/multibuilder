@@ -1,0 +1,11 @@
+# Validation, 2026-09-07
+
+953 tests passed on both the local isolated candidate and the destination host. The destination reported one existing dependency deprecation warning. The original source passed 906 tests. The new feature regressions failed on the old source before the port. Applying the review patch to the downloaded baseline reproduced every deployed file hash.
+
+Authenticated browser QA passed at 1440 x 1000 and 390 x 844. The green plus opened a blank name field, Astra, Max and an unchecked refusal checkbox. The first named session launched with explicit Astra/Max arguments and opened automatically. Choosing GPT-5.5 reduced the effort choices to supported levels; a second session launched with Luna/High and the refusal checkbox checked. Reload preserved its route, effort, checkbox and manually supplied display name with spaces. The first session and existing account model/effort were unchanged. The recovery notice remained visible on mobile. No horizontal overflow, console messages or page errors were observed. Screenshots were inspected.
+
+The initial cleanup script did not wait for the nested asynchronous close job and encountered a transient busy response for the second disposable session. It was corrected to await completion and retry the busy response, and the full browser pass was repeated successfully. Both runs' disposable sessions and generated project directories were removed. The isolated browser was closed and its temporary authentication file deleted. The destination resident browser was never opened. Its audit CLI cannot record while stopped, so the browser audit event was recorded on Builder5, where the isolated QA browser ran.
+
+All 15 pre-existing tmux panes and native Codex process sets were identical before and after the Supervisor restart. A later check confirmed those original processes were still present. The service returned HTTP 200, and all seven live source/test files matched the reviewed after hashes. No existing session was restarted or closed by the deployment.
+
+Service-recovery behavior is covered by the same structured-error and exact-session integration tests as Builder5. No artificial outage was injected into a user session. Policy and permission exclusions remain enforced.
