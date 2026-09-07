@@ -1343,6 +1343,90 @@ class TestSshIdeSafety:
         )
         assert not app._claude_is_user_turn({"type": "assistant", "message": {}})
 
+    def test_redirected_state_paths_bypass_the_shared_database(self):
+        """Patching a state file must actually isolate the store.
+
+        Tests sandbox state by pointing SSH_CONNECTIONS_FILE at a tmp dir. That
+        worked until the stores moved to Postgres, after which _shared_store
+        returned the DATABASE regardless and those writes landed in production
+        — 40 test fixtures ended up in the real connection list.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from core.state import _is_sandboxed_path, _shared_store
+
+        from unittest.mock import patch
+
+        import core.state as state
+
+        with tempfile.TemporaryDirectory() as folder:
+            sandbox = Path(folder) / "ssh-connections.json"
+            assert _is_sandboxed_path(sandbox)
+            # Force the database to look available, or this asserts nothing:
+            # without a live DB the fallback returns a file store regardless.
+            with patch.object(state, "_db_ready", return_value=True):
+                store = _shared_store("ssh_connections", sandbox, dict)
+                assert type(store).__name__ == "LockedJsonStore", (
+                    "a redirected path still reached the shared database"
+                )
+                real = _shared_store(
+                    "ssh_connections", Path.home() / ".tmux-dashboard" / "x.json", dict
+                )
+                assert type(real).__name__ == "PgJsonStore", (
+                    "a real path should still use the shared database"
+                )
+
+        # A real state path is unaffected and keeps whatever backend is live.
+        assert not _is_sandboxed_path(Path.home() / ".tmux-dashboard" / "x.json")
+
+    def test_workspace_listing_enforces_ownership_and_hides_secrets(self):
+        """The home server list must not become a way to enumerate other tenants.
+
+        `_ssh_user_may_use_profile(user, profile)` takes the USER first —
+        passing them the other way round silently returns False for everything,
+        which is how this endpoint first shipped returning zero rows.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_list_all_workspaces)
+        assert "_ssh_user_may_use_profile(user, profile)" in source
+        # Published fields go through the same allow-list as the per-session
+        # endpoint, so credentials cannot reach the browser.
+        assert "_ssh_public_profile(profile)" in source
+
+    def test_home_does_not_auto_open_a_session(self):
+        """Home must list, not jump into whichever session happens to be first."""
+        from pathlib import Path
+
+        page = Path("templates/dashboard.html").read_text()
+        assert "selectedSession=sessions[0].name" not in page
+        assert "function renderHome()" in page
+        # Both tabs exist and the choice is remembered.
+        assert "setHomeTab('sessions')" in page
+        assert "setHomeTab('servers')" in page
+        assert "localStorage.setItem('home.tab'" in page
+
+    def test_pending_turn_is_gated_on_capture_not_on_busy(self):
+        """The live bubble must not blank when one idle frame is read.
+
+        Gating the in-flight text on the busy flag made it vanish and reappear
+        between polls -- the "flickering" instead of a stream. It is now
+        suppressed only once that exact turn has been stored as a message,
+        which is the condition that actually means "no longer in flight".
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_ide_chat_messages)
+        assert "_output_signature(draft)" in source, "pending is not capture-gated"
+        assert "chat_summary_sig" in source
+        # The old busy gate must be gone, or the flicker returns.
+        assert "if busy:" not in source
+
     def test_chat_detects_activity_rather_than_reading_a_stale_cache(self):
         """The panel must probe activity, not trust whatever last wrote it.
 
@@ -1375,8 +1459,10 @@ class TestSshIdeSafety:
 
         source = inspect.getsource(app.api_ide_chat_messages)
         assert '"pending"' in source
-        # Only read while busy, and never stored.
-        assert "if busy:" in source
+        # Never stored: the saved message is still written once, when the turn
+        # settles. (It is deliberately NOT gated on `busy` any more -- that
+        # gate blanked the bubble on a single idle frame, which read as
+        # flickering rather than streaming.)
         assert "_append_assistant_msg" not in source
         # A status line is not a draft worth showing.
         assert "_turn_is_only_status" in source

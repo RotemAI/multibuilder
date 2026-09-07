@@ -51,7 +51,23 @@ def _db_ready() -> bool:
     return _DB_BACKEND_OK
 
 def _shared_store(name: str, path: Path, default_factory):
-    """A document store backed by Postgres when available, else the JSON file."""
-    if _db_ready():
+    """A document store backed by Postgres when available, else the JSON file.
+
+    A caller that has redirected `path` somewhere temporary is explicitly
+    asking for an isolated store -- that is how the tests sandbox state. Before
+    Postgres existed, patching the path was enough; afterwards the database was
+    returned regardless and those writes went to PRODUCTION, which is how 40
+    test fixtures ended up in the real connection list. Honour the redirect.
+    """
+    if _db_ready() and not _is_sandboxed_path(path):
         return db_store.PgJsonStore(name, default_factory)
     return LockedJsonStore(path, default_factory)
+
+
+def _is_sandboxed_path(path: Path) -> bool:
+    """Is this state file pointed at a throwaway location (a test tmp dir)?"""
+    try:
+        resolved = str(Path(path).resolve())
+    except (OSError, ValueError):
+        return False
+    return resolved.startswith(("/tmp/", "/var/tmp/")) or "/pytest-" in resolved

@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte'
   import { ide } from './store.svelte.js'
   import { api } from './api.js'
-  import { ArrowUp, Loader, Sparkles, Check, ChevronDown, Square, Minimize2 } from 'lucide-svelte'
+  import { ArrowUp, Loader, Sparkles, Check, ChevronDown, Square, Minimize2, Paperclip } from 'lucide-svelte'
 
   // Codex and Claude are both agents running inside a tmux session, so the
   // "provider" is really which session the prompt is delivered to.
@@ -79,7 +79,16 @@
     if (!target) return
     try {
       const data = await api.chat(target)
-      const next = data.messages || []
+      const server = data.messages || []
+      // Carry over any optimistic message the server has not recorded yet,
+      // otherwise the user's own text disappears on the very next poll.
+      const serverTexts = new Set(
+        server.filter((m) => m.role === 'user').map((m) => (m.text || '').trim()),
+      )
+      const unconfirmed = messages.filter(
+        (m) => m._local && !serverTexts.has((m.text || '').trim()),
+      )
+      const next = unconfirmed.length ? [...server, ...unconfirmed] : server
       const grew = next.length !== messages.length
       messages = next
       // The server knows whether the agent is mid-turn; `sending` only covers
@@ -215,11 +224,92 @@
     return `${header}\nCurrently open: ${where}${body}\n\n${question.trim()}`
   }
 
+  // --- Drag files in ----------------------------------------------------
+  //
+  // Two sources, deliberately handled differently:
+  //  * a file dragged from the IDE tree already lives in the workspace, so only
+  //    its PATH is attached -- the agent reads it itself;
+  //  * a file dragged from the desktop is uploaded first, then referenced by
+  //    the path it landed on. The agent is a CLI in a terminal, so a path is
+  //    the only thing it can actually open -- pasting bytes would not work.
+  let dragOver = $state(false)
+  let attachments = $state([])
+
+  function onDragOver(event) {
+    const dt = event.dataTransfer
+    if (!dt) return
+    const hasFile =
+      dt.types.includes('Files') || dt.types.includes('text/x-ide-path')
+    if (!hasFile) return
+    event.preventDefault()
+    dragOver = true
+  }
+
+  async function onDrop(event) {
+    event.preventDefault()
+    dragOver = false
+    const dt = event.dataTransfer
+    if (!dt) return
+
+    const treePath = dt.getData('text/x-ide-path')
+    if (treePath) {
+      if (!attachments.includes(treePath)) attachments = [...attachments, treePath]
+      return
+    }
+
+    for (const file of Array.from(dt.files || [])) {
+      try {
+        const form = new FormData()
+        form.append('file', file)
+        const response = await fetch(
+          `${rootPath}/api/sessions/${encodeURIComponent(target)}/upload`,
+          { method: 'POST', body: form },
+        )
+        const data = await response.json().catch(() => ({}))
+        if (!response.ok) throw new Error(data.error || 'Upload failed')
+        if (data.path && !attachments.includes(data.path)) {
+          attachments = [...attachments, data.path]
+        }
+      } catch (error) {
+        ide.setStatus(error.message || `Could not attach ${file.name}`)
+      }
+    }
+  }
+
+  const removeAttachment = (path) => {
+    attachments = attachments.filter((p) => p !== path)
+  }
+
+  const fileName = (path) => path.split('/').pop()
+
   async function send() {
     const text = question.trim()
     if (!text || !target || sending) return
-    const prompt = buildPrompt()
+    const attached = attachments.length
+      ? `\n\nAttached files (read them from these paths):\n${attachments
+          .map((p) => `- ${p}`)
+          .join('\n')}`
+      : ''
+    const prompt = buildPrompt() + attached
     sending = true
+
+    // Show the message and clear the box IMMEDIATELY, the way every chat does.
+    // It used to be appended only after the round trip, so the text sat in the
+    // input for a beat and then the next poll — which replaces the list with
+    // the server's copy, before the agent has recorded it — made it vanish.
+    // `_local` marks it as unconfirmed so loadMessages can keep it.
+    const localMessage = {
+      role: 'user',
+      text: attachments.length ? `${text}\n\n${attachments.map(fileName).join(', ')}` : text,
+      ts: Date.now() / 1000,
+      _local: true,
+    }
+    messages = [...messages, localMessage]
+    question = ''
+    attachments = []
+    if (textareaEl) textareaEl.style.height = 'auto'
+    queueMicrotask(scrollToEnd)
+
     try {
       const response = await fetch(
         `${rootPath}/api/sessions/${encodeURIComponent(target)}/send`,
@@ -230,11 +320,12 @@
         },
       )
       const data = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(data.error || 'Could not send')
-      question = ''
-      if (textareaEl) textareaEl.style.height = 'auto'
-      messages = [...messages, { role: 'user', text, ts: Date.now() / 1000, _local: true }]
-      queueMicrotask(scrollToEnd)
+      if (!response.ok) {
+        // Drop the optimistic echo again; the prompt never reached the agent.
+        messages = messages.filter((m) => m !== localMessage)
+        question = text
+        throw new Error(data.error || 'Could not send')
+      }
       // Poll straight away rather than after a fixed delay: the agent starts
       // working immediately, and waiting 1.2s just to notice was most of the
       // gap between pressing send and seeing anything happen.
@@ -389,7 +480,20 @@
 
 <svelte:window onclick={(e) => { if (!e.target.closest?.('[data-menu]')) menu = '' }} />
 
-<div class="flex h-full min-h-0 flex-col bg-mk-bg text-mk-fg">
+<div
+  class="relative flex h-full min-h-0 flex-col bg-mk-bg text-mk-fg"
+  ondragover={onDragOver}
+  ondragleave={() => (dragOver = false)}
+  ondrop={onDrop}
+  role="region"
+  aria-label="AI Agent conversation"
+>
+  {#if dragOver}
+    <div class="pointer-events-none absolute inset-2 z-20 flex items-center justify-center
+                rounded-md border-2 border-dashed border-mk-green/70 bg-mk-bg/80 text-xs text-mk-green">
+      Drop files to attach
+    </div>
+  {/if}
 
   <!-- Transcript -->
   <div
@@ -519,6 +623,21 @@
       </button>
     {/if}
   </div>
+
+  {#if attachments.length}
+    <div class="flex shrink-0 flex-wrap gap-1 border-t border-mk-line px-3 py-1.5">
+      {#each attachments as path (path)}
+        <span class="flex items-center gap-1 rounded-sm bg-mk-input px-1.5 py-0.5 text-[11px] text-mk-fg"
+          title={path}>
+          <Paperclip size={10} class="text-mk-comment" />
+          {fileName(path)}
+          <button class="rounded-sm p-0.5 text-mk-comment hover:text-mk-fg"
+            title="Remove attachment" aria-label="Remove {fileName(path)}"
+            onclick={() => removeAttachment(path)}>×</button>
+        </span>
+      {/each}
+    </div>
+  {/if}
 
   <!-- Composer: input first, controls beneath — the Claude Code arrangement -->
   <div class="border-t border-mk-line p-2">

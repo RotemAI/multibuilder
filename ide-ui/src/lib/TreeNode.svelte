@@ -18,6 +18,59 @@
     else await ide.openFile(path)
   }
 
+  // --- Drag to move, VS Code style -------------------------------------
+  //
+  // A move IS a rename to a different parent, which the backend already
+  // supports, so this needs no new endpoint.
+  let dropTarget = $state(false)
+
+  function onDragStart(event) {
+    event.stopPropagation()
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/x-ide-path', path)
+  }
+
+  function onDragOver(event) {
+    // Only folders accept a drop; a file would have nowhere to put it.
+    if (!entry.is_dir) return
+    const dragged = event.dataTransfer.types.includes('text/x-ide-path')
+    if (!dragged) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+    dropTarget = true
+  }
+
+  async function onDrop(event) {
+    dropTarget = false
+    if (!entry.is_dir) return
+    event.preventDefault()
+    event.stopPropagation()
+    const source = event.dataTransfer.getData('text/x-ide-path')
+    if (!source || source === path) return
+    // Refuse to move a folder into itself or its own subtree, which would
+    // otherwise detach it from the tree entirely.
+    if (path === source || path.startsWith(`${source}/`)) {
+      ide.setStatus('Cannot move a folder into itself')
+      return
+    }
+    const name = source.split('/').pop()
+    const destination = path === '.' ? name : `${path}/${name}`
+    if (destination === source) return
+    try {
+      await api.fs(ide.connectionId, { action: 'rename', path: source, new_path: destination })
+      await ide.refreshFiles()
+      ide.setStatus(`Moved ${name} to ${path}`)
+    } catch (error) {
+      ide.setStatus(error.message || 'Could not move')
+    }
+  }
+
+  function onContextMenu(event) {
+    event.preventDefault()
+    event.stopPropagation()
+    ide.openTreeMenu?.({ path, isDir: entry.is_dir, x: event.clientX, y: event.clientY })
+  }
+
   async function remove(event) {
     event.stopPropagation()
     if (!confirm(`Delete ${path}? Folders must already be empty.`)) return
@@ -45,9 +98,17 @@
 <div
   class="group flex cursor-pointer items-center gap-1 py-[2px] pr-1 text-[13px] hover:bg-vs-hover"
   class:bg-vs-active={active}
+  class:ring-1={dropTarget}
+  class:ring-vs-accent={dropTarget}
   style="padding-left: {8 + depth * 12}px"
   onclick={activate}
   onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate() } }}
+  oncontextmenu={onContextMenu}
+  draggable="true"
+  ondragstart={onDragStart}
+  ondragover={onDragOver}
+  ondragleave={() => (dropTarget = false)}
+  ondrop={onDrop}
   role="treeitem"
   tabindex="0"
   aria-expanded={entry.is_dir ? open : undefined}

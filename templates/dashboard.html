@@ -15,6 +15,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 /* Pinned right section */
 .nav-right{display:flex;align-items:center;flex-shrink:0;padding-right:24px}
 .nav-brand{font-size:.85rem;font-weight:700;color:#58a6ff;padding:12px 16px 12px 0;border-right:1px solid #30363d;margin-right:4px;white-space:nowrap;user-select:none}
+/* Home: session shortcuts and the server listing. */
+.home-tabs{display:flex;gap:2px;padding:14px 20px 0;border-bottom:1px solid #30363d}
+.home-tab{padding:8px 16px;cursor:pointer;font-size:.82rem;color:#8b949e;border-bottom:2px solid transparent;user-select:none}
+.home-tab:hover{color:#c9d1d9}
+.home-tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+.home-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;padding:18px 20px}
+.home-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;cursor:pointer;transition:border-color .15s,background .15s}
+.home-card:hover{border-color:#58a6ff;background:#1c2128}
+.home-card-title{display:flex;align-items:center;gap:8px;font-weight:600;font-size:.9rem;color:#c9d1d9;margin-bottom:6px}
+.home-card-sub{font-size:.76rem;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.home-card-meta{margin-top:4px;opacity:.85}
+.home-card-actions{display:flex;gap:6px;margin-top:10px}
+.home-card-actions button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:4px 10px;font-size:.75rem;cursor:pointer}
+.home-card-actions button:hover:not(:disabled){background:#30363d;border-color:#58a6ff}
+.home-card-actions button:disabled{opacity:.4;cursor:not-allowed}
+.nav-dot.off{background:#484f58}
+.nav-home{cursor:pointer;user-select:none}
 .nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
 .nav-item:hover{background:#1c2128}
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
@@ -2529,6 +2546,11 @@ function statusLabel(s){
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
   const brand=navEl.querySelector('.nav-brand');
+  // Clicking the brand returns to Home, which is the only way back once a
+  // session is open.
+  brand.classList.add('nav-home');
+  brand.title='Back to Home';
+  brand.onclick=()=>{selectedSession=null;renderNav();renderHome()};
   sessions.forEach(s=>{
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'');
@@ -2683,12 +2705,85 @@ function saveRawCache(){
     }
   });
 }
+// --- Home ------------------------------------------------------------------
+//
+// Two tabs: the session shortcuts that used to be the whole landing behaviour,
+// and a listing of every server/workspace you can open. The dashboard used to
+// auto-open the first session, which meant you never saw either.
+let homeTab=localStorage.getItem('home.tab')||'sessions';
+let _workspaces=null;
+
+function setHomeTab(tab){
+  homeTab=tab;
+  try{localStorage.setItem('home.tab',tab)}catch(e){}
+  renderHome();
+}
+
+async function loadWorkspaces(){
+  try{
+    const resp=await fetch(BASE+'/api/workspaces');
+    const data=await resp.json();
+    _workspaces=data.workspaces||[];
+  }catch(e){_workspaces=[]}
+  if(!selectedSession&&homeTab==='servers')renderHome();
+}
+
+function renderHome(){
+  updateFavicon('idle');
+  const tabs=`
+    <div class="home-tabs">
+      <div class="home-tab ${homeTab==='sessions'?'active':''}" onclick="setHomeTab('sessions')">Sessions</div>
+      <div class="home-tab ${homeTab==='servers'?'active':''}" onclick="setHomeTab('servers')">Servers</div>
+    </div>`;
+
+  if(homeTab==='sessions'){
+    const cards=sessions.length?sessions.map(x=>`
+      <div class="home-card" onclick="selectSession('${esc(x.name)}')">
+        <div class="home-card-title">
+          <span class="nav-dot ${esc(x.activity_status||'idle')}"></span>${esc(x.name)}
+        </div>
+        <div class="home-card-sub">${esc(x.title||x.description||'No description yet')}</div>
+        <div class="home-card-actions">
+          <button onclick="event.stopPropagation();selectSession('${esc(x.name)}')">Open</button>
+          ${MEMBER_SIMPLE?'':`<button onclick="event.stopPropagation();openSvelteIde('${esc(x.name)}')">IDE</button>`}
+        </div>
+      </div>`).join(''):'<div class="empty">No sessions yet. Create one from the top bar.</div>';
+    mainEl.innerHTML=tabs+`<div class="home-grid">${cards}</div>`;
+    return;
+  }
+
+  if(_workspaces===null){
+    mainEl.innerHTML=tabs+'<div class="empty">Loading servers…</div>';
+    loadWorkspaces();
+    return;
+  }
+  const rows=_workspaces.length?_workspaces.map(w=>`
+    <div class="home-card">
+      <div class="home-card-title">
+        <span class="nav-dot ${w.session_live?'idle':'off'}"></span>${esc(w.label||w.host||'workspace')}
+      </div>
+      <div class="home-card-sub">
+        ${w.kind==='local'?'Local folder':esc((w.username?w.username+'@':'')+(w.host||''))}
+        &middot; ${esc(w.workspace_root||'.')}
+      </div>
+      <div class="home-card-sub home-card-meta">
+        session <b>${esc(w.session_name||'—')}</b>
+        ${w.session_live?'':' (not running)'}
+      </div>
+      <div class="home-card-actions">
+        <button ${w.session_live?'':'disabled title="Its session is not running"'}
+          onclick="event.stopPropagation();openSvelteIde('${esc(w.session_name)}')">Connect</button>
+      </div>
+    </div>`).join(''):'<div class="empty">No servers saved yet. Add one from a session\'s IDE.</div>';
+  mainEl.innerHTML=tabs+`<div class="home-grid">${rows}</div>`;
+}
+
 function renderDetail(){
   const composerFocus=captureComposerFocus();
   saveDrafts();
   saveRawCache();
   const s=sessions.find(x=>x.name===selectedSession);
-  if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
+  if(!s){renderHome();return}
   // Non-developer (simple) users land on the clean Chat tab; admins on Terminal.
   const tab=activeTabs[s.name]||(MEMBER_SIMPLE?'chat':'raw');
   // Sync server messages into local store (merge, don't replace — preserves
@@ -3711,7 +3806,8 @@ async function loadAll(){
       lastStatus[s.name]=s.activity_status;
       if(s.messages&&s.messages.length)mergeChatMessages(s.name, s.messages);
     });
-    if(!selectedSession&&sessions.length>0)selectedSession=sessions[0].name;
+    // Land on Home rather than jumping into whichever session happens to be
+    // first. Opening a session is now a deliberate click.
     renderNav();
     renderDetail();
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}

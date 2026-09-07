@@ -8541,27 +8541,68 @@ async def api_ide_chat_messages(request: Request, session_name: str, limit: int 
     # progresses, so re-reading it each poll streams the reply in. This is
     # deliberately not persisted: the stored message is still written once, when
     # the turn settles, so a partial read can never become the saved reply.
+    # Read the in-flight turn regardless of the busy flag.
+    #
+    # Gating on `busy` made the bubble vanish the moment activity detection read
+    # one idle frame -- and reappear on the next poll. That is the flicker: the
+    # text was not being rebuilt wrongly, it was being blanked and restored.
+    # The read is ~10ms, so doing it unconditionally is cheaper than being
+    # wrong.
     pending = ""
-    if busy:
-        try:
-            last_user = next(
-                (m.get("text", "") for m in reversed(messages) if m.get("role") == "user"),
-                "",
-            )
-            draft = await asyncio.to_thread(
-                _extract_last_assistant_turn, session_name, last_user
-            )
-            draft = (draft or "").strip()
-            if draft and not _turn_is_only_status(draft):
+    try:
+        last_user = next(
+            (m.get("text", "") for m in reversed(messages) if m.get("role") == "user"),
+            "",
+        )
+        draft = await asyncio.to_thread(
+            _extract_last_assistant_turn, session_name, last_user
+        )
+        draft = (draft or "").strip()
+        if draft and not _turn_is_only_status(draft):
+            # Suppress it once this exact turn has been stored as a message,
+            # or the panel would render the reply twice: once as the live
+            # bubble and again as the saved message.
+            entry = cache.get(session_name) or {}
+            if _output_signature(draft) != entry.get("chat_summary_sig"):
                 pending = _turn_full_text(draft)
-        except Exception:  # noqa: BLE001 - a missing draft must not fail the poll
-            logger.debug("pending turn read failed for %s", session_name, exc_info=True)
+    except Exception:  # noqa: BLE001 - a missing draft must not fail the poll
+        logger.debug("pending turn read failed for %s", session_name, exc_info=True)
     return JSONResponse({
         "messages": messages[-bounded:],
         "busy": busy,
         "detail": str(activity.get("detail") or "") if busy else "",
         "pending": pending,
     })
+
+
+@app.get("/api/workspaces")
+async def api_list_all_workspaces(request: Request):
+    """Every SSH/local workspace this user owns, across all their sessions.
+
+    The home page lists servers to connect to; the existing endpoint is
+    per-session, which cannot answer "what can I connect to?" without walking
+    every session first.
+    """
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Sign in"}, status_code=403)
+    store = await asyncio.to_thread(lambda: _ssh_connections_store().read())
+    sessions, _ = await asyncio.to_thread(lambda: (get_tmux_sessions(), None))
+    live = {str(item.get("name") or "") for item in (sessions or [])}
+    out = []
+    for profile in store.get("connections", []) or []:
+        session_name = str(profile.get("session_name") or "")
+        # Ownership is enforced per connection, exactly as the per-session
+        # endpoint does — a listing must not become a way to enumerate other
+        # tenants' servers.
+        if not _ssh_user_may_use_profile(user, profile):
+            continue
+        public = _ssh_public_profile(profile)
+        public["session_name"] = session_name
+        public["session_live"] = session_name in live
+        out.append(public)
+    out.sort(key=lambda item: (not item.get("session_live"), item.get("label", "").lower()))
+    return JSONResponse({"workspaces": out})
 
 
 @app.get("/api/sessions/{session_name}/ide/ssh-connections")
