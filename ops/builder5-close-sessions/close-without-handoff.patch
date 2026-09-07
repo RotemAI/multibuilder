@@ -1,0 +1,401 @@
+--- a/app.py
++++ b/app.py
+@@ -16177,16 +16177,16 @@
+ 
+ @app.delete("/api/sessions/{session_name}")
+ async def api_delete_session(request: Request, session_name: str):
+-    """Start an owner-scoped summarize, archive, spec-update, then close job."""
++    """Close the owner's session directly, without generating a handoff."""
+     user = _current_user(request)
+     owner_id = str((user or {}).get("id") or "")
+     _sessions, session = _find_session_for_user(session_name, user)
+     if not owner_id or not session:
+         return JSONResponse({"error": "Session not found"}, status_code=404)
+     result = await _controller_call(
+-        "session_close_start", session=session_name, owner_id=owner_id
++        "session_delete", session=session_name, owner_id=owner_id
+     )
+-    status = int(result.pop("_status", 202 if result.get("ok") else 503))
++    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+     return JSONResponse(result, status_code=status)
+ 
+ 
+@@ -33195,11 +33195,11 @@
+ function showDeleteModal(name){
+   const modal=document.getElementById('modal-content');
+   modal.innerHTML=`
+-    <h3>Summarize and close ${esc(name)}?</h3>
+-    <p>Before closing, the dashboard will archive the conversation and add its technical handoff to <code>TECHNICAL_SPEC.md</code>. The tab stays open if saving fails.</p>
++    <h3>Close session ${esc(name)}?</h3>
++    <p>Running work will stop. Saved conversations and project files are kept.</p>
+     <div class="modal-actions">
+       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
+-      <button class="modal-confirm-delete" onclick="deleteSession('${esc(name)}')">Summarize &amp; Close</button>
++      <button class="modal-confirm-delete" onclick="deleteSession('${esc(name)}')">Close session</button>
+     </div>`;
+   document.getElementById('modal-overlay').classList.add('active');
+ }
+@@ -33212,62 +33212,23 @@
+   const run=++_closeSessionRun;
+   const overlay=document.getElementById('modal-overlay');
+   const modal=document.getElementById('modal-content');
+-  const safeName=encodeURIComponent(name);
+-  modal.innerHTML='<div id="session-close-job-'+run+'"><h3>Saving session knowledge…</h3><p class="conn-note" id="session-close-status-'+run+'">Waiting for current work to finish. The tab remains open until its archive and technical spec are safely written.</p><div class="create-spinner"></div><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close window</button></div></div>';
++  modal.innerHTML='<div id="session-close-job-'+run+'"><h3>Closing session…</h3><div class="create-spinner"></div></div>';
+   overlay.classList.add('active');
+   try{
+-    const started=await fetch(BASE+'/api/sessions/'+safeName,{method:'DELETE'});
+-    const initial=await started.json().catch(()=>({}));
+-    if(!started.ok){const error=new Error(initial.error||'Could not start safe close');if(initial.tab_state==='open')error.tabState='open';else error.uncertain=true;throw error;}
+-    if(!initial.job||!initial.job.id){const error=new Error(initial.error||'Could not confirm that safe close started');error.uncertain=true;throw error;}
+-    let job=initial.job;
+-    let transientFailures=0;
+-    const phaseText={queued:'Queued…',waiting_for_idle:'Waiting for current work to finish…',capturing:'Capturing the session conversation…',summarizing:'Creating the technical handoff…',updating_spec:'Archiving knowledge and updating TECHNICAL_SPEC.md…',closing:'Knowledge saved. Closing the tmux tab…'};
+-    for(let attempt=0;attempt<1800&&['queued','running'].includes(job.status);attempt++){
+-      if(_closeModalOwns(run)){
+-        const status=document.getElementById('session-close-status-'+run);
+-        if(status)status.textContent=phaseText[job.phase]||'Saving session knowledge…';
+-      }
+-      await new Promise(resolve=>setTimeout(resolve,1000));
+-      try{
+-        const polled=await fetch(BASE+'/api/sessions/'+safeName+'/close/'+encodeURIComponent(job.id),{cache:'no-store'});
+-        const data=await polled.json().catch(()=>({}));
+-        if(polled.status===403||polled.status===404){
+-          const error=new Error(data.error||'Close status is no longer available');error.uncertain=true;throw error;
+-        }
+-        if(!polled.ok||!data.job)throw new Error(data.error||'Could not read close status');
+-        job=data.job;transientFailures=0;
+-      }catch(error){
+-        if(error.uncertain)throw error;
+-        transientFailures++;
+-        if(_closeModalOwns(run)&&transientFailures>5){
+-          const status=document.getElementById('session-close-status-'+run);
+-          if(status)status.textContent='Connection interrupted. The safe close is still running on the server; reconnecting…';
+-        }
+-        await new Promise(resolve=>setTimeout(resolve,Math.min(10000,500*transientFailures)));
+-      }
+-    }
+-    if(['queued','running'].includes(job.status)){
+-      const error=new Error('The safe close is still running, but this window can no longer confirm its status. Refresh the dashboard before taking another action.');error.uncertain=true;throw error;
+-    }
+-    if(job.status==='failed'){
+-      const error=new Error(job.error||'Could not preserve session knowledge');
+-      error.tabState=job.tab_state||'unknown';throw error;
++    const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name),{method:'DELETE'});
++    const result=await response.json().catch(()=>({}));
++    if(!response.ok||result.ok!==true||result.killed!==name){
++      throw new Error(result.error||'Could not confirm that the session closed.');
+     }
+     if(selectedSession===name)selectedSession=null;
+     delete chatMessages[name];
++    if(_closeModalOwns(run))closeModal();
++  }catch(error){
+     if(_closeModalOwns(run)){
+-      modal.innerHTML='<h3>Session closed safely</h3><p class="conn-note">'+(job.archived===false?'This tab had no Codex conversation, so there was nothing to archive.':'The conversation was archived and its technical handoff was saved to <code>'+esc(job.spec_file||'TECHNICAL_SPEC.md')+'</code>.')+'</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>';
+-    }
+-    await loadAll();
+-  }catch(error){
+-    if(!_closeModalOwns(run))return;
+-    if(error&&error.tabState==='open'){
+-      modal.innerHTML='<h3>Session left open</h3><p class="conn-note">'+esc(error.message||'Could not preserve session knowledge')+'</p><p class="conn-note">The tab was verified open. Fix the issue or try again.</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button><button class="modal-confirm-delete" onclick="deleteSession(\''+esc(name)+'\')">Retry</button></div>';
+-    }else{
+-      modal.innerHTML='<h3>Close status needs confirmation</h3><p class="conn-note">'+esc(error&&error.message?error.message:'Could not confirm the final close status')+'</p><p class="conn-note">Do not retry yet: the server may still be saving knowledge or completing the close. Refresh the dashboard to confirm the tab state.</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button><button class="modal-confirm-delete" onclick="loadAll();closeModal()">Refresh tabs</button></div>';
++      modal.innerHTML='<h3>Could not confirm session close</h3><p class="conn-note">'+esc(error.message||'Connection interrupted.')+'</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Dismiss</button><button class="modal-confirm-delete" onclick="loadAll();closeModal()">Refresh tabs</button></div>';
+     }
+   }
++  await loadAll();
+ }
+ 
+ // ── Codex Auth ──
+--- a/test_api.py
++++ b/test_api.py
+@@ -271,15 +271,14 @@
+         assert "transientFailures>5" in html
+         assert "recovery will continue" in html
+ 
+-    def test_delete_ui_saves_knowledge_before_close(self, authed_client):
++    def test_delete_ui_closes_without_technical_handoff(self, authed_client):
+         html = authed_client.get("/").text
+-
+-        assert "Summarize and close ${esc(name)}?" in html
+-        assert "Summarize &amp; Close" in html
+-        assert "Saving session knowledge…" in html
+-        assert "/close/'+encodeURIComponent(job.id)" in html
+-        assert "The tab remains open" in html
+-        assert "transientFailures>5" in html
++        close_ui = html[html.index("function showDeleteModal"):html.index("// ── Codex Auth")]
++        assert "Close session ${esc(name)}?" in close_ui
++        assert "technical handoff" not in close_ui
++        assert "TECHNICAL_SPEC.md" not in close_ui
++        assert "Summarize" not in close_ui
++        assert "Running work will stop" in close_ui
+ 
+     def test_session_tab_bar_stays_pinned_while_page_scrolls(self, authed_client):
+         html = authed_client.get("/").text
+@@ -3999,6 +3998,29 @@
+ 
+ 
+ class TestDeleteSession:
++    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
++    def test_close_uses_direct_controller_cleanup_when_handoff_is_unavailable(
++        self, mock_sessions, authed_client, monkeypatch
++    ):
++        owner = {"id": "admin", "username": "admin", "role": "admin"}
++        monkeypatch.setattr(app_module, "_find_user_by_id", lambda _id: owner)
++        monkeypatch.setattr(app_module, "_strict_session_owner", lambda *_: ("admin", owner))
++        delete = AsyncMock(return_value=app_module.JSONResponse({"ok": True, "killed": "test-session"}))
++        handoff = AsyncMock(side_effect=RuntimeError("handoff service unavailable"))
++        monkeypatch.setattr(app_module, "_api_delete_session_unlocked", delete)
++        monkeypatch.setattr(app_module, "_start_session_close", handoff)
++
++        async def local_controller(op, **fields):
++            return await app_module._controller_dispatch({"op": op, **fields})
++
++        monkeypatch.setattr(app_module, "_controller_call", local_controller)
++        response = authed_client.delete("/api/sessions/test-session")
++        assert response.status_code == 200
++        assert response.json() == {"ok": True, "killed": "test-session"}
++        delete.assert_awaited_once_with(None, "test-session", expected_user=owner)
++        handoff.assert_not_awaited()
++
++
+     @patch("app.get_tmux_sessions", return_value=[])
+     def test_delete_missing_session_returns_404(self, mock_sessions, authed_client):
+         """DELETE on unknown session must return 404."""
+@@ -4008,21 +4030,20 @@
+     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+     @patch("app.subprocess.run")
+     def test_delete_session_success(self, mock_run, mock_sessions, authed_client):
+-        """Interactive deletion starts a non-blocking knowledge-preserving job."""
++        """Interactive deletion returns the completed close."""
+         with patch(
+             "app._controller_call",
+             new=AsyncMock(return_value={
+                 "ok": True,
+-                "accepted": True,
+-                "job": {"id": "close_abcdefghijklmnop", "status": "queued"},
+-                "_status": 202,
++                "killed": "test-session",
++                "_status": 200,
+             }),
+         ):
+             resp = authed_client.delete("/api/sessions/test-session")
+-        assert resp.status_code == 202
++        assert resp.status_code == 200
+         data = resp.json()
+         assert data["ok"] is True
+-        assert data["job"]["status"] == "queued"
++        assert data["killed"] == "test-session"
+ 
+     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+     @patch("app.subprocess.run")
+@@ -4042,15 +4063,15 @@
+         """The HTTP worker delegates process cleanup to the controller."""
+         call = AsyncMock(return_value={
+             "ok": True,
+-            "job": {"id": "close_abcdefghijklmnop", "status": "queued"},
+-            "_status": 202,
++            "killed": "test-session",
++            "_status": 200,
+         })
+         with patch("app._controller_call", new=call):
+             resp = authed_client.delete("/api/sessions/test-session")
+-        assert resp.status_code == 202
++        assert resp.status_code == 200
+         assert resp.json()["ok"] is True
+         call.assert_awaited_once_with(
+-            "session_close_start", session="test-session", owner_id="admin"
++            "session_delete", session="test-session", owner_id="admin"
+         )
+         mock_run.assert_not_called()
+ 
+@@ -4097,12 +4118,12 @@
+             "app._controller_call",
+             new=AsyncMock(return_value={
+                 "ok": True,
+-                "job": {"id": "close_abcdefghijklmnop", "status": "queued"},
+-                "_status": 202,
++                "killed": "test-session",
++                "_status": 200,
+             }),
+         ):
+             resp = authed_client.delete("/api/sessions/test-session")
+-        assert resp.status_code == 202
++        assert resp.status_code == 200
+         assert resp.json()["ok"] is True
+ 
+     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+--- a/test_session_close_ui.py
++++ b/test_session_close_ui.py
+@@ -1,124 +1,78 @@
+-"""Execute the knowledge-preserving close UI against deterministic fetch states."""
+-
++"""Run the session close UI with completed, rejected and lost responses."""
+ import json
+ import shutil
+ import subprocess
+ from pathlib import Path
+-
+ import pytest
+ 
+ APP = Path(__file__).parent / "app.py"
+ NODE = shutil.which("node")
+ pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
+-
+-
+ DRIVER = r"""
+ const fs=require('fs'),vm=require('vm');
+ const source=fs.readFileSync(process.argv[1],'utf8');
+-const quotes='"'.repeat(3);
+-const html=source.match(new RegExp('^HTML_PAGE = r'+quotes+'([\\s\\S]*?)^'+quotes,'m'))[1];
+-const js=html.match(/<script[^>]*>([\s\S]*?)<\/script>/)[1];
+-const region=js.slice(js.indexOf('function showDeleteModal'),js.indexOf('// ── Codex Auth'));
++const region=source.slice(source.indexOf('function showDeleteModal'),source.indexOf('// ── Codex Auth'));
+ const modal={innerHTML:''};
+-const overlay={classList:{add(){},remove(){}}};
+-const status={textContent:''};
+-const elements={'modal-content':modal,'modal-overlay':overlay};
++let active=false,loads=0,requests=0,closed=0;
++const overlay={classList:{add(){active=true},remove(){active=false}}};
+ const scenario=process.argv[2];
+-let polls=0,loads=0;
+-const response=(statusCode,data)=>({ok:statusCode>=200&&statusCode<300,status:statusCode,json:async()=>data});
+-async function fetchStub(url,opts){
+-  if(opts&&opts.method==='DELETE'){
+-    if(scenario==='initial-503')return response(503,{error:'close controller unavailable'});
+-    if(scenario==='initial-response-loss')throw new Error('connection reset');
+-    if(scenario==='initial-verified-open')return response(409,{error:'close blocked',tab_state:'open'});
+-    return response(202,{job:{id:'close_abcdefghijklmnop',status:'running',phase:'capturing'}});
+-  }
+-  polls++;
+-  if(scenario==='transient-success'){
+-    if(polls<=6)throw new Error('network down');
+-    return response(200,{job:{id:'close_abcdefghijklmnop',status:'completed',phase:'complete',tab_state:'closed',spec_file:'TECHNICAL_SPEC.md'}});
+-  }
+-  if(scenario==='no-conversation')return response(200,{job:{id:'close_abcdefghijklmnop',status:'completed',phase:'complete',tab_state:'closed',archived:false}});
+-  if(scenario==='lost-status')return response(404,{error:'Close job not found'});
+-  return response(200,{job:{id:'close_abcdefghijklmnop',status:'failed',phase:'failed',tab_state:'open',error:'disk full'}});
+-}
++const response=(status,data)=>({ok:status>=200&&status<300,status,json:async()=>data});
+ const context=vm.createContext({
+-  console,Promise,Math,BASE:'',selectedSession:'demo',chatMessages:{demo:[]},
+-  _closeSessionRun:0,fetch:fetchStub,setTimeout:fn=>fn(),
+-  esc:value=>String(value),loadAll:async()=>{loads++},
++  Promise,Math,BASE:'',selectedSession:'demo',chatMessages:{demo:[]},_closeSessionRun:0,
++  esc:value=>String(value),setTimeout:fn=>fn(),loadAll:async()=>{loads++},
++  closeModal:()=>{active=false;closed++},
++  fetch:async(url,options)=>{
++    requests++;
++    if(options.method!=='DELETE')throw new Error('Close must not poll a handoff job');
++    if(scenario==='lost')throw new Error('Connection reset');
++    if(scenario==='rejected')return response(409,{error:'Session owner changed'});
++    if(scenario==='malformed')return response(200,{});
++    if(scenario==='unconfirmed')return response(503,{error:'Could not confirm deletion'});
++    if(scenario==='dismissed')modal.innerHTML='<h3>Another dialog</h3>';
++    return response(200,{ok:true,killed:'demo'});
++  },
+   document:{getElementById:id=>{
++    if(id==='modal-content')return modal;
++    if(id==='modal-overlay')return overlay;
+     if(id.startsWith('session-close-job-'))return modal.innerHTML.includes(id)?{}:null;
+-    if(id.startsWith('session-close-status-'))return status;
+-    return elements[id]||null;
++    return null;
+   }},
+ });
+ vm.runInContext(region,context);
+ context.deleteSession('demo').then(()=>process.stdout.write(JSON.stringify({
+-  html:modal.innerHTML,polls,loads,status:status.textContent,
+-  selectedSession:context.selectedSession,
+-  chatPreserved:Object.prototype.hasOwnProperty.call(context.chatMessages,'demo'),
++  html:modal.innerHTML,active,closed,loads,requests,selected:context.selectedSession,
++  chatPreserved:Object.hasOwn(context.chatMessages,'demo'),
+ })));
+ """
+ 
+-
+-def _run(scenario: str) -> dict:
+-    result = subprocess.run(
+-        [NODE, "-e", DRIVER, str(APP), scenario],
+-        capture_output=True,
+-        text=True,
+-        timeout=30,
+-    )
++def _run(scenario):
++    result = subprocess.run([NODE, "-e", DRIVER, str(APP), scenario], capture_output=True, text=True, timeout=15)
+     assert result.returncode == 0, result.stderr
+     return json.loads(result.stdout)
+ 
++def test_success_closes_dialog_and_refreshes_tabs_without_polling():
++    state = _run("success")
++    assert state["closed"] == 1
++    assert state["active"] is False
++    assert state["loads"] == 1
++    assert state["requests"] == 1
++    assert state["selected"] is None
++    assert state["chatPreserved"] is False
+ 
+-def test_transient_poll_failures_keep_tracking_until_close_completes():
+-    state = _run("transient-success")
+-    assert state["polls"] == 7
++@pytest.mark.parametrize("scenario", ["lost", "rejected", "malformed", "unconfirmed"])
++def test_unconfirmed_close_keeps_local_session_and_refreshes_actual_state(scenario):
++    state = _run(scenario)
++    assert state["chatPreserved"] is True
++    assert state["selected"] == "demo"
+     assert state["loads"] == 1
+-    assert "Session closed safely" in state["html"]
++    assert state["requests"] == 1
++    assert state["active"] is True
++    assert "Refresh tabs" in state["html"]
++    assert "verified open" not in state["html"]
++    assert "handoff" not in state["html"]
+ 
+-
+-def test_completed_close_without_conversation_does_not_claim_spec_write():
+-    state = _run("no-conversation")
++def test_late_close_response_does_not_replace_another_dialog():
++    state = _run("dismissed")
++    assert state["closed"] == 0
++    assert state["html"] == "<h3>Another dialog</h3>"
+     assert state["loads"] == 1
+-    assert "Session closed safely" in state["html"]
+-    assert "nothing to archive" in state["html"]
+-    assert "technical handoff was saved" not in state["html"]
+-    assert "TECHNICAL_SPEC.md" not in state["html"]
+-
+-
+-def test_unknown_status_never_claims_tab_is_open_or_offers_retry():
+-    state = _run("lost-status")
+-    assert "Close status needs confirmation" in state["html"]
+-    assert "Nothing was killed" not in state["html"]
+-    assert ">Retry<" not in state["html"]
+-
+-
+-@pytest.mark.parametrize("scenario", ["initial-503", "initial-response-loss"])
+-def test_unconfirmed_initial_delete_preserves_tabs_without_offering_retry(scenario):
+-    state = _run(scenario)
+-    assert state["polls"] == 0
+-    assert state["loads"] == 0
+-    assert state["selectedSession"] == "demo"
+-    assert state["chatPreserved"] is True
+-    assert "Close status needs confirmation" in state["html"]
+-    assert "verified open" not in state["html"]
+-    assert ">Retry<" not in state["html"]
+-
+-
+-def test_explicit_initial_verified_open_failure_offers_retry():
+-    state = _run("initial-verified-open")
+-    assert state["loads"] == 0
+-    assert state["selectedSession"] == "demo"
+-    assert state["chatPreserved"] is True
+-    assert "Session left open" in state["html"]
+-    assert "verified open" in state["html"]
+-    assert ">Retry<" in state["html"]
+-
+-
+-def test_verified_open_failure_offers_retry():
+-    state = _run("failed-open")
+-    assert "Session left open" in state["html"]
+-    assert "verified open" in state["html"]
+-    assert ">Retry<" in state["html"]
