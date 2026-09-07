@@ -1,0 +1,963 @@
+--- a/test_api.py
++++ b/test_api.py
+@@ -395,7 +395,7 @@
+         assert 'class="nav-new-btn" onclick="showCreateModal()"' in html
+         assert "showCreateModal();closeToolsMenu()" in html
+         assert 'id="new-session-name"' in html
+-        assert "JSON.stringify({name:requested||_autoSessionName()})" in html
++        assert "JSON.stringify({name:requested||_autoSessionName(),...choices})" in html
+         assert "if(!requested&&resp.status===409&&data.code==='name_conflict')continue" in html
+ 
+     def test_tools_menu_tracks_accessible_expanded_state(self, authed_client):
+@@ -1361,7 +1361,8 @@
+         assert "Invalid name" in resp.json()["error"]
+ 
+     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+-    def test_create_session_duplicate_name(self, mock_sessions, authed_client):
++    @patch("app._load_model_snapshot", return_value=([], app_module._SEED_MODEL_EFFORTS, 1))
++    def test_create_session_duplicate_name(self, mock_catalog, mock_sessions, authed_client):
+         with patch("app._exact_tmux_session_id", return_value="$1"):
+             resp = authed_client.post(
+                 "/api/sessions/create",
+@@ -3437,6 +3438,9 @@
+             "model": "gpt-6-astra",
+             "model_pending": "gpt-6-astra",
+             "effort": "ultra",
++            "session_model_settings": False,
++            "no_fallback": True,
++            "fallback_status": "",
+         }
+ 
+     def test_config_replace_fails_closed_across_filesystems(self, tmp_path):
+--- a/app.py
++++ b/app.py
+@@ -2268,6 +2268,7 @@
+         ("tmp watchdog", _tmp_watchdog_loop()),
+         ("crash recovery", _crash_recovery_loop()),
+         ("codex health watchdog", _codex_health_watchdog_loop()),
++        ("model service recovery", _model_fallback_loop()),
+         ("model refresh", _model_refresh_loop()),
+         ("browser lifecycle", _browser_lifecycle_loop()),
+         ("session lifecycle", _session_lifecycle_loop()),
+@@ -14478,6 +14479,28 @@
+ 
+ class CreateSession(BaseModel):
+     name: str = ""
++    model: str = os.environ.get("TMUX_DASH_NEW_SESSION_MODEL", "gpt-6-astra")
++    effort: str = os.environ.get("TMUX_DASH_NEW_SESSION_EFFORT", "max")
++    no_fallback: bool = False
++
++
++def _validated_new_session_options(body: CreateSession, user: dict | None) -> dict:
++    _catalog, efforts, checked = _load_model_snapshot(_model_catalog_file_for_user(user))
++    if checked <= 0:
++        raise RuntimeError("Model catalog is unavailable. Refresh and try again.")
++    if body.model not in efforts:
++        raise ValueError("This model is unavailable for your account.")
++    if body.effort not in efforts[body.model]:
++        raise ValueError(f"{body.model} does not support {body.effort} effort.")
++    return {"model": body.model, "effort": body.effort, "no_fallback": body.no_fallback}
++
++
++def _session_launch_options(session_name: str, expected_owner_id: str | None = None) -> dict:
++    row = _session_lifecycle.get(session_name)
++    owner = expected_owner_id or _session_owner_id(session_name)
++    if not owner or row.get("owner_id") != owner or _session_owner_id(session_name) != owner:
++        return {}
++    return dict(row.get("launch_options") or {})
+ 
+ 
+ def _is_valid_session_name(name: str) -> bool:
+@@ -14573,7 +14596,8 @@
+ 
+ 
+ async def _finish_created_session(
+-    user: dict | None, created: str, session_id: str, create_token: str
++    user: dict | None, created: str, session_id: str, create_token: str,
++    launch_options: dict | None = None,
+ ) -> JSONResponse:
+     owner_id = str((user or {}).get("id") or "admin")
+     generation = ""
+@@ -14603,6 +14627,7 @@
+             cwd=initial_cwd,
+             owner_id=owner_id,
+             source="session-create",
++            launch_options=launch_options,
+         )
+         generation = str(lifecycle.get("generation") or "")
+         if not generation:
+@@ -14659,8 +14684,10 @@
+             launch = _session_launch_command(
+                 created,
+                 _session_launch_base(created, user),
+-                pin_model=not _uses_private_account_runtime(user),
++                pin_model=True,
+                 expected_owner_id=owner_id,
++                model=(launch_options or {}).get("model"),
++                effort=(launch_options or {}).get("effort"),
+             )
+             if (
+                 _exact_tmux_session_id(created) != session_id
+@@ -14748,6 +14775,12 @@
+             {"error": "Invalid name. Use up to 128 letters, numbers, dots, dashes, or underscores."},
+             status_code=400,
+         )
++    try:
++        launch_options = _validated_new_session_options(body, user)
++    except ValueError as exc:
++        return JSONResponse({"error": str(exc)}, status_code=400)
++    except RuntimeError as exc:
++        return JSONResponse({"error": str(exc)}, status_code=503)
+     auth_home = _user_codex_config_dir(user)
+     if _uses_private_account_runtime(user):
+         _ensure_user_codex_config_dir(user)
+@@ -14819,7 +14852,7 @@
+                         status_code=500,
+                     )
+                 response = await _finish_created_session(
+-                    user, created, session_id, create_token
++                    user, created, session_id, create_token, launch_options
+                 )
+                 if response.status_code == 200 and display_name != created:
+                     def save_manual_label(data):
+@@ -14838,7 +14871,7 @@
+         try:
+             with _session_operation_lock(created):
+                 response = await _finish_created_session(
+-                    user, created, session_id, create_token
++                    user, created, session_id, create_token, launch_options
+                 )
+         except _SessionOperationBusy:
+             _kill_exact_created_tmux(created, session_id, create_token)
+@@ -21897,6 +21930,9 @@
+             effort = configured_effort
+     except Exception:
+         pass
++    options = _session_launch_options(session_name)
++    if options:
++        configured_model, effort = options["model"], options["effort"]
+     model = live_model or configured_model
+     configured_base = configured_model.split("[", 1)[0]
+     confirmed = bool(
+@@ -21911,6 +21947,9 @@
+         "model": model,
+         "model_pending": configured_model if configured_model and not confirmed else "",
+         "effort": effort,
++        "session_model_settings": bool(options),
++        "no_fallback": options.get("no_fallback", True),
++        "fallback_status": (options.get("fallback") or {}).get("status", ""),
+     }
+ 
+ 
+@@ -22968,6 +23007,7 @@
+         "default": DEFAULT_MODEL,
+         "efforts": list(_CODEX_REASONING_EFFORTS),
+         "default_effort": _CODEX_DEFAULT_REASONING_EFFORT,
++        "new_session_defaults": CreateSession().model_dump(exclude={"name"}),
+     })
+ 
+ 
+@@ -23003,7 +23043,10 @@
+ def _saved_session_model_effort(
+     session_name: str, expected_owner_id: str | None = None
+ ) -> tuple[str, str]:
+-    """Read the account settings that must override a resumed thread's history."""
++    """Prefer this session's choices when resuming, then legacy account settings."""
++    options = _session_launch_options(session_name, expected_owner_id)
++    if options:
++        return options["model"], options["effort"]
+     model = DEFAULT_MODEL
+     effort = _CODEX_DEFAULT_REASONING_EFFORT
+     initial_config = _verified_session_codex_config_path(
+@@ -23534,7 +23577,25 @@
+     requested_effort: str | None = None,
+     expected_owner_id: str | None = None,
+ ) -> tuple[str, str]:
+-    """Validate and write an account model-effort pair under one file lock."""
++    """Write scoped session choices, or legacy account settings, atomically."""
++    row = _session_lifecycle.get(session_name)
++    options = _session_launch_options(session_name, expected_owner_id)
++    if options:
++        from session_model_policy import compatible_effort, update_options
++        target_model = requested_model or options["model"]
++        target_effort = requested_effort or options["effort"]
++        supported = model_efforts.get(target_model, [])
++        if requested_model and target_effort not in supported:
++            target_effort = compatible_effort(target_effort, supported)
++        if not target_effort or target_effort not in supported:
++            raise _UnsupportedModelEffortError("This model does not support the requested effort.")
++        try:
++            update_options(_session_lifecycle, session_name, str(row.get("owner_id")),
++                           str(row.get("generation")),
++                           {"model": target_model, "effort": target_effort, "fallback": {}}, expected=options)
++        except ValueError as exc:
++            raise _SessionOwnershipChangedError(str(exc)) from exc
++        return target_model, target_effort
+     initial_path = _verified_session_codex_config_path(
+         session_name, expected_owner_id
+     )
+@@ -25189,6 +25250,213 @@
+     # The API workers cannot see this process's memory — publish it.
+     await asyncio.to_thread(_publish_codex_auth_state, _codex_health_auth)
+     return dict(_codex_health_auth)
++
++
++def _model_recovery_event(session_name: str, owner_id: str) -> dict | None:
++    from session_model_policy import latest_turn
++    owner_binding = _strict_session_owner(session_name, owner_id)
++    row = _session_lifecycle.get(session_name)
++    root = str(row.get("resume_uuid") or "")
++    if not owner_binding or not root or _validated_session_root_thread_id(session_name, root, owner_id) != root:
++        return None
++    fd, _relative, fingerprint = _open_session_close_rollout({
++        "session_name": session_name, "owner_id": owner_id,
++        "owner": owner_binding[1], "resume_uuid": root,
++    })
++    with os.fdopen(fd, "rb") as stream:
++        # No old error may survive a newer lifecycle event. Truncated leading
++        # rows are discarded; a tail without a lifecycle event fails closed.
++        offset = max(0, fingerprint[2] - 1_000_000)
++        stream.seek(offset)
++        if offset:
++            stream.readline()
++        return latest_turn(stream.read(1_000_000).splitlines())
++
++
++def _model_recovery_composer_ready(visible: str) -> bool:
++    lines = visible.splitlines()[-25:]
++    return bool(
++        any(_CODEX_COMPOSER_FOOTER_RE.match(line) for line in lines)
++        and any(_CODEX_COMPOSER_LINE_RE.match(line) for line in lines)
++        and not re.search(r"esc to interrupt|tab to queue", visible, re.I)
++        and not _has_pending_user_input(visible)
++        and not _detect_interactive_prompt(visible)
++        and not _looks_like_bare_shell(visible)
++    )
++
++
++async def _model_fallback_once(session_name: str) -> bool:
++    """Recover a terminal service failure once, on the same owner-bound root."""
++    from session_model_policy import fallback_candidate, recoverable_error, update_options
++    row = _session_lifecycle.get(session_name)
++    options = row.get("launch_options") or {}
++    owner_id = str(row.get("owner_id") or "")
++    generation = str(row.get("generation") or "")
++    if (not options or options.get("no_fallback", True) or row.get("desired_state") != "running"
++            or session_name in _session_close_barriers
++            or _session_auth_mode.get(session_name) != "subscription"):
++        return False
++    owner_binding = _strict_session_owner(session_name, owner_id)
++    if not owner_binding or not await _async_is_codex_running(session_name):
++        return False
++    if not row.get("resume_uuid"):
++        with _session_operation_lock(session_name):
++            await asyncio.to_thread(_checkpoint_active_session, session_name, source="model-recovery-probe")
++        row = _session_lifecycle.get(session_name)
++        if row.get("generation") != generation or row.get("owner_id") != owner_id:
++            return False
++    event = await asyncio.to_thread(_model_recovery_event, session_name, owner_id)
++    if not event or event.get("type") != "task_complete":
++        return False
++    if not event.get("error"):
++        previous = options.get("fallback") or {}
++        if previous.get("attempts") and event.get("turn_id") != previous.get("turn_id"):
++            # A completed turn ends the outage episode. Keep its visible audit.
++            update_options(_session_lifecycle, session_name, owner_id, generation,
++                           {"fallback": {**previous, "attempts": 0, "tried": []}}, expected=options)
++        return False
++    completed = event.get("completed_at")
++    if not isinstance(completed, (int, float)) or not 20 <= time.time() - completed <= 3600:
++        return False
++    facts = await asyncio.to_thread(_codex_session_facts, session_name)
++    if (facts.get("metrics_thread_id") != row.get("resume_uuid")
++            or facts.get("model") != options.get("model") or facts.get("metrics_catching_up")):
++        return False
++    _catalog, efforts, checked = _load_model_snapshot(_model_catalog_file_for_user(owner_binding[1]))
++    if checked <= 0:
++        return False
++    chain = [m.strip() for m in os.environ.get(
++        "TMUX_DASH_FALLBACK_MODELS", "gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna"
++    ).split(",") if m.strip()]
++    candidate = fallback_candidate(options, event, efforts, chain)
++    if not candidate:
++        previous = options.get("fallback") or {}
++        if recoverable_error(event.get("error")) and previous.get("turn_id") != event.get("turn_id"):
++            update_options(_session_lifecycle, session_name, owner_id, generation,
++                           {"fallback": {**previous, "turn_id": event.get("turn_id"),
++                            "status": "Automatic fallback stopped. Select a model to retry."}}, expected=options)
++        return False
++    model, effort = candidate
++    async with _async_tmux_server_mutation_lock():
++        with _session_operation_lock(session_name):
++            binding = await _autopush_terminal_binding(session_name, owner_id)
++            if not binding or binding.get("generation") != generation:
++                return False
++            target = str(binding["session_id"])
++            expected_options = options
++
++            async def current() -> bool:
++                return bool(
++                    session_name not in _session_close_barriers
++                    and _session_auth_mode.get(session_name) == "subscription"
++                    and _session_launch_options(session_name, owner_id) == expected_options
++                    and _session_lifecycle.matches(session_name, generation=generation,
++                        owner_id=owner_id, desired_states={"running"}, resume_uuid=row.get("resume_uuid"), restore_on_startup=True)
++                    and await asyncio.to_thread(_terminal_binding_state, binding) == "current"
++                )
++
++            async def capture() -> str:
++                result = await asyncio.to_thread(subprocess.run,
++                    ["tmux", "capture-pane", "-t", target, "-p"], capture_output=True, text=True, timeout=3)
++                return result.stdout if result.returncode == 0 else ""
++
++            async def send(text: str) -> bool:
++                async with _autopush_action_lock(session_name):
++                    if not await current():
++                        return False
++                    result = await _to_thread_drain_on_cancel(subprocess.run,
++                        ["tmux", "send-keys", "-t", target, "-l", text], capture_output=True, text=True, timeout=5)
++                    if result.returncode != 0:
++                        return False
++                    await asyncio.sleep(0.3)
++                    if not await current():
++                        return False
++                    result = await _to_thread_drain_on_cancel(subprocess.run,
++                        ["tmux", "send-keys", "-t", target, "Enter"], capture_output=True, text=True, timeout=5)
++                    return result.returncode == 0
++
++            if (not await current() or _session_launch_options(session_name, owner_id) != options
++                    or await asyncio.to_thread(_model_recovery_event, session_name, owner_id) != event
++                    or not _model_recovery_composer_ready(await capture())):
++                return False
++            previous = options.get("fallback") or {}
++            state = {"turn_id": event["turn_id"], "attempts": int(previous.get("attempts") or 0) + 1,
++                     "tried": [*(previous.get("tried") or []), options["model"], model],
++                     "from_model": options["model"], "to_model": model, "at": time.time(),
++                     "status": f"Service error: switching from {options['model']} to {model} ({effort})."}
++            updated = update_options(_session_lifecycle, session_name, owner_id, generation,
++                                     {"model": model, "effort": effort, "fallback": state}, expected=options)
++            expected_options = updated
++
++            def status(message):
++                nonlocal updated, expected_options
++                updated = update_options(_session_lifecycle, session_name, owner_id, generation,
++                    {"fallback": {**state, "status": message}}, expected=updated)
++                expected_options = updated
++
++            # A failed turn must already be idle. Never interrupt a turn or an
++            # approval prompt to force a model change, even if quitting fails.
++            if not await send("/quit"):
++                status("Model fallback could not restart this session. Retry manually.")
++                return False
++            for _ in range(15):
++                await asyncio.sleep(1)
++                if not await _async_is_codex_running(session_name):
++                    break
++            if await _async_is_codex_running(session_name) or not await current():
++                status("Model fallback stopped because Codex did not exit. Retry manually.")
++                return False
++            restarted = await _ensure_codex_running(session_name,
++                resume_uuid=row["resume_uuid"], resume_cwd=row["cwd"],
++                expected_owner_id=owner_id, expected_generation=generation,
++                expected_desired_states={"running"}, allow_fresh=False,
++                operation_locked=True, tmux_locked=True)
++            if not restarted:
++                status("Fallback model saved. Session recovery is pending; retry when ready.")
++                return False
++            ready = False
++            for _ in range(20):
++                await asyncio.sleep(1)
++                if not await current() or _session_launch_options(session_name, owner_id) != updated:
++                    return False
++                # No duplicate continuation after a new user turn or a retry.
++                if await asyncio.to_thread(_model_recovery_event, session_name, owner_id) != event:
++                    status(f"Switched to {model} ({effort}). A newer turn already exists.")
++                    return False
++                if _model_recovery_composer_ready(await capture()):
++                    ready = True
++                    break
++            if not ready:
++                status(f"Switched to {model} ({effort}). Continue when the session is ready.")
++                return False
++            prompt = "Continue the interrupted task after the model service error. Preserve all prior instructions, safety decisions and permission boundaries."
++            if not await send(prompt):
++                status(f"Switched to {model} ({effort}). Continue manually.")
++                return False
++            submitted = await _ensure_codex_submitted(session_name, prompt, target)
++            if submitted not in {"submitted", "queued", "resent"}:
++                status(f"Switched to {model} ({effort}). Continue manually; submission was not confirmed.")
++                return False
++            _session_lifecycle.touch(session_name, source="model-service-recovery", records_input=True)
++            status(f"Service recovery: {options['model']} switched to {model} ({effort}); continuing the same session.")
++            logger.info("Model service recovery in %s: %s to %s, effort %s", session_name, options["model"], model, effort)
++            _session_model_cache.pop(session_name, None)
++            return True
++
++
++async def _model_fallback_loop():
++    await asyncio.sleep(30)
++    while True:
++        for session in await asyncio.to_thread(get_tmux_sessions):
++            try:
++                await _model_fallback_once(session["name"])
++            except asyncio.CancelledError:
++                raise
++            except (_SessionOperationBusy, _TmuxMutationBusy, ValueError):
++                pass
++            except Exception:
++                logger.debug("Model service recovery deferred", exc_info=True)
++        await asyncio.sleep(10)
+ 
+ 
+ async def _codex_health_watchdog_loop():
+@@ -30972,6 +31240,7 @@
+   'gpt-5.3-codex-spark':['low','medium','high','xhigh'],
+ };
+ let DEFAULT_EFFORT='xhigh';
++let NEW_SESSION_DEFAULTS={model:'gpt-6-astra',effort:'max',no_fallback:false};
+ (function loadModelChoices(){
+   try{
+     fetch(BASE+'/api/models').then(r=>r.ok?r.json():null).then(d=>{
+@@ -30981,6 +31250,7 @@
+       if(d&&Array.isArray(d.efforts)&&d.efforts.length)EFFORT_CHOICES=d.efforts;
+       if(d&&d.model_efforts&&typeof d.model_efforts==='object')MODEL_EFFORTS=d.model_efforts;
+       if(d&&d.default_effort)DEFAULT_EFFORT=d.default_effort;
++      if(d&&d.new_session_defaults)NEW_SESSION_DEFAULTS=d.new_session_defaults;
+     }).catch(()=>{});
+   }catch(e){}
+ })();
+@@ -31010,7 +31280,7 @@
+   closeModelMenu();
+   const s=sessions.find(x=>x.name===name)||{};
+   const cur=catalogModelId(s.model_pending||s.model||'');
+-  let html='<div class="mm-title">Codex account model · applies after restart</div>';
++  let html='<div class="mm-title">'+(s.session_model_settings?'Session model':'Codex account model')+' · applies after restart</div>';
+   MODEL_CHOICES.forEach(([id,label])=>{
+     const sel=cur&&id===cur;
+     html+='<button type="button" class="mm-item'+(sel?' sel':'')+'" onclick="setSessionModel(\''+esc(name)+'\',\''+id+'\')">'
+@@ -31059,6 +31329,8 @@
+ }
+ function _paintModelBadge(name){
+   const s=sessions.find(x=>x.name===name);
++  const notice=document.getElementById('model-fallback-'+name);
++  if(notice){notice.textContent=s?.fallback_status||'';notice.style.display=s?.fallback_status?'':'none';}
+   const lbl=modelBadgeLabel(s);
+   const mb=document.getElementById('model-badge-'+name);
+   if(mb){
+@@ -31161,7 +31433,7 @@
+   modal.classList.remove('modal-wide');
+   modal.innerHTML=`<h3>Rename session</h3>
+     <label for="session-rename-input">Session name</label>
+-    <input id="session-rename-input" type="text" maxlength="128" value="${esc(sessionTabLabel(session))}" style="width:100%;margin:10px 0" onkeydown="if(event.key==='Enter'){event.preventDefault();renameSession('${esc(name)}')}">
++    <input id="session-rename-input" type="text" maxlength="128" value="${esc(sessionTabLabel(session))}" style="width:100%;margin:10px 0;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px" onkeydown="if(event.key==='Enter'){event.preventDefault();renameSession('${esc(name)}')}">
+     <p id="session-rename-error" role="alert" style="color:#f85149"></p>
+     <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
+     <button id="session-rename-save" class="modal-confirm-create" onclick="renameSession('${esc(name)}')">Save name</button></div>`;
+@@ -31564,6 +31836,7 @@
+       </div>
+     </div>
+ 
++    <div id="model-fallback-${s.name}" role="status" style="padding:8px 16px;color:#d29922;${s.fallback_status?'':'display:none'}">${esc(s.fallback_status||'')}</div>
+     <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
+       <div class="chat-wrap">
+         <div class="chat-controls">
+@@ -33086,6 +33359,9 @@
+         if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
+         if(st.model&&sessions[si].model!==st.model){sessions[si].model=st.model;navChanged=true;badgeChanged=true;}
+         if(st.effort&&sessions[si].effort!==st.effort){sessions[si].effort=st.effort;badgeChanged=true;}
++        for(const field of ['fallback_status','no_fallback','session_model_settings']){
++          if(Object.prototype.hasOwnProperty.call(st,field)&&sessions[si][field]!==st[field]){sessions[si][field]=st[field];badgeChanged=true;}
++        }
+         if(badgeChanged)_paintModelBadge(st.name);
+         if(navChanged)renderNav();
+       }
+@@ -33482,24 +33758,49 @@
+   }
+   return false;
+ }
+-function showCreateModal(prefill=''){
++function showCreateModal(prefill='',choices=null){
+   if(_sessionCreatePending)return;
+   const modal=document.getElementById('modal-content');
+   modal.classList.remove('modal-wide');
++  const selected=choices||NEW_SESSION_DEFAULTS;
+   modal.innerHTML=`<h3>New session</h3>
+     <label for="new-session-name">Session name</label>
+     <input id="new-session-name" type="text" maxlength="128" autocomplete="off" placeholder="e.g. Website updates" value="${esc(prefill)}" style="width:100%;margin:10px 0" onkeydown="if(event.key==='Enter'){event.preventDefault();createSession()}">
+     <p class="conn-note">Leave empty to generate a random name. Automatic naming is optional in Settings.</p>
++    <div style="display:flex;gap:12px;flex-wrap:wrap;margin:16px 0">
++      <label style="flex:1;min-width:150px" for="new-session-model">Model
++        <select id="new-session-model" style="display:block;width:100%;margin-top:6px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;color-scheme:dark" onchange="updateNewSessionEfforts()">${MODEL_CHOICES.map(([id,label])=>`<option value="${esc(id)}" ${id===selected.model?'selected':''}>${esc(label)}</option>`).join('')}</select>
++      </label>
++      <label style="flex:1;min-width:110px" for="new-session-effort">Effort
++        <select id="new-session-effort" style="display:block;width:100%;margin-top:6px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;color-scheme:dark"></select>
++      </label>
++    </div>
++    <label style="display:flex;align-items:flex-start;gap:8px" for="new-session-nofb"><input id="new-session-nofb" type="checkbox" ${selected.no_fallback?'checked':''} style="width:auto;margin-top:3px">Refuse automatic model fallback</label>
++    <p class="conn-note">When unchecked, service errors can switch subscription sessions to another available model and continue. Safety, permission and usage limits still stop the request.</p>
+     <p id="session-create-error" role="alert" style="color:#f85149"></p>
+     <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
+     <button class="modal-confirm-create" onclick="createSession()">Create</button></div>`;
+   document.getElementById('modal-overlay').classList.add('active');
++  updateNewSessionEfforts(selected.effort);
+   setTimeout(()=>document.getElementById('new-session-name')?.focus(),50);
++}
++function updateNewSessionEfforts(preferred){
++  const model=document.getElementById('new-session-model');
++  const select=document.getElementById('new-session-effort');
++  if(!model||!select)return;
++  const requested=preferred||select.value||'max';
++  const supported=MODEL_EFFORTS[model.value]||[];
++  const ceiling=EFFORT_CHOICES.indexOf(requested);
++  const chosen=supported.includes(requested)?requested:EFFORT_CHOICES.slice(0,ceiling>=0?ceiling+1:6).reverse().find(e=>supported.includes(e));
++  select.innerHTML=supported.map(e=>`<option value="${esc(e)}" ${e===chosen?'selected':''}>${esc(e==='xhigh'?'Extra high':e.charAt(0).toUpperCase()+e.slice(1))}</option>`).join('');
+ }
+ function createSessionAuto(){showCreateModal()}
+ async function createSession(){
+   if(_sessionCreatePending)return;
+   const requested=(document.getElementById('new-session-name')?.value||'').trim();
++  const choices={model:document.getElementById('new-session-model')?.value||NEW_SESSION_DEFAULTS.model,
++    effort:document.getElementById('new-session-effort')?.value||NEW_SESSION_DEFAULTS.effort,
++    no_fallback:!!document.getElementById('new-session-nofb')?.checked};
+   _sessionCreatePending=true;
+   const run=++_sessionCreateRun;
+   const overlay=document.getElementById('modal-overlay');
+@@ -33514,7 +33815,7 @@
+     for(let attempt=0;attempt<5;attempt++){
+       const resp=await fetch(BASE+'/api/sessions/create',{
+         method:'POST',headers:{'Content-Type':'application/json'},
+-        body:JSON.stringify({name:requested||_autoSessionName()})
++        body:JSON.stringify({name:requested||_autoSessionName(),...choices})
+       });
+       const data=await resp.json().catch(()=>({}));
+       if(!requested&&resp.status===409&&data.code==='name_conflict')continue;
+@@ -33542,7 +33843,7 @@
+   }catch(error){
+     if(!_sessionCreateModalOwns(run))return;
+     _sessionCreatePending=false;
+-    showCreateModal(requested);
++    showCreateModal(requested,choices);
+     const errorEl=document.getElementById('session-create-error');
+     if(errorEl)errorEl.textContent=error&&error.message?error.message:'Network error. Please try again.';
+   }finally{
+--- /dev/null
++++ b/session_model_policy.py
+@@ -0,0 +1,87 @@
++"""Session-scoped launch choices and bounded recovery from service failures."""
++import json
++import re
++
++EFFORTS = ("none", "low", "medium", "high", "xhigh", "max", "ultra")
++
++
++def compatible_effort(requested, supported):
++    ceiling = EFFORTS.index(requested) if requested in EFFORTS else EFFORTS.index("max")
++    return next((e for e in reversed(EFFORTS[:ceiling + 1]) if e in supported), None)
++
++
++def recoverable_error(error):
++    """Accept only Codex's structured operational failures, never conversation text."""
++    if not isinstance(error, dict) or error.get("misalignment"):
++        return False
++    info = error.get("codex_error_info", error.get("codexErrorInfo"))
++    if isinstance(info, str):
++        if info in {"serverOverloaded", "internalServerError", "rateLimitExceeded"}:
++            return True
++        # Codex 0.153.4 persists HTTP 503 as `other`; only its exact transport
++        # prefix with an operational status is accepted, not arbitrary prose.
++        return info == "other" and bool(re.match(
++            r"^unexpected status (?:408|429|500|502|503|504)\b", str(error.get("message") or "")
++        ))
++    if not isinstance(info, dict) or len(info) != 1:
++        return False
++    kind, details = next(iter(info.items()))
++    if kind not in {"httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts"}:
++        return False
++    if not isinstance(details, dict):
++        return False
++    status = details.get("httpStatusCode", details.get("http_status_code"))
++    return status is None or (type(status) is int and status in {408, 429, 500, 502, 503, 504})
++
++
++def latest_turn(lines):
++    """Read only lifecycle events, with a newer start invalidating an old error."""
++    latest = None
++    for line in lines:
++        try:
++            event = json.loads(line)
++        except (ValueError, TypeError):
++            continue
++        if not isinstance(event, dict) or event.get("type") != "event_msg":
++            continue
++        payload = event.get("payload")
++        if isinstance(payload, dict) and payload.get("type") in {"task_started", "task_complete", "turn_aborted"}:
++            latest = payload
++    return latest
++
++
++def next_model(current, effort, catalog, chain, tried):
++    for model in chain:
++        if model == current or model in tried or model not in catalog:
++            continue
++        level = compatible_effort(effort, catalog[model])
++        if level:
++            return model, level
++    return None
++
++
++def fallback_candidate(options, event, catalog, chain):
++    if not options or options.get("no_fallback", True) or not event:
++        return None
++    state = options.get("fallback") or {}
++    if (event.get("type") != "task_complete" or not event.get("turn_id")
++            or not recoverable_error(event.get("error"))
++            or state.get("turn_id") == event["turn_id"]
++            or int(state.get("attempts") or 0) >= 2):
++        return None
++    return next_model(options["model"], options["effort"], catalog, chain, state.get("tried") or [])
++
++
++def update_options(store, name, owner, generation, updates, *, expected=None):
++    """Compare and update one live generation without touching account config."""
++    def mutate(data):
++        row = data.get("sessions", {}).get(name, {})
++        if (row.get("owner_id") != owner or row.get("generation") != generation
++                or row.get("desired_state") != "running"):
++            raise ValueError("Session owner, generation or state changed")
++        current = row.get("launch_options") or {}
++        if expected is not None and current != expected:
++            raise ValueError("Session model settings changed")
++        row["launch_options"] = {**current, **updates}
++        return dict(row["launch_options"])
++    return store.store.update(mutate)[1]
+--- /dev/null
++++ b/test_session_launch_options.py
+@@ -0,0 +1,230 @@
++import io
++import json
++from unittest.mock import patch
++
++import pytest
++
++import app
++from runtime_control import SessionLifecycleStore
++
++
++def test_create_defaults_are_astra_max():
++    body = app.CreateSession(name="work")
++    assert (body.model, body.effort, body.no_fallback) == ("gpt-6-astra", "max", False)
++
++
++def test_new_session_settings_survive_checkpoints_without_changing_account(tmp_path):
++    store = SessionLifecycleStore(tmp_path / "state.json")
++    options = {"model": "gpt-5.6-luna", "effort": "high", "no_fallback": True}
++    row = store.register_active("a", cwd=str(tmp_path), owner_id="admin", launch_options=options)
++    store.checkpoint_active("a", cwd=str(tmp_path), owner_id="admin", expected_generation=row["generation"])
++    with patch.object(app, "_session_lifecycle", store), patch.object(app, "_session_owner_id", return_value="admin"):
++        assert app._saved_session_model_effort("a", "admin") == ("gpt-5.6-luna", "high")
++        assert store.get("a")["launch_options"]["no_fallback"] is True
++
++
++def test_new_session_selection_validated_before_tmux():
++    with patch.object(app, "_load_model_snapshot", return_value=([["gpt-6-astra", "Astra"]], {"gpt-6-astra": ["max"]}, 1)):
++        with pytest.raises(ValueError, match="support"):
++            app._validated_new_session_options(app.CreateSession(effort="ultra"), {"id": "admin"})
++
++
++@pytest.mark.parametrize("info", ["serverOverloaded", "internalServerError", "rateLimitExceeded", {"responseTooManyFailedAttempts": {"httpStatusCode": 503}}])
++def test_operational_failures_allow_recovery(info):
++    from session_model_policy import recoverable_error
++    assert recoverable_error({"codex_error_info": info, "message": "Service error"})
++
++
++@pytest.mark.parametrize("info", ["cyberPolicy", "misalignmentPolicyViolation", "unauthorized", "sessionBudgetExceeded", "usageLimitExceeded", "badRequest", "sandboxError", "contextWindowExceeded", "other", {"httpConnectionFailed": {"httpStatusCode": 403}}])
++def test_policy_access_budget_and_unknown_errors_never_swap(info):
++    from session_model_policy import recoverable_error
++    assert not recoverable_error({"codex_error_info": info, "message": "Service error"})
++
++
++def test_observed_codex_503_event_recovers_but_quoted_error_does_not():
++    from session_model_policy import latest_turn, recoverable_error
++    failure = {"type": "task_complete", "turn_id": "turn-1", "completed_at": 123, "error": {"codex_error_info": "other", "message": "unexpected status 503 Service Unavailable: Synthetic service unavailable, url: http://localhost/v1/responses"}}
++    lines = [json.dumps({"type": "event_msg", "payload": failure})]
++    assert recoverable_error(latest_turn(lines)["error"])
++    assert latest_turn([json.dumps({"type": "response_item", "payload": {"content": lines}})]) is None
++    lines.append(json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-2"}}))
++    assert latest_turn(lines)["type"] == "task_started"
++
++
++def test_fallback_uses_verified_models_and_never_raises_effort():
++    from session_model_policy import next_model
++    catalog = {"gpt-5.6-sol": ["low", "high", "ultra"], "gpt-5.6-luna": ["high", "max"]}
++    assert next_model("gpt-6-astra", "max", catalog, ["missing", "gpt-5.6-sol"], []) == ("gpt-5.6-sol", "high")
++    assert next_model("gpt-6-astra", "max", catalog, ["gpt-5.6-sol"], ["gpt-5.6-sol"]) is None
++
++
++def test_opt_out_and_exhaustion_prevent_fallback():
++    from session_model_policy import fallback_candidate
++    event = {"type": "task_complete", "turn_id": "t", "error": {"codex_error_info": "serverOverloaded"}}
++    catalog = {"gpt-5.6-sol": ["max"]}
++    options = {"model": "gpt-6-astra", "effort": "max", "no_fallback": True}
++    assert fallback_candidate(options, event, catalog, ["gpt-5.6-sol"]) is None
++    options.update(no_fallback=False, fallback={"attempts": 2})
++    assert fallback_candidate(options, event, catalog, ["gpt-5.6-sol"]) is None
++
++
++def test_session_settings_cannot_cross_owner_or_recycled_generation(tmp_path):
++    from session_model_policy import update_options
++    store = SessionLifecycleStore(tmp_path / "state.json")
++    row = store.register_active("a", cwd=str(tmp_path), owner_id="alice")
++    for owner, generation in [("bob", row["generation"]), ("alice", "stale")]:
++        with pytest.raises(ValueError):
++            update_options(store, "a", owner, generation, {"model": "bad"})
++    assert "launch_options" not in store.get("a")
++
++
++@pytest.mark.parametrize("visible", ["shell $", "› draft\n  gpt-6-astra max · /tmp", "›\n  gpt-6-astra max · /tmp\n esc to interrupt", "Allow this command?\n› 1. Yes"])
++def test_recovery_never_types_into_drafts_running_turns_or_prompts(visible):
++    assert not app._model_recovery_composer_ready(visible)
++
++
++def test_recovery_requires_an_explicit_empty_codex_composer():
++    assert app._model_recovery_composer_ready("Service unavailable\n\n›\n\n  gpt-6-astra max · /tmp")
++
++
++@pytest.mark.asyncio
++async def test_fallback_opt_out_does_not_read_or_mutate_terminal(tmp_path):
++    store = SessionLifecycleStore(tmp_path / "state.json")
++    store.register_active("a", cwd=str(tmp_path), owner_id="admin", launch_options={"model": "gpt-6-astra", "effort": "max", "no_fallback": True})
++    with patch.object(app, "_session_lifecycle", store), patch.object(app, "subprocess") as process:
++        await app._model_fallback_once("a")
++        process.run.assert_not_called()
++
++
++@pytest.fixture
++def recovery_runtime(tmp_path, monkeypatch):
++    from contextlib import asynccontextmanager, nullcontext
++    from types import SimpleNamespace
++    from unittest.mock import AsyncMock
++    import time
++    store = SessionLifecycleStore(tmp_path / 'state.json')
++    opts = {'model': 'gpt-6-astra', 'effort': 'max', 'no_fallback': False}
++    row = store.register_active('a', cwd=str(tmp_path), owner_id='admin', launch_options=opts)
++    store.checkpoint_active('a', cwd=str(tmp_path), owner_id='admin', resume_uuid='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', expected_generation=row['generation'])
++    event = {'type': 'task_complete', 'turn_id': 'failed-turn', 'completed_at': time.time()-30,
++             'error': {'codex_error_info': 'serverOverloaded'}}
++    state = {'running': True, 'event': event, 'commands': [], 'visible': 'Service error\n\n›\n\n  gpt-6-astra max · /tmp'}
++    binding = {'session_id': '$123', 'generation': row['generation']}
++    @asynccontextmanager
++    async def lock(*args):
++        yield
++    async def running(*args): return state['running']
++    async def ensure(*args, **kwargs):
++        state['running'] = True
++        state['resume'] = kwargs
++        return True
++    def command(args, **kwargs):
++        if args[1]=='capture-pane': return SimpleNamespace(returncode=0, stdout=state['visible'])
++        state['commands'].append(args)
++        if args[-1]=='Enter' and state.get('typed')=='/quit': state['running']=False
++        if '-l' in args: state['typed']=args[-1]
++        return SimpleNamespace(returncode=0, stdout='')
++    monkeypatch.setattr(app, '_session_lifecycle', store)
++    monkeypatch.setattr(app, '_session_auth_mode', {'a':'subscription'})
++    monkeypatch.setattr(app, '_strict_session_owner', lambda *a: ('admin', {'id':'admin'}))
++    monkeypatch.setattr(app, '_session_owner_id', lambda *a: 'admin')
++    monkeypatch.setattr(app, '_async_is_codex_running', running)
++    monkeypatch.setattr(app, '_model_recovery_event', lambda *a: state['event'])
++    monkeypatch.setattr(app, '_codex_session_facts', lambda *a: {'model':store.get('a')['launch_options']['model'],'metrics_thread_id':store.get('a')['resume_uuid']})
++    monkeypatch.setattr(app, '_load_model_snapshot', lambda *a: ([], {'gpt-5.6-sol':['max'], 'gpt-5.6-terra':['max']}, 1))
++    monkeypatch.setattr(app, '_async_tmux_server_mutation_lock', lock)
++    monkeypatch.setattr(app, '_session_operation_lock', lambda *a: nullcontext())
++    monkeypatch.setattr(app, '_autopush_action_lock', lock)
++    monkeypatch.setattr(app, '_autopush_terminal_binding', AsyncMock(return_value=binding))
++    monkeypatch.setattr(app, '_terminal_binding_state', lambda *a: 'current')
++    monkeypatch.setattr(app, '_ensure_codex_running', ensure)
++    monkeypatch.setattr(app.subprocess, 'run', command)
++    monkeypatch.setattr(app.asyncio, 'sleep', AsyncMock())
++    monkeypatch.setattr(app, '_ensure_codex_submitted', AsyncMock(return_value='submitted'))
++    return store, state
++
++
++@pytest.mark.asyncio
++async def test_recovery_resumes_exact_thread_with_saved_model_and_only_once(recovery_runtime):
++    store, state = recovery_runtime
++    assert await app._model_fallback_once('a') is True
++    assert store.get('a')['launch_options']['model'] == 'gpt-5.6-sol'
++    assert store.get('a')['launch_options']['effort'] == 'max'
++    assert state['resume']['resume_uuid'] == 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
++    assert state['resume']['allow_fresh'] is False
++    assert state['resume']['expected_owner_id'] == 'admin'
++    assert 'continuing the same session' in store.get('a')['launch_options']['fallback']['status']
++    count = len(state['commands'])
++    assert await app._model_fallback_once('a') is False
++    assert len(state['commands']) == count
++    assert not any('C-c' in command for command in state['commands'])
++
++
++@pytest.mark.asyncio
++async def test_recovery_checks_newer_turn_after_restart_and_does_not_submit(recovery_runtime, monkeypatch):
++    store, state = recovery_runtime
++    original = app._ensure_codex_running
++    async def ensure(*a, **k):
++        result = await original(*a, **k)
++        state['event'] = {'type':'task_started', 'turn_id':'human-turn'}
++        return result
++    monkeypatch.setattr(app, '_ensure_codex_running', ensure)
++    assert await app._model_fallback_once('a') is False
++    assert [c[-1] for c in state['commands'] if '-l' in c] == ['/quit']
++
++
++@pytest.mark.asyncio
++async def test_recovery_does_not_continue_until_submission_is_confirmed(recovery_runtime, monkeypatch):
++    from unittest.mock import AsyncMock
++    store, state = recovery_runtime
++    monkeypatch.setattr(app, '_ensure_codex_submitted', AsyncMock(return_value='stranded'))
++    assert await app._model_fallback_once('a') is False
++    assert 'manually' in store.get('a')['launch_options']['fallback']['status']
++
++
++@pytest.mark.asyncio
++async def test_fallback_stops_after_two_models_and_keeps_policy_blocks_visible(recovery_runtime):
++    store, state = recovery_runtime
++    assert await app._model_fallback_once('a')
++    state['event'] = {**state['event'], 'turn_id':'second-failure'}
++    assert await app._model_fallback_once('a')
++    state['event'] = {**state['event'], 'turn_id':'third-failure'}
++    assert not await app._model_fallback_once('a')
++    assert store.get('a')['launch_options']['fallback']['attempts'] == 2
++    assert 'stopped' in store.get('a')['launch_options']['fallback']['status']
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('change', ['draft', 'policy', 'wrong_binding', 'api_auth', 'active_turn'])
++async def test_recovery_sends_nothing_when_guards_fail(recovery_runtime, monkeypatch, change):
++    store, state = recovery_runtime
++    if change=='draft': state['visible']='› my draft\n  gpt-6-astra max · /tmp'
++    if change=='policy': state['event']['error']['codex_error_info']='cyberPolicy'
++    if change=='wrong_binding': monkeypatch.setattr(app, '_terminal_binding_state', lambda *a:'replaced')
++    if change=='api_auth': monkeypatch.setattr(app, '_session_auth_mode', {'a':'api'})
++    if change=='active_turn': state['event']={'type':'task_started','turn_id':'new'}
++    assert not await app._model_fallback_once('a')
++    assert state['commands']==[]
++    assert store.get('a')['launch_options']['model']=='gpt-6-astra'
++
++
++def test_manual_model_change_rejects_a_recycled_session_during_settings_read(tmp_path, monkeypatch):
++    store = SessionLifecycleStore(tmp_path / 'state.json')
++    options={'model':'gpt-6-astra','effort':'max','no_fallback':False}
++    store.register_active('a', cwd=str(tmp_path), owner_id='admin', launch_options=options)
++    def recycle(*args):
++        store.register_active('a', cwd=str(tmp_path), owner_id='admin', launch_options=options)
++        return dict(options)
++    monkeypatch.setattr(app, '_session_lifecycle', store)
++    monkeypatch.setattr(app, '_session_launch_options', recycle)
++    with pytest.raises(app._SessionOwnershipChangedError):
++        app._write_validated_session_codex_settings('a',model_efforts={'gpt-5.6-sol':['max']},requested_model='gpt-5.6-sol',expected_owner_id='admin')
++    assert store.get('a')['launch_options']['model']=='gpt-6-astra'
++
++
++@pytest.mark.asyncio
++async def test_old_model_failure_cannot_override_a_new_selection(recovery_runtime, monkeypatch):
++    store,state=recovery_runtime
++    monkeypatch.setattr(app,'_codex_session_facts',lambda *args:{'model':'gpt-5.6-luna','metrics_thread_id':store.get('a')['resume_uuid']})
++    assert not await app._model_fallback_once('a')
++    assert state['commands']==[]
+--- a/runtime_control.py
++++ b/runtime_control.py
+@@ -194,6 +194,7 @@
+         cwd: str,
+         owner_id: str,
+         source: str = "session-create",
++        launch_options: dict | None = None,
+     ) -> dict[str, Any]:
+         """Register a fresh tab generation and discard stale same-name roots."""
+         owner = str(owner_id or "").strip()
+@@ -215,6 +216,9 @@
+             "last_checkpoint": now,
+             "checkpoint_source": str(source or "session-create")[:64],
+         }
++
++        if launch_options is not None:
++            row["launch_options"] = dict(launch_options)
+ 
+         def mutate(value: dict[str, Any]) -> dict[str, Any]:
+             value["version"] = 2
+--- a/test_project_session_ui.py
++++ b/test_project_session_ui.py
+@@ -9,8 +9,11 @@
+ const input=JSON.parse(process.argv[2]);
+ const nodes={};const requests=[];const noop=()=>{};
+ const node=()=>({innerHTML:'',textContent:'',value:'',style:{},classList:{add:noop,remove:noop,toggle:noop},focus:noop});
+-for(const id of ['modal-overlay','modal-content','new-session-name','session-create-error'])nodes[id]=node();
++for(const id of ['modal-overlay','modal-content','new-session-name','session-create-error','new-session-model','new-session-effort','new-session-nofb'])nodes[id]=node();
+ nodes['new-session-name'].value=input.name||'';
++nodes['new-session-model'].value=input.model||'gpt-6-astra';
++nodes['new-session-effort'].value=input.effort||'max';
++nodes['new-session-nofb'].checked=!!input.no_fallback;
+ const st={userRows:[1,3],userScrolledUp:false};
+ nodes['raw-alpha']={scrollTop:0,scrollHeight:900,children:[0,1,2,3].map(i=>({offsetTop:i*100,classList:{add:noop,remove:noop}}))};
+ const context=vm.createContext({console,Promise,Math,Date,Uint8Array,BASE:'',crypto:{getRandomValues:a=>a.fill(2)},
+@@ -21,6 +24,7 @@
+  loadAll:async()=>{context.selectedSession='old';context.sessions.push({name:'created'})},closeModal:noop,
+  fetch:async(url,options)=>{if(url.endsWith('/create')){requests.push(JSON.parse(options.body));return {ok:!input.conflict,status:input.conflict?409:200,json:async()=>input.conflict?{code:'name_conflict',error:'Already exists'}:{ok:true,name:'created'}}}return {ok:true,json:async()=>({authoritative:true,sessions:[{name:'created',runtime_state:'active'}]})}}
+ });
++vm.runInContext(source.slice(source.indexOf('let MODEL_CHOICES='),source.indexOf('function modelChoiceLabel(')),context);
+ (async()=>{
+  if(input.action==='create'){
+   vm.runInContext(source.slice(source.indexOf('let _sessionCreatePending='),source.indexOf('// ── Connections (Drive')),context);
+@@ -34,7 +38,7 @@
+   context.jumpToLastUserMessage('alpha');const second=nodes['raw-alpha'].scrollTop;
+   context.jumpToLive('alpha');context.jumpResult={first,second,last:nodes['raw-alpha'].scrollTop,following:!st.userScrolledUp};
+  }
+- process.stdout.write(JSON.stringify({requests,selected:context.selectedSession,html:nodes['modal-content'].innerHTML,error:nodes['session-create-error'].textContent,jump:context.jumpResult}));
++ process.stdout.write(JSON.stringify({requests,selected:context.selectedSession,html:nodes['modal-content'].innerHTML,error:nodes['session-create-error'].textContent,efforts:nodes['new-session-effort'].innerHTML,jump:context.jumpResult}));
+ })().catch(e=>{console.error(e);process.exit(1)});
+ '''
+ 
+@@ -52,7 +56,7 @@
+ 
+ def test_typed_name_is_used_and_created_session_opens_after_roster_refresh():
+     state=run(action='create',name='my-project')
+-    assert state['requests'] == [{'name':'my-project'}]
++    assert state['requests'] == [{'name':'my-project','model':'gpt-6-astra','effort':'max','no_fallback':False}]
+     assert state['selected'] == 'created'
+ 
+ 
+@@ -63,7 +67,7 @@
+ 
+ def test_named_collision_never_falls_back_to_random_name():
+     state=run(action='create',name='taken',conflict=True)
+-    assert state['requests'] == [{'name':'taken'}]
++    assert state['requests'] == [{'name':'taken','model':'gpt-6-astra','effort':'max','no_fallback':False}]
+     assert state['selected'] == 'old'
+ 
+ 
+@@ -87,3 +91,27 @@
+     response=subprocess.run(['node','-e',script,str(APP)],capture_output=True,text=True)
+     assert response.returncode == 0, response.stderr
+     assert json.loads(response.stdout) == {'parsed':'my project','updates':[],'selected':'my project'}
++
++
++def test_creation_form_defaults_and_effort_cap():
++    state=run(action='form')
++    assert '<option value="gpt-6-astra" selected>' in state['html']
++    assert '<option value="max" selected>Max</option>' in state['efforts']
++    assert '<option value="ultra" selected>' not in state['efforts']
++    assert 'id="new-session-nofb" type="checkbox"  ' in state['html']
++    limited=run(action='form',model='gpt-5.5')
++    assert '<option value="xhigh" selected>' in limited['efforts']
++    assert 'value="ultra"' not in limited['efforts']
++
++
++def test_custom_model_effort_and_opt_out_are_submitted():
++    state=run(action='create',name='custom',model='gpt-5.6-luna',effort='high',no_fallback=True)
++    assert state['requests']==[{'name':'custom','model':'gpt-5.6-luna','effort':'high','no_fallback':True}]
++    assert state['selected']=='created'
++
++
++def test_failed_creation_preserves_selected_model_effort_and_opt_out():
++    state=run(action='create',name='taken',model='gpt-5.6-luna',effort='high',no_fallback=True,conflict=True)
++    assert '<option value="gpt-5.6-luna" selected>' in state['html']
++    assert '<option value="high" selected>' in state['efforts']
++    assert 'id="new-session-nofb" type="checkbox" checked' in state['html']
