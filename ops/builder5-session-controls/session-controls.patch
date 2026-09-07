@@ -1,0 +1,1001 @@
+--- a/app.py
++++ b/app.py
+@@ -5462,6 +5462,127 @@
+     })
+ 
+ 
++def _preferences_path(user: dict) -> Path:
++    return _user_data_dir(user) / "preferences.json"
++
++
++def _user_preferences(user: dict) -> dict:
++    data = LockedJsonStore(_preferences_path(user), dict).read()
++    return {"auto_session_names": data.get("auto_session_names") is True}
++
++
++def _auto_session_names_enabled(owner_id: str) -> bool:
++    user = _find_user_by_id(owner_id) if owner_id else None
++    return bool(user and _user_preferences(user)["auto_session_names"])
++
++
++class UserPreferences(BaseModel):
++    auto_session_names: bool = Field(strict=True)
++
++
++@app.get("/api/preferences")
++async def api_preferences(request: Request):
++    user = _current_user(request)
++    if not user:
++        return JSONResponse({"error": "Not logged in"}, status_code=401)
++    return JSONResponse(await asyncio.to_thread(_user_preferences, user), headers={"Cache-Control": "no-store"})
++
++
++@app.post("/api/preferences")
++async def api_save_preferences(request: Request, body: UserPreferences):
++    user = _current_user(request)
++    if not user:
++        return JSONResponse({"error": "Not logged in"}, status_code=401)
++    store = LockedJsonStore(_preferences_path(user), dict)
++    await asyncio.to_thread(store.update, lambda data: data.update(body.model_dump()))
++    return JSONResponse(body.model_dump(), headers={"Cache-Control": "no-store"})
++
++
++def _collect_session_saved_items(session_name: str, user: dict, generation: str) -> dict:
++    """Incrementally read only this owner's validated root conversation."""
++    from project_saved import collect_saved_items
++
++    owner_id = str(user["id"])
++    key = hashlib.sha256(f"{session_name}\0{generation}".encode()).hexdigest()
++    store = LockedJsonStore(_user_data_dir(user) / "saved-projects" / f"{key}.json", dict)
++
++    def mutate(data):
++        texts = []
++        entry = cache.get(session_name) or {}
++        if str(entry.get("_owner_id") or "") == owner_id and _session_cache_entry_is_current(session_name, entry):
++            texts.extend(m.get("text", "") for m in entry.get("messages", []) if isinstance(m, dict) and m.get("role") in {"user", "assistant"})
++            texts.append(entry.get("notes", ""))
++        root = _session_lifecycle.get(session_name).get("resume_uuid")
++        if not root:
++            root = _active_session_root_thread_id(session_name, owner_id)
++        if root:
++            try:
++                fd, relative, fingerprint = _open_session_close_rollout({
++                    "owner": user, "owner_id": owner_id,
++                    "session_name": session_name, "resume_uuid": root,
++                })
++                with os.fdopen(fd, "rb") as stream:
++                    source = [relative, *fingerprint[:2]]
++                    offset = int(data.get("offset") or 0) if data.get("source") == source else 0
++                    if offset > fingerprint[2]:
++                        offset = 0
++                    if not offset:
++                        data.pop("discarding_line", None)
++                    stream.seek(offset)
++                    # Process bounded chunks, retaining a cursor for the next refresh.
++                    stop = offset + 4_000_000
++                    while stream.tell() < stop:
++                        start = stream.tell()
++                        line = stream.readline(4_000_001)
++                        if not line:
++                            break
++                        if not line.endswith(b"\n"):
++                            if len(line) > 4_000_000:
++                                data["discarding_line"] = True
++                                continue
++                            stream.seek(start)
++                            break
++                        if data.pop("discarding_line", False):
++                            continue
++                        try:
++                            event = json.loads(line)
++                        except (ValueError, UnicodeError):
++                            continue
++                        for event_type in ("user_message", "agent_message"):
++                            payload = _codex_event_payload(event, event_type)
++                            text = payload.get("message") if payload else None
++                            if isinstance(text, str) and not any(marker in text for marker in ("<environment_context>", "<INSTRUCTIONS>", "# AGENTS.md instructions", "<permissions instructions>")):
++                                texts.append(text)
++                    data.update(source=source, offset=stream.tell(), catching_up=stream.tell() < fingerprint[2])
++            except (_SessionCloseError, OSError, ValueError):
++                pass
++        uploads = _user_uploads_dir(user) / session_name
++        files = []
++        if uploads.is_dir() and not uploads.is_symlink():
++            files = [str(p) for p in uploads.iterdir() if p.is_file() and not p.is_symlink()]
++        data.update(collect_saved_items(data, texts, files))
++        data.update(session_name=session_name, generation=generation, owner_id=owner_id)
++        return {key: data.get(key, []) for key in ("urls", "creds", "files")} | {"catching_up": bool(data.get("catching_up"))}
++
++    _, result = store.update(mutate)
++    return result
++
++
++@app.get("/api/sessions/{session_name}/saved-items")
++async def api_session_saved_items(request: Request, session_name: str):
++    user = _current_user(request)
++    if not user:
++        return JSONResponse({"error": "Not logged in"}, status_code=401)
++    owner_id = str(user["id"])
++    if not _is_valid_session_name(session_name) or not _strict_session_owner(session_name, owner_id):
++        return JSONResponse({"error": "Session not found"}, status_code=404)
++    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
++    result = await asyncio.to_thread(_collect_session_saved_items, session_name, user, generation)
++    if not _strict_session_owner(session_name, owner_id) or str(_session_lifecycle.get(session_name).get("generation") or "") != generation:
++        return JSONResponse({"error": "Session changed"}, status_code=409)
++    return JSONResponse(result, headers={"Cache-Control": "no-store"})
++
++
+ @app.get("/api/me")
+ async def api_me(request: Request):
+     """Return the currently logged-in user (for the frontend to know who they are)."""
+@@ -8455,7 +8576,12 @@
+ 
+ def _session_tab_label(session_name: str, rows: dict | None = None) -> str:
+     rows = rows if rows is not None else _session_tab_label_rows()
+-    label = str((rows.get(session_name) or {}).get("label") or "").strip()
++    row = rows.get(session_name) or {}
++    if not _auto_session_names_enabled(str(row.get("owner_id") or "")):
++        return str(row.get("manual_label") or "")
++    if not row.get("label"):
++        return str(row.get("manual_label") or "")
++    label = str(row.get("label") or "").strip()
+     return _normalize_two_word_tab_label(label) if label else ""
+ 
+ 
+@@ -8467,6 +8593,8 @@
+     started_at: float | None = None,
+ ) -> str:
+     """Start (or replace) the two-minute rename clock for one request."""
++    if not _auto_session_names_enabled(owner_id):
++        return ""
+     request_id = secrets.token_hex(12)
+     source_prompt, source_ts = _tab_label_source_for_request(session_name, prompt)
+     pending = {
+@@ -8511,7 +8639,7 @@
+         if not isinstance(pending, dict) or pending.get("id") != request_id:
+             return {}
+         row.pop("pending", None)
+-        if normalized:
++        if normalized and _auto_session_names_enabled(str(row.get("owner_id") or "")):
+             owner_id = str(row.get("owner_id") or "")
+             used = {
+                 str(other.get("label") or "").casefold()
+@@ -9884,6 +10012,9 @@
+         request_id = str(pending.get("id") or "")
+         started_at = float(pending.get("started_at") or 0)
+         if not request_id or checked_at - started_at < TAB_RENAME_AFTER_SECONDS:
++            continue
++        if not _auto_session_names_enabled(str(row.get("owner_id") or "")):
++            await asyncio.to_thread(_finish_session_tab_label, session_name, request_id)
+             continue
+         if session_name not in live_session_names:
+             await asyncio.to_thread(_remove_session_tab_label, session_name)
+@@ -14528,7 +14659,8 @@
+ async def _api_create_session_tmux_locked(request: Request, body: CreateSession):
+     """Create one generation-bound tmux/Codex session transactionally."""
+     user = _current_user(request)
+-    requested_name = body.name.strip()
++    display_name = body.name.strip()
++    requested_name = re.sub(r"\s+", "-", display_name)
+     if requested_name and not _is_valid_session_name(requested_name):
+         return JSONResponse(
+             {"error": "Invalid name. Use up to 128 letters, numbers, dots, dashes, or underscores."},
+@@ -14604,9 +14736,15 @@
+                         {"error": result.stderr.strip() or "Failed to create session"},
+                         status_code=500,
+                     )
+-                return await _finish_created_session(
++                response = await _finish_created_session(
+                     user, created, session_id, create_token
+                 )
++                if response.status_code == 200 and display_name != created:
++                    def save_manual_label(data):
++                        row = data.setdefault("sessions", {}).setdefault(created, {})
++                        row.update(manual_label=display_name, owner_id=str((user or {}).get("id") or "admin"), generation=str(_session_lifecycle.get(created).get("generation") or ""))
++                    await asyncio.to_thread(_session_tab_labels.update, save_manual_label)
++                return response
+ 
+         result, session_id, created, create_token = create_tmux()
+         if not session_id:
+@@ -28522,19 +28660,29 @@
+   .tab-more-icon{display:inline-block}
+   .tab-more-model-block{display:block}
+ }
++.nav-plan-bars{display:flex;flex-direction:column;gap:4px;font-size:10px;min-width:125px}
++.nav-plan-window{display:flex;align-items:center;gap:5px;white-space:nowrap}
++.nav-plan-window>span:first-child{min-width:25px}
++.nav-plan-window .nav-usage-bar{display:inline-block;width:62px;height:6px}
++.message-jumped{background:#263f28;border-radius:4px;outline:1px solid #3fb950}
++@media(max-width:600px){.nav-plan-bars{min-width:105px;font-size:9px}.nav-plan-window .nav-usage-bar{width:42px}}
+ </style></head>
+ <body>
+ <div id="imp-banner" style="display:none"></div>
+ <div class="nav-wrapper">
+ <nav class="top-nav" id="top-nav">
+   <span class="nav-brand">__BRAND__</span>
+-  <button class="nav-new-btn" onclick="createSessionAuto()" title="New session">+</button>
++  <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
+   <span class="nav-spacer"></span>
+ </nav>
+ <div class="nav-right">
+   <span class="nav-compact-status" aria-label="System status summary">
+     <span class="nav-compact-stat" id="nav-cpu-summary" title="CPU usage">CPU <span class="stat-val" id="nav-cpu-summary-value">&mdash;</span></span>
+-    <span class="nav-compact-stat" id="nav-usage-cap-summary" title="Codex plan usage cap">Usage cap: <span class="stat-val" id="nav-usage-cap-value">&mdash;</span></span>
++    <span class="nav-compact-stat" id="nav-usage-cap-summary" style="display:none" title="Codex plan usage cap">Usage cap: <span class="stat-val" id="nav-usage-cap-value">&mdash;</span></span>
++  </span>
++  <span class="nav-plan-bars" aria-label="Codex plan usage">
++    <span id="plan-primary" class="nav-plan-window" style="display:none"><span id="plan-primary-label"></span><span class="nav-usage-bar" id="plan-primary-meter" role="progressbar" aria-label="Primary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-primary-fill"></span></span><span id="plan-primary-value"></span></span>
++    <span id="plan-secondary" class="nav-plan-window" style="display:none"><span id="plan-secondary-label"></span><span class="nav-usage-bar" id="plan-secondary-meter" role="progressbar" aria-label="Secondary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-secondary-fill"></span></span><span id="plan-secondary-value"></span></span>
+   </span>
+   <div class="nav-status-wrap">
+     <button class="nav-status-toggle" id="nav-status-toggle" type="button"
+@@ -28598,7 +28746,7 @@
+             onclick="toggleToolsMenu(event)" title="Settings" aria-label="Settings and tools"
+             aria-expanded="false" aria-haspopup="menu" aria-controls="nav-tools-menu"><span class="icon">&#x2699;</span></button>
+     <div class="nav-tools-menu" id="nav-tools-menu" role="menu">
+-      <button class="nav-tools-item nav-tools-mobile" type="button" role="menuitem" onclick="createSessionAuto();closeToolsMenu()"><span class="icon">&#x2B;</span> New session</button>
++      <button class="nav-tools-item nav-tools-mobile" type="button" role="menuitem" onclick="showCreateModal();closeToolsMenu()"><span class="icon">&#x2B;</span> New session</button>
+       <button class="nav-tools-item nav-tools-mobile nav-tools-admin" type="button" role="menuitem" onclick="toggleStatusMenu(event)"><span class="icon">&#x1F4CA;</span> Status &amp; usage</button>
+       <div class="nav-tools-divider nav-tools-mobile-divider" role="separator"></div>
+       <!-- Settings owns all configuration editors, including Context Files. -->
+@@ -29875,6 +30023,7 @@
+   }
+   if(rows.length>RAW_MAX_LINES+400)rows=rows.slice(rows.length-RAW_MAX_LINES);
+   let htmlLines;
++  let userRows=[];
+   if(!rows.length||!rows.join('').trim()){
+     htmlLines=(st.fullText||'').trim()
+       ? ['<span style="color:#6e7681">Clean view is hiding everything on this screen. Turn it off in the &hellip; menu to see the raw terminal.</span>']
+@@ -29885,11 +30034,14 @@
+     // straddles a newline, so splitting the result back per line is safe.
+     htmlLines=_linkifyTerminalText(rows.join('\n'),flow?1000000:st.paneWidth).split('\n');
+     const userPromptFlags=_userPromptLineFlags(rows);
++    userRows=rows.map((line,i)=>userPromptFlags[i]&&_USER_PROMPT_RE.test(line)?i:-1).filter(i=>i>=0);
+     htmlLines=htmlLines.map(function(html,i){
+       return userPromptFlags[i]?'<span class="tl-user-prompt">'+html+'</span>':html;
+     });
+   }
+ 
++  if(JSON.stringify(st.userRows)!==JSON.stringify(userRows))st._jumpAt=undefined;
++  st.userRows=userRows;
+   const prev=st.painted||[];
+   const d=_lineDiff(prev,htmlLines);
+   if(!d.remove&&!d.insert){
+@@ -29925,6 +30077,37 @@
+   // Scrolled up and the change was at or below the top of the viewport: nothing
+   // the reader can see has moved, so scrollTop is not touched at all.
+   updateFreezeUi(name);
++}
++function jumpToLastUserMessage(name){
++  const st=getRawState(name);
++  const rawEl=document.getElementById('raw-'+name);
++  const rows=st.userRows||[];
++  if(!rawEl||!rows.length){
++    if(statusInfoEl)statusInfoEl.textContent='No submitted messages in this scrollback yet';
++    return;
++  }
++  let at=(typeof st._jumpAt==='number'?st._jumpAt:rows.length)-1;
++  if(at<0)at=rows.length-1;
++  st._jumpAt=at;
++  const el=rawEl.children[rows[at]];
++  if(!el)return;
++  st.userScrolledUp=true;
++  _setRawScroll(rawEl,Math.max(0,el.offsetTop-10));
++  el.classList.remove('message-jumped');
++  void el.offsetWidth;
++  el.classList.add('message-jumped');
++  setTimeout(()=>el.classList.remove('message-jumped'),1700);
++  if(statusInfoEl)statusInfoEl.textContent='Your message '+(at+1)+' of '+rows.length+'. Click again for the previous message.';
++}
++function jumpToLive(name){
++  const st=getRawState(name);
++  const rawEl=document.getElementById('raw-'+name);
++  if(!rawEl)return;
++  st._jumpAt=undefined;
++  st.userScrolledUp=false;
++  if(st.frozen){st.frozen=false;renderRawText(name,true);updateFreezeUi(name)}
++  _setRawScroll(rawEl,rawEl.scrollHeight);
++  if(statusInfoEl)statusInfoEl.textContent='Following the latest output';
+ }
+ function rerenderAllRaw(){
+   // Called after the filter preference changes — re-render every cached buffer
+@@ -31433,6 +31616,7 @@
+   refreshUploadedFiles(s.name);
+   // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
+   renderSavedKeys(s.name, s);
++  refreshSavedProjectItems(s.name);
+   // Scroll chat to bottom
+   const chatEl=document.getElementById('chat-'+s.name);
+   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
+@@ -31471,7 +31655,21 @@
+   if(tab==='skills')loadAccountSkills(s.name);
+ }
+ 
++function _sessionRouteName(){
++  const match=(location.hash||'').match(/^#\/session\/([^/]+)$/);
++  if(!match)return '';
++  try{return decodeURIComponent(match[1])}catch(error){return ''}
++}
++function _restoreSessionRoute(){
++  const name=_sessionRouteName();
++  if(name&&sessions.some(s=>s.name===name))selectSession(name);
++}
++window.addEventListener('hashchange',_restoreSessionRoute);
++window.addEventListener('popstate',_restoreSessionRoute);
+ function selectSession(name){
++  if(_sessionRouteName()!==name){
++    history.pushState(null,'',location.pathname+location.search+'#/session/'+encodeURIComponent(name));
++  }
+   stopAllRawPolling();
+   selectedSession=name;
+   // This function is only reached from a deliberate nav click, so selecting
+@@ -32440,6 +32638,7 @@
+   if(prog)prog.textContent=s.progress||'';
+   if(notesEl&&s.notes)notesEl.textContent=s.notes;
+   renderSavedKeys(s.name, s);
++  refreshSavedProjectItems(s.name);
+   const tsDesc=document.getElementById('ts-desc-'+s.name);
+   const tsProg=document.getElementById('ts-prog-'+s.name);
+   const tsNotes=document.getElementById('ts-notes-'+s.name);
+@@ -32481,6 +32680,8 @@
+   setAutopushPending(name,false);
+   _resetSessionRuntimeState(name);
+   delete chatMessages[name];
++  if(typeof _savedProjectItems!=='undefined')delete _savedProjectItems[name];
++  if(typeof _savedProjectFetchedAt!=='undefined')delete _savedProjectFetchedAt[name];
+   delete lastStatus[name];
+   delete activeTabs[name];
+   delete lastSubmittedDraft[name];
+@@ -32821,6 +33022,8 @@
+ function _setUsageWindow(slot,windowData){
+   const navWrap=document.getElementById('nav-usage-'+slot+'-wrap');
+   const visible=!!windowData;
++  const top=document.getElementById('plan-'+slot);
++  if(top)top.style.display=visible?'':'none';
+   if(navWrap)navWrap.style.display=visible?'':'none';
+   if(!visible)return;
+   const label=windowData.label||slot;
+@@ -32836,6 +33039,15 @@
+   _applyUsageStyle(document.getElementById('nav-usage-'+slot+'-fill'),pct);
+   const title='Codex '+label+' plan window · '+pct+'% used · '+meta;
+   if(navWrap)navWrap.title=title;
++  if(top){
++    top.title=title;
++    document.getElementById('plan-'+slot+'-label').textContent=label;
++    document.getElementById('plan-'+slot+'-value').textContent=pct+'%';
++    const meter=document.getElementById('plan-'+slot+'-meter');
++    meter.setAttribute('aria-valuenow',String(Math.min(100,Math.max(0,pct))));
++    meter.setAttribute('aria-valuetext',title);
++    _applyUsageStyle(document.getElementById('plan-'+slot+'-fill'),pct);
++  }
+ }
+ function _selectUsageCapWindow(windows){
+   return (windows||[]).reduce((longest,current)=>{
+@@ -32863,7 +33075,7 @@
+   wrap.title='Codex '+(windowData.label||'plan')+' cap · '+pct+'% used'+(reset?' · resets '+reset:'');
+ }
+ async function refreshUsageLimits(){
+-  if(MEMBER_SIMPLE) return;  // members don't see usage bars
++  if(MEMBER_SIMPLE)return;
+   const wrap=document.getElementById('nav-usage');
+   const empty=document.getElementById('nav-status-usage-empty');
+   if(!wrap)return;
+@@ -33061,15 +33273,31 @@
+   }
+   return false;
+ }
+-async function createSessionAuto(){
++function showCreateModal(prefill=''){
+   if(_sessionCreatePending)return;
++  const modal=document.getElementById('modal-content');
++  modal.classList.remove('modal-wide');
++  modal.innerHTML=`<h3>New session</h3>
++    <label for="new-session-name">Session name</label>
++    <input id="new-session-name" type="text" maxlength="128" autocomplete="off" placeholder="e.g. Website updates" value="${esc(prefill)}" style="width:100%;margin:10px 0" onkeydown="if(event.key==='Enter'){event.preventDefault();createSession()}">
++    <p class="conn-note">Leave empty to generate a random name. Automatic naming is optional in Settings.</p>
++    <p id="session-create-error" role="alert" style="color:#f85149"></p>
++    <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
++    <button class="modal-confirm-create" onclick="createSession()">Create</button></div>`;
++  document.getElementById('modal-overlay').classList.add('active');
++  setTimeout(()=>document.getElementById('new-session-name')?.focus(),50);
++}
++function createSessionAuto(){showCreateModal()}
++async function createSession(){
++  if(_sessionCreatePending)return;
++  const requested=(document.getElementById('new-session-name')?.value||'').trim();
+   _sessionCreatePending=true;
+   const run=++_sessionCreateRun;
+   const overlay=document.getElementById('modal-overlay');
+   const modal=document.getElementById('modal-content');
+   modal.classList.remove('modal-wide');
+-  modal.innerHTML=`<div id="session-create-progress-${run}"><h3>Creating session…</h3>
+-    <p class="conn-note">Setting up your session. The first one can take a few seconds — hang tight.</p>
++  modal.innerHTML=`<div id="session-create-progress-${run}"><h3>Creating session...</h3>
++    <p class="conn-note">Setting up your session. It will open automatically.</p>
+     <div class="create-spinner"></div></div>`;
+   overlay.classList.add('active');
+   try{
+@@ -33077,10 +33305,10 @@
+     for(let attempt=0;attempt<5;attempt++){
+       const resp=await fetch(BASE+'/api/sessions/create',{
+         method:'POST',headers:{'Content-Type':'application/json'},
+-        body:JSON.stringify({name:_autoSessionName()})
++        body:JSON.stringify({name:requested||_autoSessionName()})
+       });
+       const data=await resp.json().catch(()=>({}));
+-      if(resp.status===409&&data.code==='name_conflict')continue;
++      if(!requested&&resp.status===409&&data.code==='name_conflict')continue;
+       if(!resp.ok)throw new Error(data.error||'Failed to create the session.');
+       if(data.ok!==true||typeof data.name!=='string'||!data.name){
+         throw new Error('The server returned an invalid session response. Please log in again.');
+@@ -33089,26 +33317,25 @@
+       break;
+     }
+     if(!created)throw new Error('Could not allocate a session name. Please try again.');
+-    if(!await _waitForCreatedSession(created.name)){
+-      if(_sessionCreateModalOwns(run)){
+-        modal.innerHTML=`<h3>Session is still starting</h3>
+-          <p class="conn-note">The session was created and will appear shortly.</p>
+-          <div class="modal-actions"><button class="modal-confirm-create" onclick="closeModal();loadAll()">Refresh tabs</button></div>`;
++    // Select after reconciliation, which may otherwise restore the previous tab.
++    const ready=await _waitForCreatedSession(created.name);
++    await loadAll(created.name);
++    if(_sessionCreateModalOwns(run)){
++      if(!sessions.some(s=>s.name===created.name)){
++        // Creation is authoritative even when the roster is still warming up.
++        sessions.push({name:created.name,status:'idle',messages:[],notes:'',runtime_state:'recovering'});
++        renderNav();
+       }
+-      return;
++      selectSession(created.name);
++      closeModal();
++      if(!ready&&statusInfoEl)statusInfoEl.textContent='Session created. Waiting for Codex to finish starting.';
+     }
+-    if(_sessionCreateModalOwns(run)){
+-      selectedSession=created.name;
+-    }
+-    await loadAll();
+-    if(_sessionCreateModalOwns(run))closeModal();
+   }catch(error){
+     if(!_sessionCreateModalOwns(run))return;
+-    modal.innerHTML=`<h3>Couldn't create session</h3>
+-      <p class="conn-note">${esc(error&&error.message?error.message:'Network error — please try again.')}</p>
+-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button>
+-      <button class="modal-confirm-create" onclick="createSessionAuto()">Try again</button></div>`;
+-    overlay.classList.add('active');
++    _sessionCreatePending=false;
++    showCreateModal(requested);
++    const errorEl=document.getElementById('session-create-error');
++    if(errorEl)errorEl.textContent=error&&error.message?error.message:'Network error. Please try again.';
+   }finally{
+     _sessionCreatePending=false;
+   }
+@@ -33738,6 +33965,8 @@
+       <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
+     </div>
+     <div class="uploaded-files" id="uploaded-files-${tab}-${name}"></div>
++    ${tab==='raw'?`<button class="key-btn" onclick="jumpToLastUserMessage('${esc(name)}')">&#8613; My last message</button><button class="key-btn" onclick="jumpToLive('${esc(name)}')">&#8595; Latest output</button>`:''}
++    <div class="key-saved" id="keysaved-${tab}-${name}"></div>
+   </div>`;
+   }
+   const id='keybar-'+tab+'-'+name;
+@@ -33749,24 +33978,20 @@
+     <span class="key-bar-label">Keys:</span>
+     <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape — exit menus/dialogs">Esc</button>
+     <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
+-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U — clear input line (wipes any stale/phantom text from Codex's input buffer without interrupting the running task)">Clear Input</button>
+     <span class="key-bar-sep"></span>
+     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
+-    <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space — scroll pager">Space</button>
+     <span class="key-bar-sep"></span>
+     <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
+     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
+     <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
+     <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
+     ${tab==='raw'?`<span class="key-bar-sep"></span>
++    <button class="key-btn" onclick="jumpToLastUserMessage('${esc(name)}')" title="Jump to your last message. Click again for earlier messages.">&#8613; My last message</button>
++    <button class="key-btn" onclick="jumpToLive('${esc(name)}')" title="Return to the latest output and follow new messages.">&#8595; Latest output</button>
+     <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>`:''}
+     <span class="key-bar-sep"></span>
+     <span class="key-bar-label">Cmds:</span>
+-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/new')" title="New conversation">/new</button>
+     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
+-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/status')" title="Session status & usage">/status</button>
+-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Switch to Plan mode">/plan</button>
+-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model gpt-5.4-mini')" title="Switch to GPT-5.4-mini">/model mini</button>
+     <div class="drop-zone" id="dropzone-${tab}-${name}"
+       ondragover="event.preventDefault();this.classList.add('drag-over')"
+       ondragleave="this.classList.remove('drag-over')"
+@@ -33933,9 +34158,29 @@
+   r.appendChild(_savedCopyBtn(p));
+   return r;
+ }
++const _savedProjectItems={};
++const _savedProjectRequests={};
++const _savedProjectFetchedAt={};
++async function refreshSavedProjectItems(name,force=false){
++  if(!name||_savedProjectRequests[name]||(!force&&Date.now()-(_savedProjectFetchedAt[name]||0)<14000))return;
++  _savedProjectRequests[name]=true;
++  const incarnation=(sessions.find(s=>s.name===name)||{}).logical_incarnation;
++  try{
++    const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/saved-items',{cache:'no-store'});
++    if(!response.ok)return;
++    const data=await response.json();
++    const current=sessions.find(s=>s.name===name);
++    if(!current||current.logical_incarnation!==incarnation)return;
++    _savedProjectFetchedAt[name]=Date.now();
++    _savedProjectItems[name]={urls:data.urls||[],creds:data.creds||[],files:data.files||[]};
++    renderSavedKeys(name,current);
++    if(data.catching_up)setTimeout(()=>refreshSavedProjectItems(name,true),1000);
++  }catch(error){}finally{delete _savedProjectRequests[name]}
++}
++setInterval(()=>{if(!document.hidden&&selectedSession)refreshSavedProjectItems(selectedSession)},15000);
+ function renderSavedKeys(name,sessionObj){
+   const s=sessionObj||sessions.find(x=>x.name===name);
+-  const info=s?parseKeyInfo(s.notes||'',s):{urls:[],creds:[],files:[]};
++  const info=_savedProjectItems[name]||{urls:[],creds:[],files:[]};
+   // Basenames that collide across kept files → show the parent dir to tell apart.
+   const baseCount={};
+   info.files.forEach(p=>{const b=p.replace(/\/+$/,'').split('/').pop();baseCount[b]=(baseCount[b]||0)+1});
+@@ -33964,7 +34209,7 @@
+     if(!total){
+       const empty=document.createElement('div');
+       empty.className='key-saved-empty';
+-      empty.textContent='No project URLs, credentials or files captured yet — press "Full" on the Info tab to extract them.';
++      empty.textContent='Links, usernames, passwords and files shared in this session are saved here automatically.';
+       body.appendChild(empty);
+     }else{
+       if(info.urls.length)body.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
+@@ -34351,6 +34596,7 @@
+   const tabsEl = document.getElementById('settings-tabs');
+   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
+   const tabs = [
++    {id:'preferences', label:'Preferences'},
+     {id:'mycontext', label:'My Context'},
+     {id:'history',   label:'History'},
+     {id:'browser',   label:'Browser'},
+@@ -34371,9 +34617,37 @@
+   renderSettingsContent();
+ }
+ 
++async function loadPreferences(){
++  const el=document.getElementById('settings-content');
++  el.innerHTML='<div class="settings-section">Loading preferences...</div>';
++  try{
++    const response=await fetch(BASE+'/api/preferences',{cache:'no-store'});
++    if(!response.ok)throw new Error('Could not load preferences');
++    const data=await response.json();
++    if(_settingsActiveTab!=='preferences')return;
++    el.innerHTML=`<div class="settings-section"><label><input type="checkbox" id="auto-session-names" ${data.auto_session_names?'checked':''} onchange="saveNamingPreference(this)"> Automatically name sessions based on their content</label>
++      <p class="conn-note">Off by default. When enabled, longer requests can update the tab label. Turn it off to show the name entered when the session was created.</p>
++      <p id="naming-preference-status" role="status"></p></div>`;
++  }catch(error){if(_settingsActiveTab==='preferences')el.textContent=error.message}
++}
++async function saveNamingPreference(input){
++  const checked=input.checked;
++  input.disabled=true;
++  const status=document.getElementById('naming-preference-status');
++  try{
++    const response=await fetch(BASE+'/api/preferences',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_session_names:checked})});
++    if(!response.ok)throw new Error('Could not save. Please try again.');
++    if(status)status.textContent='Saved for your account.';
++    await loadAll();
++  }catch(error){input.checked=!checked;if(status)status.textContent=error.message}
++  finally{input.disabled=false}
++}
++
+ function renderSettingsContent(){
+   const el = document.getElementById('settings-content');
+-  if(_settingsActiveTab === 'mycontext'){
++  if(_settingsActiveTab === 'preferences'){
++    loadPreferences();
++  }else if(_settingsActiveTab === 'mycontext'){
+     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
+     loadMyContext();
+   }else if(_settingsActiveTab === 'global'){
+@@ -36343,7 +36617,10 @@
+       if(sendUncertain)setTimeout(function(){alert('The Codex session was created, but submission could not be confirmed. Inspect this session before retrying the report.');},250);
+     }
+   }catch(e){}
+-  await loadAll(bugSession);
++  await loadAll(bugSession||_sessionRouteName());
++  if(!location.hash&&selectedSession){
++    history.replaceState(null,'',location.pathname+location.search+'#/session/'+encodeURIComponent(selectedSession));
++  }
+   checkCodexAuth();
+ }
+ bootstrapDashboard();
+--- /dev/null
++++ b/project_saved.py
+@@ -0,0 +1,59 @@
++"""Extract useful project details from human and assistant messages, without an LLM."""
++import re
++
++_URL = re.compile(r'https?://[^\s<>\[\]{}"\'`]+')
++_PATH = re.compile(r'(?:^|[\s(\[|>*`])((?:~/|/(?:home|root|tmp|var|opt|srv|mnt|data)/)[^\n<>\[\]{}"\'`|)]+)')
++_CREDENTIAL = re.compile(
++    r'^\s*(?:[-*+]\s+|\d+\.\s*)?(?:\*\*)?'
++    r'((?:(?:[\w.-]+)[ \t]+){0,3}(?:username|user name|user|password|passwd|login|email|api[ _-]?key|access[ _-]?token|secret))'
++    r'(?:\*\*)?\s*[:=]\s*(?:\*\*)?\s*(.+?)\s*$', re.I)
++_TABLE_CREDENTIAL = re.compile(
++    r'^\s*\|\s*(?:\*\*)?([^|]+?)(?:\*\*)?\s*\|\s*(.*?)\s*\|\s*$')
++
++
++def _value(text):
++    text = text.strip()
++    if len(text) >= 2 and text[0] == text[-1] and text[0] in '`"\'':
++        return text[1:-1]
++    return text
++
++
++def collect_saved_items(previous, texts, files=()):
++    """Accumulate exact values. Credentials are never comma/semicolon split."""
++    result = {key: list(previous.get(key) or []) for key in ('urls', 'creds', 'files')}
++    seen = {key: {repr(item) for item in values} for key, values in result.items()}
++
++    def add(key, item):
++        signature = repr(item)
++        if signature not in seen[key]:
++            result[key].append(item)
++            seen[key].add(signature)
++
++    for text in texts:
++        if not isinstance(text, str) or any(marker in text for marker in ("<environment_context>", "<INSTRUCTIONS>", "# AGENTS.md instructions", "<permissions instructions>")):
++            continue
++        for url in _URL.findall(text):
++            # Markdown's closing parenthesis and sentence punctuation are not part of a link.
++            url = url.rstrip('.,;:!*')
++            while url.endswith(')') and url.count(')') > url.count('('):
++                url = url[:-1]
++            add('urls', url)
++        for path in _PATH.findall(text):
++            path = re.sub(r':\d+(?::\d+)?$', '', path.strip().rstrip('.,;:*'))
++            # Unquoted prose after a path is not part of the file name.
++            if ' ' in path and not re.search(r'\.[\w-]+$', path):
++                path = path.split()[0]
++            add('files', path)
++        for line in text.splitlines():
++            table = _TABLE_CREDENTIAL.match(line)
++            if table:
++                line = table[1].strip('* ') + ': ' + table[2]
++            credential = _CREDENTIAL.match(line)
++            if credential:
++                value = _value(credential[2])
++                if value and value.lower() not in {'none', 'n/a', 'redacted', '[redacted]', '***'}:
++                    add('creds', {'label': credential[1].strip(), 'value': value})
++    for path in files:
++        if isinstance(path, str) and path:
++            add('files', path)
++    return result
+--- a/test_api.py
++++ b/test_api.py
+@@ -383,7 +383,7 @@
+             "Log out",
+         ):
+             assert label in menu
+-        assert "createSessionAuto();closeToolsMenu()" in menu
++        assert "showCreateModal();closeToolsMenu()" in menu
+         assert "toggleStatusMenu(event)" in menu
+         assert "openSettings('browser');closeToolsMenu()" in menu
+         assert "openConnections();closeToolsMenu()" in menu
+@@ -391,37 +391,13 @@
+         assert 'nav-tools-mobile nav-tools-admin" type="button" role="menuitem"' in menu
+         assert menu.count('role="menuitem"') == 9
+ 
+-    def test_new_session_controls_auto_create_without_asking_for_a_name(
+-        self, authed_client
+-    ):
++    def test_new_session_controls_open_the_name_form(self, authed_client):
+         html = authed_client.get("/").text
+-        nav_start = html.index('<div class="nav-wrapper">')
+-        nav_end = html.index('<div class="auth-dropdown"', nav_start)
+-        nav = html[nav_start:nav_end]
+-        create_start = html.index("async function createSessionAuto()")
+-        create_end = html.index("// ── Connections", create_start)
+-        create = html[create_start:create_end]
+-
+-        assert 'class="nav-new-btn" onclick="createSessionAuto()"' in nav
+-        assert "createSessionAuto();closeToolsMenu()" in nav
+-        assert "new-session-name" not in html
+-        assert "showCreateModal" not in html
+-        assert "JSON.stringify({name:_autoSessionName()})" in create
+-        assert "crypto.getRandomValues" in html
+-        assert "for(let attempt=0;attempt<5;attempt++)" in create
+-        assert "if(resp.status===409&&data.code==='name_conflict')continue" in create
+-        assert "if(_sessionCreatePending)return" in create
+-        assert "_sessionCreatePending=false" in create
+-        assert "_sessionCreateModalOwns(run)" in create
+-        assert "data.ok!==true||typeof data.name!=='string'||!data.name" in create
+-        assert "await _waitForCreatedSession(created.name)" in create
+-        assert "for(let attempt=0;attempt<30;attempt++)" in html
+-        assert "encodeURIComponent(name)+'/uploads'" in html
+-        assert "Session is still starting" in create
+-        assert 'onclick="closeModal();loadAll()">Refresh tabs</button>' in create
+-        assert "Creating session…" in create
+-        assert "Couldn't create session" in create
+-        assert 'onclick="createSessionAuto()">Try again</button>' in create
++        assert 'class="nav-new-btn" onclick="showCreateModal()"' in html
++        assert "showCreateModal();closeToolsMenu()" in html
++        assert 'id="new-session-name"' in html
++        assert "JSON.stringify({name:requested||_autoSessionName()})" in html
++        assert "if(!requested&&resp.status===409&&data.code==='name_conflict')continue" in html
+ 
+     def test_tools_menu_tracks_accessible_expanded_state(self, authed_client):
+         html = authed_client.get("/").text
+@@ -433,12 +409,13 @@
+         assert "button.setAttribute('aria-expanded','false')" in controls
+         assert "closeStatusMenu()" in controls
+ 
+-    def test_key_bar_has_plan_mode_shortcut(self, authed_client):
++    def test_key_bar_removes_requested_shortcuts(self, authed_client):
+         html = authed_client.get("/").text
+ 
+-        assert "sendSlashCommand('${name}','/plan')" in html
+-        assert 'title="Switch to Plan mode">/plan</button>' in html
+-        assert "sendSlashCommand('${name}','/work')" not in html
++        for label in ("/new", "/status", "/plan", "/model mini", "Space", "Clear Input"):
++            assert ">" + label + "</button>" not in html
++        assert "My last message</button>" in html
++        assert "Latest output</button>" in html
+ 
+     def test_voice_button_names_recording_and_transcribing_states(
+         self,
+@@ -668,6 +645,10 @@
+ 
+ 
+ class TestDynamicSessionTabLabels:
++    @pytest.fixture(autouse=True)
++    def opt_in_to_automatic_naming(self, monkeypatch):
++        monkeypatch.setattr(app_module, "_auto_session_names_enabled", lambda owner: True)
++
+     def test_tab_uses_dynamic_label_but_keeps_stable_session_routing(self, authed_client):
+         html = authed_client.get("/").text
+ 
+@@ -1374,7 +1355,7 @@
+     def test_create_session_invalid_name(self, mock_sessions, authed_client):
+         resp = authed_client.post(
+             "/api/sessions/create",
+-            json={"name": "bad name with spaces"},
++            json={"name": "bad/name"},
+ 
+         )
+         assert resp.status_code == 400
+--- a/test_bug_handoff.py
++++ b/test_bug_handoff.py
+@@ -123,4 +123,4 @@
+     assert "async function loadAll(preferredSession)" in dashboard.HTML_PAGE
+     assert "url.searchParams.get('bug_session')" in dashboard.HTML_PAGE
+     assert "history.replaceState" in dashboard.HTML_PAGE
+-    assert "await loadAll(bugSession)" in dashboard.HTML_PAGE
++    assert "await loadAll(bugSession||_sessionRouteName())" in dashboard.HTML_PAGE
+--- /dev/null
++++ b/test_project_session_features.py
+@@ -0,0 +1,136 @@
++"""Regression coverage for naming preferences and durable private saved items."""
++import json
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++from fastapi.testclient import TestClient
++import app as dashboard
++
++
++@pytest.fixture
++def private_user(tmp_path, monkeypatch):
++    user = {"id": "test-owner", "username": "Tester", "role": "user"}
++    monkeypatch.setattr(dashboard, "_user_data_dir", lambda u: tmp_path / str(u["id"]))
++    monkeypatch.setattr(dashboard, "_current_user", lambda request: user)
++    return user
++
++
++def test_naming_is_off_by_default_and_scoped_to_the_user(private_user):
++    client = TestClient(dashboard.app, cookies={dashboard.AUTH_COOKIE: dashboard._make_token("admin")})
++    assert client.get('/api/preferences').json() == {"auto_session_names": False}
++    response = client.post('/api/preferences', json={"auto_session_names": True})
++    assert response.status_code == 200
++    assert client.get('/api/preferences').json()["auto_session_names"] is True
++    assert dashboard._user_preferences({"id": "someone-else"})["auto_session_names"] is False
++    assert dashboard._preferences_path(private_user).stat().st_mode & 0o777 == 0o600
++
++
++def test_naming_preference_requires_a_boolean(private_user):
++    response = TestClient(dashboard.app, cookies={dashboard.AUTH_COOKIE: dashboard._make_token("admin")}).post('/api/preferences', json={"auto_session_names": "false"})
++    assert response.status_code == 422
++
++
++def test_default_does_not_queue_automatic_renaming(monkeypatch):
++    monkeypatch.setattr(dashboard, '_auto_session_names_enabled', lambda owner: False, raising=False)
++    assert dashboard._queue_session_tab_label('example', 'test-owner', 'Rename from task') == ''
++
++
++def test_disabled_preference_does_not_show_old_generated_label(monkeypatch):
++    monkeypatch.setattr(dashboard, '_auto_session_names_enabled', lambda owner: False, raising=False)
++    assert dashboard._session_tab_label('my-project', {'my-project': {'owner_id':'test-owner', 'label':'Old Task'}}) == ''
++
++
++def test_saved_items_preserve_exact_passwords_and_private_links():
++    from project_saved import collect_saved_items
++    result = collect_saved_items({}, [
++        '**Username:** `nimo@example.com`\n**Password:** `a,b;c$!`\n'
++        'Project: [Open](https://builder5.rotem.ai/Nimo/demo/)\n'
++        'Report: [Download](/home/nimrod_rotem/web-projects/Nimo/demo/report.pdf:12)'
++    ])
++    assert {c['label'].lower(): c['value'] for c in result['creds']} == {'username':'nimo@example.com','password':'a,b;c$!'}
++    assert result['urls'] == ['https://builder5.rotem.ai/Nimo/demo/']
++    assert result['files'] == ['/home/nimrod_rotem/web-projects/Nimo/demo/report.pdf']
++
++
++def test_saved_items_accumulate_without_duplicates_and_include_uploads():
++    from project_saved import collect_saved_items
++    previous = collect_saved_items({}, ['https://example.com/app\nPassword: `keep;me,exact`'])
++    result = collect_saved_items(previous, ['https://example.com/app', '| Username | test-user |'], ['/tmp/upload.pdf'])
++    assert result['urls'] == ['https://example.com/app']
++    assert result['creds'] == [{'label':'Password','value':'keep;me,exact'}, {'label':'Username','value':'test-user'}]
++    assert result['files'] == ['/tmp/upload.pdf']
++
++
++def test_saved_endpoint_never_reads_another_owner(private_user, monkeypatch):
++    monkeypatch.setattr(dashboard, '_strict_session_owner', lambda *args: None)
++    monkeypatch.setattr(dashboard, '_collect_session_saved_items', lambda *args: pytest.fail('must not read denied session'), raising=False)
++    response = TestClient(dashboard.app, cookies={dashboard.AUTH_COOKIE: dashboard._make_token("admin")}).get('/api/sessions/other/saved-items')
++    assert response.status_code == 404
++
++
++def test_saved_collection_is_durable_and_generation_scoped(private_user, tmp_path, monkeypatch):
++    import os
++    owner_id = private_user['id']
++    transcript = tmp_path / 'rollout.jsonl'
++    events = [
++        {'type':'event_msg','payload':{'type':'user_message','message':'Username: demo\nPassword: `dummy,;value`'}},
++        {'type':'event_msg','payload':{'type':'agent_message','message':'Open https://example.com/project/'}},
++        {'type':'event_msg','payload':{'type':'agent_reasoning','message':'Password: should-not-save'}},
++        {'type':'event_msg','payload':{'type':'user_message','message':'# AGENTS.md instructions\nPassword: system-value'}},
++    ]
++    transcript.write_text(''.join(json.dumps(e)+'\n' for e in events))
++    monkeypatch.setattr(dashboard._session_lifecycle, 'get', lambda n: {'resume_uuid':'root','generation':'first'})
++    monkeypatch.setattr(dashboard, '_user_uploads_dir', lambda u: tmp_path / 'uploads' / u['id'])
++    monkeypatch.setattr(dashboard, 'cache', {})
++    def opener(binding):
++        assert binding['owner_id'] == owner_id
++        fd = os.open(transcript, os.O_RDONLY)
++        st = os.fstat(fd)
++        return fd, 'rollout.jsonl', (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
++    monkeypatch.setattr(dashboard, '_open_session_close_rollout', opener)
++    first = dashboard._collect_session_saved_items('demo', private_user, 'first')
++    assert first['creds'] == [{'label':'Username','value':'demo'}, {'label':'Password','value':'dummy,;value'}]
++    with transcript.open('a') as stream:
++        stream.write(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'File: /tmp/report.pdf'}})+'\n')
++    second = dashboard._collect_session_saved_items('demo', private_user, 'first')
++    assert second['urls'] == ['https://example.com/project/']
++    assert second['files'] == ['/tmp/report.pdf']
++    monkeypatch.setattr(dashboard, '_open_session_close_rollout', lambda b: (_ for _ in ()).throw(dashboard._SessionCloseError('missing')))
++    assert dashboard._collect_session_saved_items('demo', private_user, 'first')['creds'] == first['creds']
++    assert dashboard._collect_session_saved_items('demo', private_user, 'second')['creds'] == []
++    stores=list((dashboard._user_data_dir(private_user) / 'saved-projects').glob('*.json'))
++    assert len(stores) == 2
++    assert all(p.stat().st_mode & 0o777 == 0o600 for p in stores)
++
++
++@pytest.mark.asyncio
++async def test_saved_endpoint_rechecks_owner_after_read(private_user, monkeypatch):
++    from starlette.requests import Request
++    checks=iter([(private_user['id'], private_user), None])
++    monkeypatch.setattr(dashboard, '_strict_session_owner', lambda *args: next(checks))
++    monkeypatch.setattr(dashboard, '_collect_session_saved_items', lambda *args: {'creds':[{'label':'Password','value':'dummy'}]})
++    response = await dashboard.api_session_saved_items(Request({'type':'http'}), 'demo')
++    assert response.status_code == 409
++    assert b'dummy' not in response.body
++
++
++def test_no_saved_items_are_extracted_from_managed_instructions():
++    from project_saved import collect_saved_items
++    result=collect_saved_items({}, ['# AGENTS.md instructions\nLogin: fleet-login\nhttps://fleet.example/admin'])
++    assert result == {'urls':[], 'creds':[], 'files':[]}
++
++
++def test_saved_cursor_can_skip_a_large_tool_event(private_user, tmp_path, monkeypatch):
++    import os
++    transcript=tmp_path / 'oversized.jsonl'
++    transcript.write_text(json.dumps({'type':'tool_result','payload':'x'*4_000_100})+'\n'+json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'https://example.com/after-large-output'}})+'\n')
++    monkeypatch.setattr(dashboard._session_lifecycle, 'get', lambda n: {'resume_uuid':'root'})
++    monkeypatch.setattr(dashboard, '_user_uploads_dir', lambda u: tmp_path / 'uploads')
++    monkeypatch.setattr(dashboard, 'cache', {})
++    def opener(binding):
++        fd=os.open(transcript,os.O_RDONLY); st=os.fstat(fd)
++        return fd, 'oversized.jsonl', (st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns)
++    monkeypatch.setattr(dashboard, '_open_session_close_rollout', opener)
++    dashboard._collect_session_saved_items('demo',private_user,'generation')
++    assert dashboard._collect_session_saved_items('demo',private_user,'generation')['urls'] == ['https://example.com/after-large-output']
+--- /dev/null
++++ b/test_project_session_ui.py
+@@ -0,0 +1,89 @@
++"""Execute session creation and message navigation in a small DOM harness."""
++import json
++import subprocess
++from pathlib import Path
++
++APP = Path(__file__).with_name('app.py')
++DRIVER = r'''
++const fs=require('fs'),vm=require('vm'),source=fs.readFileSync(process.argv[1],'utf8');
++const input=JSON.parse(process.argv[2]);
++const nodes={};const requests=[];const noop=()=>{};
++const node=()=>({innerHTML:'',textContent:'',value:'',style:{},classList:{add:noop,remove:noop,toggle:noop},focus:noop});
++for(const id of ['modal-overlay','modal-content','new-session-name','session-create-error'])nodes[id]=node();
++nodes['new-session-name'].value=input.name||'';
++const st={userRows:[1,3],userScrolledUp:false};
++nodes['raw-alpha']={scrollTop:0,scrollHeight:900,children:[0,1,2,3].map(i=>({offsetTop:i*100,classList:{add:noop,remove:noop}}))};
++const context=vm.createContext({console,Promise,Math,Date,Uint8Array,BASE:'',crypto:{getRandomValues:a=>a.fill(2)},
++ document:{getElementById:id=>id.startsWith('session-create-progress-')?node():nodes[id]||null},
++ selectedSession:'old',sessions:[{name:'old'}],_sessionCreateRun:0,esc:String,
++ setTimeout:fn=>fn(),statusInfoEl:node(),getRawState:()=>st,_setRawScroll:(el,y)=>el.scrollTop=y,
++ selectSession:name=>context.selectedSession=name,
++ loadAll:async()=>{context.selectedSession='old';context.sessions.push({name:'created'})},closeModal:noop,
++ fetch:async(url,options)=>{if(url.endsWith('/create')){requests.push(JSON.parse(options.body));return {ok:!input.conflict,status:input.conflict?409:200,json:async()=>input.conflict?{code:'name_conflict',error:'Already exists'}:{ok:true,name:'created'}}}return {ok:true,json:async()=>({authoritative:true,sessions:[{name:'created',runtime_state:'active'}]})}}
++});
++(async()=>{
++ if(input.action==='create'){
++  vm.runInContext(source.slice(source.indexOf('let _sessionCreatePending='),source.indexOf('// ── Connections (Drive')),context);
++  await context.createSession();
++ }else if(input.action==='form'){
++  vm.runInContext(source.slice(source.indexOf('let _sessionCreatePending='),source.indexOf('// ── Connections (Drive')),context);
++  context.showCreateModal();
++ }else if(input.action==='jump'){
++  vm.runInContext(source.slice(source.indexOf('function jumpToLastUserMessage('),source.indexOf('function rerenderAllRaw(')),context);
++  context.jumpToLastUserMessage('alpha');const first=nodes['raw-alpha'].scrollTop;
++  context.jumpToLastUserMessage('alpha');const second=nodes['raw-alpha'].scrollTop;
++  context.jumpToLive('alpha');context.jumpResult={first,second,last:nodes['raw-alpha'].scrollTop,following:!st.userScrolledUp};
++ }
++ process.stdout.write(JSON.stringify({requests,selected:context.selectedSession,html:nodes['modal-content'].innerHTML,error:nodes['session-create-error'].textContent,jump:context.jumpResult}));
++})().catch(e=>{console.error(e);process.exit(1)});
++'''
++
++def run(**scenario):
++    result = subprocess.run(['node','-e',DRIVER,str(APP),json.dumps(scenario)],capture_output=True,text=True,timeout=10)
++    assert result.returncode == 0, result.stderr
++    return json.loads(result.stdout)
++
++
++def test_plus_opens_blank_name_form_without_creating():
++    state=run(action='form')
++    assert 'id="new-session-name"' in state['html']
++    assert state['requests'] == []
++
++
++def test_typed_name_is_used_and_created_session_opens_after_roster_refresh():
++    state=run(action='create',name='my-project')
++    assert state['requests'] == [{'name':'my-project'}]
++    assert state['selected'] == 'created'
++
++
++def test_only_empty_submission_generates_a_name():
++    state=run(action='create',name='   ')
++    assert len(state['requests'][0]['name']) == 8
++
++
++def test_named_collision_never_falls_back_to_random_name():
++    state=run(action='create',name='taken',conflict=True)
++    assert state['requests'] == [{'name':'taken'}]
++    assert state['selected'] == 'old'
++
++
++def test_my_last_message_steps_back_and_latest_resumes_following():
++    assert run(action='jump')['jump'] == {'first':290,'second':90,'last':900,'following':True}
++
++
++def test_session_routes_are_addressable_and_preserve_browser_navigation():
++    script = r'''
++const fs=require('fs'),vm=require('vm'),s=fs.readFileSync(process.argv[1],'utf8');
++const updates=[],listeners={};
++const context=vm.createContext({location:{hash:'#/session/my%20project',pathname:'/',search:''},
++ history:{pushState:(_a,_b,url)=>updates.push(url)},window:{addEventListener:(name,fn)=>listeners[name]=fn},
++ sessions:[{name:'my project'}],selectedSession:'old',stopAllRawPolling:()=>{},_acknowledgeCompletion:()=>{},
++ navEl:{querySelectorAll:()=>[]},document:{getElementById:()=>null},renderDetail:()=>{}});
++vm.runInContext(s.slice(s.indexOf('function _sessionRouteName('),s.indexOf('function switchTab(')),context);
++const parsed=context._sessionRouteName();context.selectSession('my project');
++context.selectedSession='old';listeners.popstate();
++process.stdout.write(JSON.stringify({parsed,updates,selected:context.selectedSession}));
++'''
++    response=subprocess.run(['node','-e',script,str(APP)],capture_output=True,text=True)
++    assert response.returncode == 0, response.stderr
++    assert json.loads(response.stdout) == {'parsed':'my project','updates':[],'selected':'my project'}
