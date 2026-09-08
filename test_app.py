@@ -1343,6 +1343,128 @@ class TestSshIdeSafety:
         )
         assert not app._claude_is_user_turn({"type": "assistant", "message": {}})
 
+    def test_agent_registry_drives_every_agent_decision(self):
+        """Agent behaviour lives in one registry, not scattered branches.
+
+        Fifteen separate `== "claude"` checks are how this codebase repeatedly
+        ended up written for Codex and silently wrong for Claude.
+        """
+        from core.config import AGENTS, DEFAULT_AGENT, agent_spec
+
+        assert DEFAULT_AGENT in AGENTS
+        for kind, spec in AGENTS.items():
+            for field in ("label", "binary", "quit", "transcripts"):
+                assert field in spec, f"{kind} missing {field}"
+        # Quit commands genuinely differ; sending the wrong one leaves a live
+        # agent running while the caller believes the pane is free.
+        assert agent_spec("codex")["quit"] == "/quit"
+        assert agent_spec("claude")["quit"] == "/exit"
+        # An unknown kind falls back rather than raising.
+        assert agent_spec("nope")["label"] == AGENTS[DEFAULT_AGENT]["label"]
+
+        # Process detection is derived, not a second list to keep in sync.
+        from services import tmux as tmux_service
+
+        assert set(tmux_service._AGENT_PROCESS_NAMES) == {
+            spec["binary"] for spec in AGENTS.values()
+        }
+
+    def test_unconfigured_agent_is_not_offered(self):
+        """An agent with no launch command must not appear as a broken choice.
+
+        Antigravity's flags and transcript format have not been observed on
+        this host, so it stays hidden until an operator configures it.
+        """
+        import app
+        from core.config import AGENTS
+
+        assert "agy" in AGENTS, "registry should carry the entry"
+        assert not AGENTS["agy"]["launch"], "agy must ship unconfigured"
+        assert "agy" not in app._installed_agents()
+
+    def test_key_rotation_validates_and_keeps_blank_as_no_change(self):
+        """A key can be replaced but never read back.
+
+        Blank means "keep the stored key" — the existing one is never sent to
+        the browser, so an empty field cannot mean "clear it". A rotated key
+        must also validate exactly as it does on creation: a
+        passphrase-protected key fails later as a bare "permission denied",
+        which reads like wrong credentials.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_update_ssh_connection)
+        assert "if pasted_key:" in source, "blank key must be a no-op"
+        assert "_valid_private_key_blob(pasted_key)" in source
+        assert "_private_key_is_encrypted(pasted_key)" in source
+        # The materialised file must be dropped, or the old key stays on disk.
+        assert "_discard_ssh_key, connection_id" in source
+        # Secrets are published only as booleans, via the shared allow-list.
+        assert "_ssh_public_profile(" in source
+
+    def test_server_edit_never_prefills_secrets(self):
+        """Neither edit form may render a stored password or key.
+
+        The stored secret is never sent to the browser, so a prefilled field
+        could only ever be wrong — and an empty one must mean "keep", never
+        "clear".
+        """
+        from pathlib import Path
+
+        page = Path("templates/dashboard.html").read_text()
+        form = page.split("function editWorkspaceFromHome(")[1].split("async function")[0]
+        assert "ws-pw-" in form and "ws-key-" in form
+        for field in form.split("<input")[1:] + form.split("<textarea")[1:]:
+            if "ws-pw-" in field or "ws-key-" in field:
+                assert "value=" not in field.split(">")[0], "a secret is prefilled"
+        assert "leave a field blank to keep what is stored" in form.lower()
+        # It is a dialog, not an inline panel.
+        assert "modal-overlay" in form
+
+        ide = Path("ide-ui/src/lib/Ide.svelte").read_text()
+        assert "private_key: ''" in ide, "IDE cannot rotate a key"
+        assert "if (!body.private_key) delete body.private_key" in ide
+        # The IDE form is a dialog too.
+        assert "showSettings && ide.connection" in ide
+        assert "fixed inset-0 z-50" in ide
+
+    def test_hover_actions_do_not_reflow_their_row(self):
+        """Row actions must be laid out always, only made visible on hover.
+
+        `hidden` + `group-hover:flex` INSERTS the buttons on hover, which
+        reflows the row and shifts the name under the pointer.
+        """
+        from pathlib import Path
+
+        for name in ("TreeNode.svelte", "GitPanel.svelte"):
+            source = Path(f"ide-ui/src/lib/{name}").read_text()
+            assert "hidden shrink-0 gap-0.5 group-hover:flex" not in source, name
+            # Invisible controls must not stay clickable — an unseeable delete
+            # button is worse than a shifting row.
+            assert "pointer-events-none" in source, name
+            assert "group-hover:pointer-events-auto" in source, name
+
+    def test_home_deletes_ask_before_destroying(self):
+        """Both deletes confirm, and the destructive one asks for the name."""
+        from pathlib import Path
+
+        page = Path("templates/dashboard.html").read_text()
+        assert "deleteSessionFromHome" in page and "deleteWorkspaceFromHome" in page
+
+        session_fn = page.split("async function deleteSessionFromHome(")[1].split(
+            "async function "
+        )[0]
+        # Killing a session ends running work: require the name to be typed.
+        assert "prompt(" in session_fn
+        assert "typed.trim()!==name" in session_fn
+
+        workspace_fn = page.split("async function deleteWorkspaceFromHome(")[1].split(
+            "function "
+        )[0]
+        assert "confirm(" in workspace_fn
+
     def test_mcp_listing_reports_servers_without_leaking_args(self):
         """MCP entries carry tokens in their argv; only the shape is published."""
         import inspect

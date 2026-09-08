@@ -29,10 +29,12 @@ from core.config import (
     _CODEX_DOCS_MCP_SERVER,
     _CODEX_DOCS_OVERRIDE_RE,
     _DISABLE_STALLED_OPENAI_DOCS_MCP,
+    AGENTS,
     AUTH_USER,
     CLAUDE_EFFORTS,
     CLAUDE_SESSION_CMD,
     CODEX_API_FALLBACK_ENABLED,
+    DEFAULT_AGENT,
     GIT_EMAIL_DOMAIN,
     MESSAGES_DIR,
     NEW_SESSION_CMD,
@@ -40,6 +42,7 @@ from core.config import (
     PUB_URL,
     SESSION_LIFECYCLE_INTERVAL,
     SESSION_PARK_AFTER,
+    agent_spec,
 )
 from core.state import _shared_store
 from core.users import _is_admin
@@ -126,9 +129,13 @@ def _session_agent_kind(session_name: str) -> str:
         # both shapes so existing sessions keep their agent after an upgrade.
         raw = row.get("agent") if isinstance(row, dict) else row
         value = str(raw or "").strip().lower()
-        return value if value in {"codex", "claude"} else "codex"
+        return value if value in AGENTS else DEFAULT_AGENT
     except Exception:
-        return "codex"
+        # Deliberately narrow in effect: this swallowed a NameError once and
+        # silently reported every session as Codex, which sends the wrong quit
+        # command to a live Claude agent. Log it rather than fail invisibly.
+        logger.warning("Could not resolve agent for %s", session_name, exc_info=True)
+        return DEFAULT_AGENT
 
 
 def _set_session_agent(session_name: str, agent: str) -> None:
@@ -150,7 +157,7 @@ def _agent_quit_command(session_name: str) -> str:
     inert: the live agent treats it as a chat message, stays running, and the
     caller then believes the pane is free.
     """
-    return "/exit" if _session_agent_kind(session_name) == "claude" else "/quit"
+    return agent_spec(_session_agent_kind(session_name))["quit"]
 
 
 def _session_claude_setting(session_name: str, key: str) -> str:

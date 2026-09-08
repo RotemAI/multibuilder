@@ -221,7 +221,8 @@
             role="button" tabindex="0" title={item.path}>
             <span class="truncate text-vs-fg">{fileName(item.path)}</span>
             <span class="truncate text-[11px] text-vs-muted">{fileDir(item.path)}</span>
-            <span class="ml-auto hidden shrink-0 gap-0.5 group-hover:flex">
+            <span class="pointer-events-none ml-auto flex shrink-0 gap-0.5 opacity-0 transition-opacity
+                         group-hover:pointer-events-auto group-hover:opacity-100">
               <button class="rounded-sm p-0.5 text-vs-muted hover:bg-vs-line hover:text-vs-fg"
                 title="Unstage" aria-label="Unstage {item.path}"
                 onclick={(e) => { e.stopPropagation(); run('unstage', { files: [item.path] }) }}>
@@ -259,7 +260,8 @@
             role="button" tabindex="0" title={item.path}>
             <span class="truncate text-vs-fg">{fileName(item.path)}</span>
             <span class="truncate text-[11px] text-vs-muted">{fileDir(item.path)}</span>
-            <span class="ml-auto hidden shrink-0 gap-0.5 group-hover:flex">
+            <span class="pointer-events-none ml-auto flex shrink-0 gap-0.5 opacity-0 transition-opacity
+                         group-hover:pointer-events-auto group-hover:opacity-100">
               <button class="rounded-sm p-0.5 text-vs-muted hover:bg-vs-line hover:text-vs-fg"
                 title="Open changes" aria-label="Open changes to {item.path}"
                 onclick={(e) => { e.stopPropagation(); openDiff(item) }}><FileDiff size={13} /></button>

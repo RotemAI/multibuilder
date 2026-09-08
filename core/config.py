@@ -67,6 +67,60 @@ CLAUDE_SESSION_CMD = os.environ.get(
     "claude --dangerously-skip-permissions",
 )
 
+# --- Agent registry --------------------------------------------------------
+#
+# One entry per agent the dashboard can launch. Everything that used to be a
+# scattered `== "claude"` branch lives here instead, so adding an agent is a
+# single edit rather than hunting fifteen call sites — which is how this
+# codebase repeatedly ended up "written for Codex, silently wrong for Claude".
+#
+# Fields:
+#   binary        what must be on PATH for the agent to be offered
+#   launch        the command tmux runs (env-overridable per agent)
+#   quit          the in-TUI command that ends a turn cleanly
+#   transcripts   how replies are read back: "codex" rollouts, "claude"
+#                 projects tree, or "" when only the pane can be scraped
+#
+# An agent whose `binary` is absent is simply not offered; nothing else in the
+# app needs to know it exists.
+AGENTS: dict[str, dict] = {
+    "codex": {
+        "label": "Codex",
+        "binary": "codex",
+        "launch": NEW_SESSION_CMD,
+        "quit": "/quit",
+        "transcripts": "codex",
+    },
+    "claude": {
+        "label": "Claude",
+        "binary": "claude",
+        "launch": CLAUDE_SESSION_CMD,
+        "quit": "/exit",
+        "transcripts": "claude",
+    },
+    # Antigravity (agy). Off unless its binary is present AND the launch command
+    # is configured, because its flags, quit command and transcript format have
+    # not been observed on this host -- guessing them is exactly the failure
+    # this registry exists to prevent. Set TMUX_DASH_AGY_SESSION_CMD to enable.
+    "agy": {
+        "label": "Antigravity",
+        "binary": os.environ.get("TMUX_DASH_AGY_BINARY", "agy").strip() or "agy",
+        "launch": os.environ.get("TMUX_DASH_AGY_SESSION_CMD", "").strip(),
+        "quit": os.environ.get("TMUX_DASH_AGY_QUIT", "/quit").strip() or "/quit",
+        # No transcript reader yet: replies fall back to scraping the pane,
+        # which works but truncates long output. See TODO.md.
+        "transcripts": "",
+    },
+}
+
+DEFAULT_AGENT = "codex"
+
+
+def agent_spec(kind: str) -> dict:
+    """The registry entry for an agent kind, falling back to the default."""
+    return AGENTS.get(str(kind or "").strip().lower()) or AGENTS[DEFAULT_AGENT]
+
+
 # --- Team mode ------------------------------------------------------------
 # When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
 # simplified UI, shared Codex authentication, per-user context, OAuth connections,

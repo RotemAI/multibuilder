@@ -140,7 +140,12 @@
 
   <span class="flex-1 truncate text-vs-fg">{entry.name}</span>
 
-  <span class="hidden shrink-0 gap-0.5 group-hover:flex">
+  <!-- Always laid out, only made visible on hover. `hidden`/`group-hover:flex`
+       inserted these on hover, which reflowed the row and made the name shift
+       under the pointer. Reserving the space keeps the row still. -->
+  <span class="pointer-events-none flex shrink-0 gap-0.5 opacity-0 transition-opacity
+               group-hover:pointer-events-auto group-hover:opacity-100
+               focus-within:pointer-events-auto focus-within:opacity-100">
     <button class="rounded-sm p-0.5 text-vs-muted hover:bg-vs-line hover:text-vs-fg"
       title="Rename" aria-label="Rename {entry.name}" onclick={rename}>
       <span class="text-[11px] leading-none">✎</span>

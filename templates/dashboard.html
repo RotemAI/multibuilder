@@ -30,6 +30,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .home-card-actions button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:4px 10px;font-size:.75rem;cursor:pointer}
 .home-card-actions button:hover:not(:disabled){background:#30363d;border-color:#58a6ff}
 .home-card-actions button:disabled{opacity:.4;cursor:not-allowed}
+.ws-row{display:flex;gap:8px}
+.ws-row input:first-child{flex:1;min-width:0}
+.ws-row input:last-child{width:92px;flex:none}
+textarea.ws-key{resize:vertical;font-family:ui-monospace,monospace;font-size:.78rem}
+.home-card-actions button.home-danger{color:#f85149;border-color:#30363d}
+.home-card-actions button.home-danger:hover:not(:disabled){background:#3d1418;border-color:#f85149}
 .nav-dot.off{background:#484f58}
 .nav-home{cursor:pointer;user-select:none}
 .nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
@@ -2746,6 +2752,8 @@ function renderHome(){
         <div class="home-card-actions">
           <button onclick="event.stopPropagation();selectSession('${esc(x.name)}')">Open</button>
           ${MEMBER_SIMPLE?'':`<button onclick="event.stopPropagation();openSvelteIde('${esc(x.name)}')">IDE</button>`}
+          <button class="home-danger" title="Delete this session and everything running in it"
+            onclick="event.stopPropagation();deleteSessionFromHome('${esc(x.name)}')">Delete</button>
         </div>
       </div>`).join(''):'<div class="empty">No sessions yet. Create one from the top bar.</div>';
     mainEl.innerHTML=tabs+`<div class="home-grid">${cards}</div>`;
@@ -2773,9 +2781,90 @@ function renderHome(){
       <div class="home-card-actions">
         <button ${w.session_live?'':'disabled title="Its session is not running"'}
           onclick="event.stopPropagation();openSvelteIde('${esc(w.session_name)}')">Connect</button>
+        <button title="Edit this server's settings"
+          onclick="event.stopPropagation();editWorkspaceFromHome('${esc(w.id)}')">Edit</button>
+        <button class="home-danger" title="Remove this saved server"
+          onclick="event.stopPropagation();deleteWorkspaceFromHome('${esc(w.session_name)}','${esc(w.id)}','${esc(w.label||w.host||'')}')">Remove</button>
       </div>
     </div>`).join(''):'<div class="empty">No servers saved yet. Add one from a session\'s IDE.</div>';
   mainEl.innerHTML=tabs+`<div class="home-grid">${rows}</div>`;
+}
+
+async function deleteSessionFromHome(name){
+  // Typing the name, not just an OK: this kills the agent and every process in
+  // the session, and a mis-click on a card is easy.
+  const typed=prompt(`Delete session "${name}"?\n\nThis kills the agent and everything running in it. Type the session name to confirm:`);
+  if(typed===null)return;
+  if(typed.trim()!==name){alert('Name did not match — nothing was deleted.');return}
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name),{method:'DELETE'});
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Could not delete session');
+    sessions=sessions.filter(x=>x.name!==name);
+    if(selectedSession===name)selectedSession=null;
+    _workspaces=null;
+    renderNav();renderHome();
+  }catch(e){alert(e.message||'Could not delete session')}
+}
+
+function editWorkspaceFromHome(id){
+  const w=(_workspaces||[]).find(x=>x.id===id);
+  if(!w)return;
+  const isLocal=w.kind==='local';
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`
+    <h3>${esc(w.label||w.host||'Server')}</h3>
+    <p>${isLocal?'Local folder settings.':'SSH connection settings. Secrets are never shown — leave a field blank to keep what is stored.'}</p>
+    <input class="modal-input" id="ws-label-${esc(w.id)}" placeholder="Label" value="${esc(w.label||'')}">
+    ${isLocal?'':`
+      <div class="ws-row">
+        <input class="modal-input" id="ws-host-${esc(w.id)}" placeholder="Host" value="${esc(w.host||'')}">
+        <input class="modal-input" id="ws-port-${esc(w.id)}" type="number" min="1" max="65535" placeholder="Port" value="${esc(String(w.port||22))}">
+      </div>
+      <input class="modal-input" id="ws-user-${esc(w.id)}" placeholder="Username" value="${esc(w.username||'')}">
+      <input class="modal-input" id="ws-idf-${esc(w.id)}" placeholder="Identity file (optional)" value="${esc(w.identity_file||'')}">
+      <input class="modal-input" id="ws-pw-${esc(w.id)}" type="password" autocomplete="new-password"
+        placeholder="${w.has_password?'Password stored — type to replace':'Password (optional)'}">
+      <textarea class="modal-input ws-key" id="ws-key-${esc(w.id)}" rows="3"
+        placeholder="${w.has_private_key?'Private key stored — paste a new one to replace':'Paste a private key (optional)'}"></textarea>`}
+    <input class="modal-input" id="ws-root-${esc(w.id)}" placeholder="Workspace folder" value="${esc(w.workspace_root||'')}">
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeModal()">Cancel</button>
+      <button class="modal-confirm-create" onclick="saveWorkspaceFromHome('${esc(w.session_name)}','${esc(w.id)}')">Save</button>
+    </div>`;
+  document.getElementById('modal-overlay').classList.add('active');
+}
+
+async function saveWorkspaceFromHome(sessionName,id){
+  const get=k=>{const el=document.getElementById('ws-'+k+'-'+id);return el?el.value.trim():''};
+  const body={label:get('label'),workspace_root:get('root')};
+  const host=get('host'), user=get('user'), port=get('port');
+  if(host)body.host=host;
+  if(user)body.username=user;
+  if(port)body.port=Number(port)||22;
+  const idf=get('idf'); if(idf)body.identity_file=idf;
+  // Blank secret fields mean "keep what is stored": the existing password and
+  // key are never sent to the browser, so empty cannot mean "clear".
+  const pw=get('pw'); if(pw)body.password=pw;
+  const key=get('key'); if(key)body.private_key=key;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/ide/ssh-connections/'+encodeURIComponent(id),
+      {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Could not save');
+    closeModal();_workspaces=null;renderHome();
+  }catch(e){alert(e.message||'Could not save server')}
+}
+
+async function deleteWorkspaceFromHome(sessionName,id,label){
+  if(!confirm(`Remove saved server "${label||id}"?\n\nThe session and its files are untouched; only this saved connection is removed.`))return;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/ide/ssh-connections/'+encodeURIComponent(id),{method:'DELETE'});
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Could not remove server');
+    _workspaces=(_workspaces||[]).filter(w=>w.id!==id);
+    renderHome();
+  }catch(e){alert(e.message||'Could not remove server')}
 }
 
 function renderDetail(){

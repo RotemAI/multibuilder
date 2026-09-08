@@ -20,6 +20,7 @@ import re
 import subprocess
 import time
 
+from core.config import AGENTS
 from core.validators import _is_valid_session_name
 from runtime_control import SessionLifecycleStore
 
@@ -152,7 +153,9 @@ def _process_tree_snapshot() -> tuple[dict[str, list[str]], dict[str, str]]:
 # Process names that mark a tmux session as belonging to this dashboard. Claude
 # sessions were invisible while this matched only "codex", so a session started
 # with the Claude agent vanished from the list the moment its shell was replaced.
-_AGENT_PROCESS_NAMES = frozenset({"codex", "claude"})
+# Derived from the registry so a new agent's process is recognised without a
+# second list to keep in sync.
+_AGENT_PROCESS_NAMES = frozenset(spec["binary"] for spec in AGENTS.values())
 
 
 def _session_is_codex(name: str) -> bool:

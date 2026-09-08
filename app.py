@@ -86,6 +86,7 @@ from core.config import (  # noqa: E402
     ADVISOR_ADMIN_TOKEN_FILE,
     ADVISOR_BASE_URL,
     ADVISOR_HOST_NAME,
+    AGENTS,
     AUTH_COOKIE,
     AUTH_PASS,
     AUTH_USER,
@@ -103,6 +104,7 @@ from core.config import (  # noqa: E402
     CODEX_HOME,
     CONTROLLER_SOCKET,
     DASH_LOCAL_URL,
+    DEFAULT_AGENT,
     DOCVAULT_MCP_KEY,
     DOCVAULT_MCP_SCRIPT,
     DOCVAULT_MCP_URL,
@@ -140,6 +142,7 @@ from core.config import (  # noqa: E402
     TEAM_MODEL,
     TEMPLATES_DIR,
     USERS_FILE,
+    agent_spec,
 )
 
 # Pure validators moved to core/validators.py; re-exported so existing
@@ -7019,8 +7022,8 @@ async def api_create_session(request: Request, body: CreateSession):
         # Record which agent this session runs before anything builds its launch
         # command, so _session_launch_base/_session_launch_command see it.
         _agent = (body.agent or "codex").strip().lower()
-        if _agent not in {"codex", "claude"}:
-            _agent = "codex"
+        if _agent not in AGENTS:
+            _agent = DEFAULT_AGENT
         if _agent == "claude" and not shutil.which("claude"):
             # Fall back rather than launching a command that cannot exist; the
             # session is still usable and the reason is reported to the caller.
@@ -7485,6 +7488,19 @@ stores_service.configure(
 # Wire services/usage.py once its helpers exist. AUTH_SECRET and DEFAULT_MODEL
 # are passed as current values here and kept in step by the module-level
 # attribute forwarding below, which is what tests patch through.
+def _installed_agents() -> list[str]:
+    """Agent kinds this host can actually launch.
+
+    An entry needs its binary on PATH and a launch command; Antigravity ships
+    with neither configured by default, so it stays hidden until an operator
+    sets TMUX_DASH_AGY_SESSION_CMD rather than appearing as a broken choice.
+    """
+    return [
+        kind for kind, spec in AGENTS.items()
+        if spec.get("launch") and shutil.which(spec.get("binary") or kind)
+    ]
+
+
 def _session_started_at(session_name: str) -> float:
     """When this tmux session was created, or 0 when unknown."""
     try:
@@ -9103,6 +9119,35 @@ async def api_update_ssh_connection(
         if body.password:
             changes["password_enc"] = _ssh_vault_encrypt(body.password, connection_id)
             changes["has_password"] = True
+
+        # Key rotation. Blank means "keep the stored key" -- the existing one is
+        # never sent to the browser, so an empty field cannot mean "clear it".
+        # The same validation as creation applies: a passphrase-protected key
+        # fails later as a bare "permission denied", which reads like wrong
+        # credentials, so it is refused up front.
+        pasted_key = (body.private_key or "").strip()
+        if pasted_key:
+            if not _valid_private_key_blob(pasted_key):
+                return JSONResponse(
+                    {"error": "That does not look like an OpenSSH private key "
+                              "(expected a BEGIN … PRIVATE KEY block)"},
+                    status_code=400,
+                )
+            if _private_key_is_encrypted(pasted_key):
+                return JSONResponse(
+                    {"error": "That key is passphrase-protected, which is not supported "
+                              "here. Paste a key without a passphrase, or use password "
+                              "authentication."},
+                    status_code=400,
+                )
+            changes["private_key_enc"] = _ssh_vault_encrypt(pasted_key, connection_id)
+            changes["has_private_key"] = True
+            # A rotated key must replace the materialised file, not sit behind
+            # the old one still on disk.
+            try:
+                await asyncio.to_thread(_discard_ssh_key, connection_id)
+            except OSError:
+                logger.debug("Could not discard old key for %s", connection_id, exc_info=True)
 
     root = body.workspace_root.strip()
     if root:
@@ -12567,7 +12612,7 @@ async def api_get_session_agent(request: Request, session_name: str):
         # offers its own model aliases and effort levels.
         return JSONResponse({
             "agent": agent,
-            "available": [name for name in ("codex", "claude") if shutil.which(name)],
+            "available": _installed_agents(),
             "model": _session_claude_setting(session_name, "claude_model"),
             "model_pending": "",
             "effort": _session_claude_setting(session_name, "claude_effort"),
@@ -12578,7 +12623,7 @@ async def api_get_session_agent(request: Request, session_name: str):
     fields = await asyncio.to_thread(_session_model_fields, session_name)
     return JSONResponse({
         "agent": agent,
-        "available": [name for name in ("codex", "claude") if shutil.which(name)],
+        "available": _installed_agents(),
         "model": fields.get("model", ""),
         "model_pending": fields.get("model_pending", ""),
         "effort": fields.get("effort", ""),
@@ -12602,7 +12647,7 @@ async def api_set_session_agent(request: Request, session_name: str, body: SetSe
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     agent = (body.agent or "").strip().lower()
-    if agent not in {"codex", "claude"}:
+    if agent not in AGENTS:
         return JSONResponse({"error": "Agent must be 'codex' or 'claude'"}, status_code=400)
     if not shutil.which(agent):
         return JSONResponse(

@@ -34,7 +34,7 @@
   let savingSettings = $state(false)
   let settingsForm = $state({
     label: '', host: '', username: '', port: 22,
-    identity_file: '', password: '', workspace_root: '',
+    identity_file: '', password: '', private_key: '', workspace_root: '',
   })
 
   /** Open the settings form from anywhere: reveal the panel that holds it. */
@@ -54,12 +54,13 @@
       username: c.username || '',
       port: c.port || 22,
       identity_file: c.identity_file || '',
-      // Never prefilled: the stored secret is not sent to the browser, and a
+      // Never prefilled: stored secrets are not sent to the browser, and a
       // blank field means "keep it".
       password: '',
+      private_key: '',
       workspace_root: c.workspace_root || '',
     }
-    showSettings = !showSettings
+    showSettings = true
   }
 
   async function saveConnectionSettings() {
@@ -68,6 +69,7 @@
     try {
       const body = { ...settingsForm, port: Number(settingsForm.port) || 22 }
       if (!body.password) delete body.password
+      if (!body.private_key) delete body.private_key
       await api.updateConnection(ide.connection.id, body)
       await ide.loadConnections?.()
       showSettings = false
@@ -529,45 +531,6 @@
               {/if}
             </div>
 
-            {#if showSettings && ide.connection}
-              <!-- Editing an existing connection. Password and key are never
-                   sent back to the browser, so a blank field here means "keep
-                   what is stored", not "clear it". -->
-              <div class="flex flex-col gap-1.5 rounded-sm border border-vs-line bg-vs-panel p-2">
-                <span class="text-[11px] font-semibold tracking-wide uppercase text-vs-muted">
-                  {isLocal ? 'Folder settings' : 'SSH connection settings'}
-                </span>
-                <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
-                  placeholder="Label" bind:value={settingsForm.label} />
-                {#if !isLocal}
-                  <div class="flex gap-1">
-                    <input class="min-w-0 flex-1 rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
-                      placeholder="Host" bind:value={settingsForm.host} />
-                    <input class="w-16 rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
-                      type="number" min="1" max="65535" placeholder="Port" bind:value={settingsForm.port} />
-                  </div>
-                  <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
-                    placeholder="Username" bind:value={settingsForm.username} />
-                  <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
-                    placeholder="Identity file (optional)" bind:value={settingsForm.identity_file} />
-                  <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
-                    type="password" autocomplete="new-password"
-                    placeholder="Password — leave blank to keep current"
-                    bind:value={settingsForm.password} />
-                {/if}
-                <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
-                  placeholder="Workspace folder" bind:value={settingsForm.workspace_root} />
-                <div class="flex gap-1">
-                  <button class="flex-1 rounded-sm bg-vs-status px-2 py-1 text-xs text-white hover:brightness-110 disabled:opacity-40"
-                    disabled={savingSettings} onclick={saveConnectionSettings}>
-                    {savingSettings ? 'Saving…' : 'Save'}
-                  </button>
-                  <button class="rounded-sm border border-vs-line px-2 py-1 text-xs hover:bg-vs-hover"
-                    onclick={() => (showSettings = false)}>Cancel</button>
-                </div>
-              </div>
-            {/if}
-
             {#if ide.connection && ide.connectionState !== 'connected'}
               {#if !isLocal && !ide.connection.has_password}
                 <input class="w-full rounded-sm border border-vs-line bg-vs-input px-2 py-1 text-xs outline-none focus:border-vs-accent"
@@ -831,6 +794,66 @@
   {/if}
   {#if showOpenFolder}
     <OpenFolderDialog onopen={openFolder} onclose={() => (showOpenFolder = false)} />
+  {/if}
+
+  <!-- Connection settings, as a dialog rather than a panel: it is reachable
+       from the status bar on any view, and a form buried in one sidebar tab
+       was easy to miss. Secrets are never sent to the browser, so blank means
+       "keep what is stored" -- it cannot mean "clear it". -->
+  {#if showSettings && ide.connection}
+    <div
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onclick={(e) => { if (e.target === e.currentTarget) showSettings = false }}
+      onkeydown={(e) => { if (e.key === 'Escape') showSettings = false }}
+      role="presentation"
+    >
+      <div class="flex w-full max-w-[420px] flex-col gap-2 rounded-lg border border-vs-line bg-vs-panel p-4 shadow-2xl">
+        <h3 class="text-sm font-semibold text-vs-fg">
+          {isLocal ? 'Folder settings' : 'SSH connection settings'}
+        </h3>
+        <p class="mb-1 text-[11px] leading-relaxed text-vs-muted">
+          {isLocal
+            ? 'Where this workspace opens.'
+            : 'Secrets are never shown — leave a field blank to keep what is stored.'}
+        </p>
+        <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1.5 text-xs outline-none focus:border-vs-accent"
+          placeholder="Label" bind:value={settingsForm.label} />
+        {#if !isLocal}
+          <div class="flex gap-2">
+            <input class="min-w-0 flex-1 rounded-sm border border-vs-line bg-vs-input px-2 py-1.5 text-xs outline-none focus:border-vs-accent"
+              placeholder="Host" bind:value={settingsForm.host} />
+            <input class="w-20 rounded-sm border border-vs-line bg-vs-input px-2 py-1.5 text-xs outline-none focus:border-vs-accent"
+              type="number" min="1" max="65535" placeholder="Port" bind:value={settingsForm.port} />
+          </div>
+          <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1.5 text-xs outline-none focus:border-vs-accent"
+            placeholder="Username" bind:value={settingsForm.username} />
+          <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1.5 text-xs outline-none focus:border-vs-accent"
+            placeholder="Identity file (optional)" bind:value={settingsForm.identity_file} />
+          <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1.5 text-xs outline-none focus:border-vs-accent"
+            type="password" autocomplete="new-password"
+            placeholder={ide.connection.has_password
+              ? 'Password stored — type to replace'
+              : 'Password (optional)'}
+            bind:value={settingsForm.password} />
+          <textarea rows="3"
+            class="resize-y rounded-sm border border-vs-line bg-vs-input px-2 py-1.5 font-mono text-[11px] outline-none focus:border-vs-accent"
+            placeholder={ide.connection.has_private_key
+              ? 'Private key stored — paste a new one to replace'
+              : 'Paste a private key (optional)'}
+            bind:value={settingsForm.private_key}></textarea>
+        {/if}
+        <input class="rounded-sm border border-vs-line bg-vs-input px-2 py-1.5 text-xs outline-none focus:border-vs-accent"
+          placeholder="Workspace folder" bind:value={settingsForm.workspace_root} />
+        <div class="mt-1 flex justify-end gap-2">
+          <button class="rounded-sm border border-vs-line px-3 py-1 text-xs hover:bg-vs-hover"
+            onclick={() => (showSettings = false)}>Cancel</button>
+          <button class="rounded-sm bg-vs-status px-3 py-1 text-xs text-white hover:brightness-110 disabled:opacity-40"
+            disabled={savingSettings} onclick={saveConnectionSettings}>
+            {savingSettings ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
   {/if}
   {#if ide.needsHostKey}
     <HostKeyDialog
