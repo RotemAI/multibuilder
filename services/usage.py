@@ -1008,7 +1008,7 @@ def _parse_session_stats(session_name: str) -> dict:
             try:
                 last_user = next(
                     (
-                        m.get("text", "")
+                        (m.get("full") or m.get("text") or "")
                         for m in reversed(_session_messages(session_name) or [])
                         if m.get("role") == "user"
                     ),

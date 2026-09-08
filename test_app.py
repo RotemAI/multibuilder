@@ -1343,6 +1343,33 @@ class TestSshIdeSafety:
         )
         assert not app._claude_is_user_turn({"type": "assistant", "message": {}})
 
+    def test_prompt_preamble_is_not_shown_as_the_users_message(self):
+        """The transcript shows what was typed; the full prompt is kept apart.
+
+        Storing the built prompt as the user's message had two effects: the
+        chat displayed the whole workspace preamble, and the optimistic echo
+        never matched the server's copy — so every exchange rendered TWICE.
+        """
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_send_command)
+        assert '"text": (body.display.strip() or body.command)' in source
+        # The full prompt must still be stored: transcript matching needs it to
+        # tell two sessions sharing a folder apart.
+        assert '"full": body.command' in source
+
+    def test_transcript_matching_prefers_the_full_prompt(self):
+        """Matching on the displayed text alone would break session binding."""
+        import inspect
+
+        import app
+
+        for fn in (app._capture_agent_reply, app.api_ide_chat_messages):
+            source = inspect.getsource(fn)
+            assert 'm.get("full") or m.get("text")' in source, fn.__name__
+
     def test_redirected_state_paths_bypass_the_shared_database(self):
         """Patching a state file must actually isolate the store.
 

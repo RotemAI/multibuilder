@@ -6071,8 +6071,11 @@ async def _capture_agent_reply(session_name: str) -> bool:
             entry["_chat_was_busy"] = True
             return False
         last_user = next(
-            (m.get("text", "") for m in reversed(entry.get("messages", []) or [])
-             if m.get("role") == "user"),
+            (
+                (m.get("full") or m.get("text") or "")
+                for m in reversed(entry.get("messages", []) or [])
+                if m.get("role") == "user"
+            ),
             "",
         )
         summary = await get_chat_summary(
@@ -8551,7 +8554,11 @@ async def api_ide_chat_messages(request: Request, session_name: str, limit: int 
     pending = ""
     try:
         last_user = next(
-            (m.get("text", "") for m in reversed(messages) if m.get("role") == "user"),
+            (
+                (m.get("full") or m.get("text") or "")
+                for m in reversed(messages)
+                if m.get("role") == "user"
+            ),
             "",
         )
         draft = await asyncio.to_thread(
@@ -11870,6 +11877,10 @@ async def api_session_stats(session_name: str):
 
 class SendCommand(BaseModel):
     command: str
+    # What the user actually typed, when the caller sent a larger built prompt.
+    # The transcript should show the question, not the workspace preamble that
+    # is prepended for the agent's benefit.
+    display: str = ""
 
 class SendKeys(BaseModel):
     # List of tmux key names, e.g. ["Escape"], ["C-c"], ["q", "Enter"].
@@ -12001,8 +12012,14 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
             entry = cache.setdefault(session_name, {})
             if "messages" not in entry:
                 entry["messages"] = _load_session_messages(session_name)
+            # `text` is what the transcript shows; `full` keeps the prompt that
+            # was actually sent. Transcript matching needs the full prompt to
+            # tell two sessions in one folder apart, so both are stored.
             entry["messages"].append({
-                "role": "user", "text": body.command, "ts": now
+                "role": "user",
+                "text": (body.display.strip() or body.command),
+                "full": body.command,
+                "ts": now,
             })
             _save_messages()
         try:

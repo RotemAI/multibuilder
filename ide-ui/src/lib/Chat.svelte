@@ -82,9 +82,15 @@
       const server = data.messages || []
       // Carry over any optimistic message the server has not recorded yet,
       // otherwise the user's own text disappears on the very next poll.
-      const serverTexts = new Set(
-        server.filter((m) => m.role === 'user').map((m) => (m.text || '').trim()),
-      )
+      // Match on the displayed text OR the full prompt: the server stores both,
+      // and comparing only one meant the optimistic echo was never recognised
+      // as confirmed, so every exchange rendered twice.
+      const serverTexts = new Set()
+      for (const m of server) {
+        if (m.role !== 'user') continue
+        if (m.text) serverTexts.add(m.text.trim())
+        if (m.full) serverTexts.add(m.full.trim())
+      }
       const unconfirmed = messages.filter(
         (m) => m._local && !serverTexts.has((m.text || '').trim()),
       )
@@ -316,7 +322,11 @@
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ command: prompt }),
+          // `display` is what the transcript keeps: the built prompt carries a
+          // workspace preamble the agent needs but the user never typed, and
+          // storing that made the optimistic echo and the server's copy differ,
+          // so both rendered and every exchange appeared twice.
+          body: JSON.stringify({ command: prompt, display: text }),
         },
       )
       const data = await response.json().catch(() => ({}))
