@@ -5786,6 +5786,49 @@ def _claude_turn_text(event: dict) -> str | None:
     return joined or None
 
 
+# What each tool's input is "about", so a step reads like the CLI's own line
+# ("Read app.py", "Bash(make ide)") rather than a bare tool name.
+_TOOL_SUBJECT_KEYS = (
+    "file_path", "path", "command", "pattern", "query", "url", "description",
+    "notebook_path", "prompt",
+)
+
+
+def _claude_tool_steps(event: dict) -> list[dict]:
+    """Tool calls in one Claude transcript line, as display steps.
+
+    A turn that spends minutes running tools produces NO assistant text until
+    it finishes, so the panel looked hung. These are what fills that gap --
+    the same activity the CLI prints as it works.
+    """
+    if event.get("type") != "assistant":
+        return []
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    steps = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name = str(block.get("name") or "tool")
+        payload = block.get("input")
+        subject = ""
+        if isinstance(payload, dict):
+            for key in _TOOL_SUBJECT_KEYS:
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    subject = " ".join(value.split())
+                    break
+        # A path reads better as its tail; a command reads better from the head.
+        if subject.startswith("/") and " " not in subject:
+            subject = subject.rsplit("/", 1)[-1]
+        steps.append({"type": "tool", "name": name, "detail": subject[:80]})
+    return steps
+
+
 def _claude_is_user_turn(event: dict) -> bool:
     """A real human prompt, not a tool result echoed back as a user message."""
     if event.get("type") != "user":
@@ -6023,6 +6066,39 @@ def _extract_turn_links(text: str, limit: int = 14) -> list:
 # The stored copy of a turn is capped only to stop one runaway reply bloating the
 # per-user message file forever. Real prose never gets near this.
 _CHAT_FULL_MAX = 20000
+
+
+def _extract_turn_activity(session_name: str, last_user_text: str = "") -> list[dict]:
+    """The in-flight turn as an ordered timeline of text and tool steps.
+
+    Mirrors what the CLI shows while it works, so a long tool run is visible
+    progress instead of a silent gap.
+    """
+    path = _resolve_session_transcript(session_name, last_user_text)
+    if not path:
+        return []
+    steps: list[dict] = []
+    try:
+        for line in _read_jsonl_tail(path):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:  # noqa: BLE001 - a torn line is simply skipped
+                continue
+            if _codex_event_payload(event, "user_message") or _claude_is_user_turn(event):
+                steps = []
+                continue
+            text = _claude_turn_text(event)
+            if text:
+                steps.append({"type": "text", "text": text})
+            steps.extend(_claude_tool_steps(event))
+    except Exception:  # noqa: BLE001 - activity is best-effort
+        logger.debug("turn activity read failed for %s", session_name, exc_info=True)
+        return []
+    # Only the tail matters; an old turn's steps would just be noise.
+    return steps[-40:]
 
 
 def _turn_full_text(text: str) -> str:
@@ -8552,15 +8628,17 @@ async def api_ide_chat_messages(request: Request, session_name: str, limit: int 
     # The read is ~10ms, so doing it unconditionally is cheaper than being
     # wrong.
     pending = ""
+    # Bound outside the try: it is read again when building `steps` below, and
+    # an exception in here would otherwise leave it undefined.
+    last_user = next(
+        (
+            (m.get("full") or m.get("text") or "")
+            for m in reversed(messages)
+            if m.get("role") == "user"
+        ),
+        "",
+    )
     try:
-        last_user = next(
-            (
-                (m.get("full") or m.get("text") or "")
-                for m in reversed(messages)
-                if m.get("role") == "user"
-            ),
-            "",
-        )
         draft = await asyncio.to_thread(
             _extract_last_assistant_turn, session_name, last_user
         )
@@ -8579,6 +8657,79 @@ async def api_ide_chat_messages(request: Request, session_name: str, limit: int 
         "busy": busy,
         "detail": str(activity.get("detail") or "") if busy else "",
         "pending": pending,
+        # The turn's tool activity, so a long run shows progress rather than a
+        # silent gap. Only meaningful while a turn is in flight.
+        "steps": _extract_turn_activity(session_name, last_user) if busy else [],
+    })
+
+
+@app.get("/api/sessions/{session_name}/mcp")
+async def api_session_mcp(request: Request, session_name: str):
+    """MCP servers this session's agent can actually reach.
+
+    Both the dashboard chat and the IDE panel talk to the SAME agent process in
+    tmux, so they share whatever MCP is configured on this host -- there is no
+    separate IDE configuration. This reports what that is, from the agent's own
+    config, so the panel can say which tools are available instead of leaving
+    it a guess.
+    """
+    _sessions, session = _find_session_for_user(session_name, _current_user(request))
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    agent = _session_agent_kind(session_name)
+    cwd = get_session_cwd(session_name) or ""
+    servers: dict[str, dict] = {}
+    sources: list[str] = []
+
+    def merge(found: dict, origin: str):
+        if not isinstance(found, dict):
+            return
+        added = False
+        for name, spec in found.items():
+            if not isinstance(name, str) or not name.strip():
+                continue
+            servers.setdefault(name, {
+                "name": name,
+                # Only the shape, never the args: an MCP entry's argv routinely
+                # carries tokens and connection strings.
+                "kind": str((spec or {}).get("type") or ("stdio" if (spec or {}).get("command") else "unknown")),
+                "source": origin,
+            })
+            added = True
+        if added:
+            sources.append(origin)
+
+    if agent == "claude":
+        config = Path.home() / ".claude.json"
+        try:
+            data = json.loads(config.read_text()) if config.is_file() else {}
+        except (OSError, ValueError):
+            data = {}
+        merge(data.get("mcpServers") or {}, "user")
+        project = (data.get("projects") or {}).get(cwd) or {}
+        merge(project.get("mcpServers") or {}, "project")
+        # A repo-level .mcp.json is picked up by the CLI for that folder.
+        if cwd:
+            repo = Path(cwd) / ".mcp.json"
+            try:
+                if repo.is_file():
+                    merge(json.loads(repo.read_text()).get("mcpServers") or {}, ".mcp.json")
+            except (OSError, ValueError):
+                pass
+    else:
+        codex_home = _session_config_base(session_name)
+        try:
+            names = _codex_home_mcp_servers(codex_home)
+        except Exception:  # noqa: BLE001 - a missing config is not an error
+            names = frozenset()
+        merge({name: {"type": "stdio"} for name in names}, "config.toml")
+
+    return JSONResponse({
+        "agent": agent,
+        "cwd": cwd,
+        "servers": sorted(servers.values(), key=lambda item: item["name"]),
+        "sources": sorted(set(sources)),
     })
 
 

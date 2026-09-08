@@ -1343,6 +1343,90 @@ class TestSshIdeSafety:
         )
         assert not app._claude_is_user_turn({"type": "assistant", "message": {}})
 
+    def test_mcp_listing_reports_servers_without_leaking_args(self):
+        """MCP entries carry tokens in their argv; only the shape is published."""
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.api_session_mcp)
+        # Name, kind and origin only — never the command line.
+        assert '"name": name' in source
+        assert '"args"' not in source
+        assert "spec" in source and "command" in source
+
+    def test_chat_bubbles_are_sided_agent_left_user_right(self):
+        """Agent left, you right — and the agent's side stays the wider one.
+
+        Its replies carry code, tables and lists; squeezing those into a narrow
+        column is what makes rendered output unreadable.
+        """
+        from pathlib import Path
+
+        source = Path("ide-ui/src/lib/Chat.svelte").read_text()
+        assert "chat-bubble-agent" in source and "chat-bubble-user" in source
+        assert "items-start" in source and "items-end" in source
+        # The user bubble is capped narrower than the agent's.
+        style = source.split(".chat-bubble-user {")[1].split("}")[0]
+        assert "max-width: 84%" in style
+
+    def test_chat_markdown_is_parsed_and_sanitised(self):
+        """Agent output is untrusted, and it must render as real Markdown.
+
+        The hand-rolled renderer handled only code/bold/bullets, so tables and
+        headings came through as raw syntax. Replacing it with a parser means
+        the output must also be sanitised: a reply can quote a file or a web
+        page, so it is not safe HTML by construction.
+        """
+        from pathlib import Path
+
+        source = Path("ide-ui/src/lib/Chat.svelte").read_text()
+        assert "marked.parse(" in source, "markdown is not parsed"
+        assert "DOMPurify.sanitize(" in source, "parsed HTML is not sanitised"
+        # Sanitising must wrap the parse, not sit somewhere unrelated.
+        render = source.split("function renderMarkdown(")[1].split("function ")[0]
+        assert "DOMPurify.sanitize(" in render
+        assert "FORBID_TAGS" in render
+
+    def test_chat_scrolls_after_the_dom_has_flushed(self):
+        """queueMicrotask measured the OLD height and landed short.
+
+        It runs before Svelte flushes, so the view kept trailing the stream
+        instead of following it. tick() is the correct wait.
+        """
+        from pathlib import Path
+
+        source = Path("ide-ui/src/lib/Chat.svelte").read_text()
+        assert "queueMicrotask(scrollToEnd)" not in source
+        scroll = source.split("async function scrollToEnd(")[1].split("function ")[0]
+        assert "await tick()" in scroll
+
+    def test_tool_activity_is_extracted_for_the_live_turn(self):
+        """A turn spent in tools must show progress, not a silent gap.
+
+        Only `text` blocks were read, so a turn that ran tools for minutes
+        emitted nothing until it finished — which is what read as a hang.
+        """
+        import app
+
+        event = {
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "make ide"}},
+                {"type": "tool_use", "name": "Read",
+                 "input": {"file_path": "/var/www/multibuilder/app.py"}},
+                {"type": "text", "text": "done"},
+            ]},
+        }
+        steps = app._claude_tool_steps(event)
+        assert [s["name"] for s in steps] == ["Bash", "Read"]
+        assert steps[0]["detail"] == "make ide"
+        # A path is shown by its tail; a command keeps its head.
+        assert steps[1]["detail"] == "app.py"
+        # Text blocks are not tool steps.
+        assert app._claude_tool_steps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hi"}]}}) == []
+
     def test_prompt_preamble_is_not_shown_as_the_users_message(self):
         """The transcript shows what was typed; the full prompt is kept apart.
 

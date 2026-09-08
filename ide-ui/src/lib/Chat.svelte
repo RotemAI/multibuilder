@@ -1,5 +1,7 @@
 <script>
-  import { onDestroy } from 'svelte'
+  import { onDestroy, tick } from 'svelte'
+  import { marked } from 'marked'
+  import DOMPurify from 'dompurify'
   import { ide } from './store.svelte.js'
   import { api } from './api.js'
   import { ArrowUp, Loader, Sparkles, Check, ChevronDown, Square, Minimize2, Paperclip } from 'lucide-svelte'
@@ -21,9 +23,20 @@
   let pollRate = 0
   let agentBusy = $state(false)
   let pending = $state('')
+  let steps = $state([])
+  let mcp = $state(null)
   let busyDetail = $state('')
   // "Working" covers both: our request in flight, and the agent still writing.
   const working = $derived(sending || agentBusy || !!pending)
+
+  // Name what is happening, the way the CLI does, rather than a generic label:
+  // during a long tool run "Generating" alone gives no sense of progress.
+  const currentActivity = $derived.by(() => {
+    const lastTool = [...steps].reverse().find((s) => s.type === 'tool')
+    if (lastTool) return `Running ${lastTool.name}`
+    if (pending) return 'Writing'
+    return busyDetail || 'Generating'
+  })
   let messages = $state([])
   let error = $state('')
   let listEl = $state(null)
@@ -102,13 +115,16 @@
       agentBusy = !!data.busy
       busyDetail = data.detail || ''
       const nextPending = data.pending || ''
-      const streamed = nextPending !== pending
+      const nextSteps = data.steps || []
+      const streamed =
+        nextPending !== pending || nextSteps.length !== steps.length
       pending = nextPending
+      steps = nextSteps
       error = ''
       // Follow along while a reply streams in, not only when a message is
       // added -- otherwise the text grows below the fold and the user has to
       // chase it. Skipped if they have scrolled up to read history.
-      if ((grew || streamed || working) && atBottom) queueMicrotask(scrollToEnd)
+      if ((grew || streamed || working) && atBottom) scrollToEnd()
     } catch (exc) {
       error = exc.message || 'Could not load chat'
     }
@@ -139,8 +155,21 @@
     atBottom = distance < 80
   }
 
-  function scrollToEnd() {
-    if (listEl) listEl.scrollTop = listEl.scrollHeight
+  /** Scroll to the newest content AFTER Svelte has flushed the DOM.
+   *
+   * queueMicrotask fires before the flush, so it measured the OLD scrollHeight
+   * and landed short of the text that had just arrived -- which is why the view
+   * kept trailing behind the stream instead of following it.
+   */
+  async function scrollToEnd() {
+    await tick()
+    if (!listEl) return
+    listEl.scrollTop = listEl.scrollHeight
+    // Streaming appends in bursts; a second pass after the browser has laid the
+    // new nodes out catches the case where the first landed mid-reflow.
+    requestAnimationFrame(() => {
+      if (listEl) listEl.scrollTop = listEl.scrollHeight
+    })
   }
 
   function jumpToLatest() {
@@ -154,6 +183,7 @@
     // A different session has its own turn in flight; showing the previous
     // one's partial text against the new transcript would be wrong.
     pending = ''
+    steps = []
     agentBusy = false
     atBottom = true
     if (timer) clearInterval(timer)
@@ -314,7 +344,7 @@
     question = ''
     attachments = []
     if (textareaEl) textareaEl.style.height = 'auto'
-    queueMicrotask(scrollToEnd)
+    scrollToEnd()
 
     try {
       const response = await fetch(
@@ -371,27 +401,28 @@
    * pulling a parser into the bundle — everything is escaped BEFORE any tag is
    * introduced, so agent output can never inject markup.
    */
+  /** Render agent output as Markdown, sanitised.
+   *
+   * The hand-rolled version handled only fenced code, bold and bullets, so
+   * headings, links, numbered lists and TABLES came through as raw syntax --
+   * which is why a reply containing a table looked mangled.
+   *
+   * Agent output is untrusted text: it can quote a file, a web page, or
+   * anything a tool returned. It is parsed then sanitised, so a reply cannot
+   * inject script or event handlers into the panel.
+   */
   function renderMarkdown(raw) {
-    const blocks = []
-    // Pull fenced code out first so its contents are never touched by the
-    // inline rules below.
-    const withFences = escapeHtml(raw).replace(/```(\w*)\n?([\s\S]*?)```/g, (_m, lang, code) => {
-      blocks.push(
-        `<pre class="chat-code"><code>${code.replace(/\n$/, '')}</code></pre>`,
-      )
-      return `\u0000BLOCK${blocks.length - 1}\u0000`
-    })
-    const inline = withFences
-      .replace(/`([^`\n]+)`/g, '<code class="chat-inline">$1</code>')
-      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-      .split('\n')
-      .map((line) => {
-        const bullet = line.match(/^\s*[-*]\s+(.*)$/)
-        if (bullet) return `<span class="chat-li">${bullet[1]}</span>`
-        return line
+    try {
+      const html = marked.parse(raw || '', { breaks: true, gfm: true })
+      return DOMPurify.sanitize(html, {
+        // Nothing in a reply should be able to prompt for input in the panel.
+        FORBID_TAGS: ['form', 'input', 'button', 'style', 'iframe', 'object', 'embed'],
+        FORBID_ATTR: ['style', 'srcset'],
       })
-      .join('\n')
-    return inline.replace(/\u0000BLOCK(\d+)\u0000/g, (_m, i) => blocks[Number(i)])
+    } catch {
+      // Never let a malformed reply blank the transcript.
+      return escapeHtml(raw || '')
+    }
   }
 
   function displayText(message) {
@@ -413,6 +444,24 @@
   let compacting = $state(false)
   let usageTimer = null
 
+  /** Which MCP servers the agent can reach on this host.
+   *
+   * The IDE panel and the dashboard chat drive the SAME agent process, so they
+   * share one MCP configuration — this reports it rather than leaving it a
+   * guess about what tools are available.
+   */
+  async function loadMcp() {
+    if (!target) return
+    try {
+      const response = await fetch(
+        `${rootPath}/api/sessions/${encodeURIComponent(target)}/mcp`,
+      )
+      mcp = response.ok ? await response.json() : null
+    } catch {
+      mcp = null
+    }
+  }
+
   async function loadUsage() {
     if (!target) return
     try {
@@ -429,6 +478,7 @@
   $effect(() => {
     target
     loadUsage()
+    loadMcp()
     clearInterval(usageTimer)
     // Cheap (a cached file parse) but not free, so poll slowly; a turn also
     // refreshes it on completion below.
@@ -516,23 +566,24 @@
     {/if}
     {#each messages as message, index (message.ts + ':' + index)}
       {#if message.role === 'assistant'}
-        <!-- Assistant turns read as flowing prose with a speaker label, the way
-             Claude Code renders replies — not as chat bubbles. -->
-        <div class="flex flex-col gap-1.5">
+        <!-- Agent on the LEFT. Its replies carry code, tables and lists, so the
+             bubble is allowed to run wide -- squeezing them into a narrow
+             column is what makes rendered output unreadable. -->
+        <div class="flex flex-col items-start gap-1">
           <span class="flex items-center gap-1.5 text-[11px] font-semibold text-mk-green">
             <Sparkles size={11} />
             {config.agent === 'claude' ? 'Claude' : 'Codex'}
           </span>
-          <div class="chat-prose text-[13px] leading-relaxed text-mk-fg">
+          <div class="chat-bubble chat-bubble-agent chat-prose text-[13px] leading-relaxed text-mk-fg">
             {@html renderMarkdown(displayText(message))}
           </div>
         </div>
       {:else}
-        <!-- The user's own turn: a quiet left rule rather than a bubble, so a
-             long prompt does not dominate the column. -->
-        <div class="flex flex-col gap-1.5 border-l-2 border-mk-blue/60 pl-2.5">
+        <!-- You on the RIGHT, the usual chat convention. Capped narrower than
+             the agent's side so a long paste does not fill the column. -->
+        <div class="flex flex-col items-end gap-1">
           <span class="text-[11px] font-semibold text-mk-blue">You</span>
-          <div class="text-[13px] leading-relaxed whitespace-pre-wrap text-mk-fg/90">
+          <div class="chat-bubble chat-bubble-user text-[13px] leading-relaxed whitespace-pre-wrap text-mk-fg">
             {displayText(message)}
           </div>
         </div>
@@ -552,13 +603,30 @@
     <!-- The turn in flight, streamed from the transcript. Rendered like a
          finished reply so text does not jump when it settles, with a caret to
          show it is still arriving. -->
+    {#if steps.length && working}
+      <!-- What the agent is doing right now. A turn can spend minutes in tools
+           without emitting a single line of text, which read as a hang; these
+           are the same steps the CLI prints as it works. -->
+      <div class="flex flex-col gap-0.5 text-[11px]">
+        {#each steps.filter((s) => s.type === 'tool') as step, i (i)}
+          <div class="flex items-start gap-1.5 text-mk-comment">
+            <span class="mt-[3px] text-mk-green">●</span>
+            <span class="truncate">
+              <b class="font-medium text-mk-fg/80">{step.name}</b>
+              {#if step.detail}<span class="text-mk-comment">({step.detail})</span>{/if}
+            </span>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
     {#if pending}
-      <div class="flex flex-col gap-1.5">
+      <div class="flex flex-col items-start gap-1">
         <span class="flex items-center gap-1.5 text-[11px] font-semibold text-mk-green">
           <Sparkles size={11} />
           {config.agent === 'claude' ? 'Claude' : 'Codex'}
         </span>
-        <div class="chat-prose text-[13px] leading-relaxed text-mk-fg">
+        <div class="chat-bubble chat-bubble-agent chat-prose text-[13px] leading-relaxed text-mk-fg">
           {@html renderMarkdown(pending)}<span class="chat-caret"></span>
         </div>
       </div>
@@ -566,7 +634,7 @@
     {#if working}
       <div class="flex items-center gap-2 text-[11px] text-mk-comment">
         <Loader size={11} class="animate-spin" />
-        <span>{busyDetail || 'Generating'}<span class="chat-dots"></span></span>
+        <span>{currentActivity}<span class="chat-dots"></span></span>
       </div>
     {/if}
   </div>
@@ -603,6 +671,12 @@
       <span title="{usage.messageCount} turns · {compactNumber(usage.totalInput)} in · {compactNumber(usage.totalOutput)} out">
         {compactNumber(usage.totalTokens)} tokens
       </span>
+      {#if mcp && mcp.servers && mcp.servers.length}
+        <span class="text-mk-comment"
+          title={`MCP tools available to this agent: ${mcp.servers.map((x) => x.name).join(', ')}`}>
+          {mcp.servers.length} MCP
+        </span>
+      {/if}
       {#if usage.shared}
         <!-- Several agent sessions share this folder and transcripts are stored
              per folder, so these totals cover all of them. Labelled rather than
@@ -790,8 +864,74 @@
   .chat-prose :global(.chat-li) { display: block; padding-left: 12px; text-indent: -12px; }
   .chat-prose :global(.chat-li)::before { content: '•'; color: var(--color-mk-green); padding-right: 6px; }
   /* Only the non-code text wraps; a long code line scrolls instead. */
-  .chat-prose { white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* marked emits real block elements, so the container must no longer force
+     pre-wrap -- that was for the hand-rolled renderer's raw newlines. */
+  /* Bubbles: agent left, you right. */
+  .chat-bubble {
+    border-radius: 10px;
+    padding: 8px 11px;
+    max-width: 92%;
+  }
+  .chat-bubble-agent {
+    background: var(--color-mk-input);
+    border: 1px solid var(--color-mk-line);
+    border-top-left-radius: 3px;
+  }
+  .chat-bubble-user {
+    /* Tinted rather than solid: a saturated fill next to Monokai code makes
+       both harder to read. */
+    background: color-mix(in srgb, var(--color-mk-blue) 16%, var(--color-mk-input));
+    border: 1px solid color-mix(in srgb, var(--color-mk-blue) 34%, transparent);
+    border-top-right-radius: 3px;
+    max-width: 84%;
+  }
+
+  .chat-prose { overflow-wrap: anywhere; }
   .chat-prose :global(.chat-code) { white-space: pre; }
+
+  .chat-prose :global(p) { margin: 0 0 0.6em; }
+  .chat-prose :global(p:last-child) { margin-bottom: 0; }
+  .chat-prose :global(h1),
+  .chat-prose :global(h2),
+  .chat-prose :global(h3),
+  .chat-prose :global(h4) {
+    margin: 0.9em 0 0.4em; font-weight: 600; line-height: 1.3;
+  }
+  .chat-prose :global(h1) { font-size: 1.15em; }
+  .chat-prose :global(h2) { font-size: 1.08em; }
+  .chat-prose :global(h3) { font-size: 1em; }
+  .chat-prose :global(ul),
+  .chat-prose :global(ol) { margin: 0 0 0.6em; padding-left: 1.3em; }
+  .chat-prose :global(li) { margin: 0.15em 0; }
+  .chat-prose :global(ul) { list-style: disc; }
+  .chat-prose :global(ol) { list-style: decimal; }
+  .chat-prose :global(a) { color: var(--color-mk-blue); text-decoration: underline; }
+  .chat-prose :global(blockquote) {
+    margin: 0 0 0.6em; padding-left: 0.8em;
+    border-left: 2px solid var(--color-mk-line); color: var(--color-mk-comment);
+  }
+  .chat-prose :global(hr) { border: 0; border-top: 1px solid var(--color-mk-line); margin: 0.8em 0; }
+  .chat-prose :global(pre) {
+    margin: 0 0 0.6em; padding: 8px 10px; border-radius: 6px;
+    background: var(--color-mk-input); overflow-x: auto;
+  }
+  .chat-prose :global(pre code) { white-space: pre; }
+  .chat-prose :global(code) {
+    background: var(--color-mk-input); border-radius: 3px; padding: 0 3px;
+    font-size: 0.92em;
+  }
+  .chat-prose :global(pre code) { background: none; padding: 0; }
+
+  /* A wide table must scroll in its own box, never widen the panel. */
+  .chat-prose :global(table) {
+    display: block; width: max-content; max-width: 100%; overflow-x: auto;
+    border-collapse: collapse; margin: 0 0 0.6em; font-size: 0.94em;
+  }
+  .chat-prose :global(th),
+  .chat-prose :global(td) {
+    border: 1px solid var(--color-mk-line); padding: 4px 8px; text-align: left;
+  }
+  .chat-prose :global(th) { background: var(--color-mk-input); font-weight: 600; }
 
   /* Streaming caret: shows the reply is still arriving without shifting the
      text, which a spinner on its own line would do. */
