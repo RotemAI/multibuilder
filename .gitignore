@@ -83,3 +83,4 @@ ide-ui/.vite/
 
 # pm2 runtime logs
 logs/
+workspace
