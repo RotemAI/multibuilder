@@ -1430,6 +1430,31 @@ class TestSshIdeSafety:
         assert "showSettings && ide.connection" in ide
         assert "fixed inset-0 z-50" in ide
 
+    def test_explorer_context_menu_can_create_in_place(self):
+        """New File/Folder must land in the clicked folder, not the root.
+
+        Creating inside a right-clicked FILE's own path would fail, so the
+        parent is used; and a new item inside an already-expanded folder stays
+        hidden behind that folder's cached children unless they are re-read.
+        """
+        from pathlib import Path
+
+        explorer = Path("ide-ui/src/lib/Explorer.svelte").read_text()
+        assert "New File…" in explorer and "New Folder…" in explorer
+        assert "startCreateIn(" in explorer
+
+        target = explorer.split("function startCreateIn(")[1].split("async function")[0]
+        # A folder receives the child; a file contributes its parent.
+        assert "isDir ? path :" in target
+
+        store = Path("ide-ui/src/lib/store.svelte.js").read_text()
+        assert "revealDirectory(" in store, "no way to re-read cached children"
+        reveal = store.split("async revealDirectory(")[1].split("async toggleDirectory")[0]
+        assert "delete next[path]" in reveal, "cached children are not invalidated"
+
+        # Exactly one create handler: an earlier pass duplicated it.
+        assert explorer.count("async function submitCreate(") == 1
+
     def test_hover_actions_do_not_reflow_their_row(self):
         """Row actions must be laid out always, only made visible on hover.
 

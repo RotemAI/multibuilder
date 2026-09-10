@@ -3,6 +3,7 @@
   import { api } from './api.js'
   import TreeNode from './TreeNode.svelte'
   import { tick } from 'svelte'
+  import { FilePlus, FolderPlus, RefreshCw, ChevronDown } from 'lucide-svelte'
 
   // Context menu state. The tree asks to open it via ide.openTreeMenu so the
   // menu lives once here rather than once per node.
@@ -65,25 +66,43 @@
     navigator.clipboard?.writeText(target).catch(() => {})
     ide.setStatus(`Copied ${target}`)
   }
-  import { FilePlus, FolderPlus, RefreshCw, ChevronDown } from 'lucide-svelte'
-
   let creating = $state('')
   let newName = $state('')
+  // Where the new item lands. The toolbar creates at the workspace root; the
+  // context menu creates inside the clicked folder (or beside a clicked file),
+  // which is what VS Code does.
+  let createBase = $state('')
 
-  const join = (dir, name) => (dir === '.' ? name : `${dir}/${name}`)
+  const join = (dir, name) => (dir === '.' || !dir ? name : `${dir}/${name}`)
+
+  function startCreateIn(kind, path, isDir) {
+    createBase = isDir ? path : (path.split('/').slice(0, -1).join('/') || '.')
+    creating = kind
+    newName = ''
+    closeMenu()
+  }
 
   async function submitCreate(event) {
     event.preventDefault()
     const name = newName.trim()
     if (!name) return
+    const base = createBase || ide.path
     try {
       await api.fs(ide.connectionId, {
         action: creating === 'dir' ? 'create_dir' : 'create_file',
-        path: join(ide.path, name),
+        path: join(base, name),
       })
+      const created = join(base, name)
+      const kind = creating
       creating = ''
       newName = ''
+      createBase = ''
       await ide.refreshFiles()
+      // Reveal it: a new item inside an already-expanded folder stays hidden
+      // behind that folder's cached children until they are re-read.
+      await ide.revealDirectory(base)
+      // Open a new file so it is ready to edit, as VS Code does.
+      if (kind === 'file') await ide.openFile(created)
     } catch (error) {
       ide.setStatus(error.message || 'Could not create')
     }
@@ -113,9 +132,9 @@
     <span class="flex-1 truncate" title={ide.connection?.workspace_root}>{rootLabel}</span>
     <span class="flex opacity-0 transition-opacity group-hover:opacity-100">
       <button class="rounded-sm p-1 hover:bg-vs-hover" title="New file" aria-label="New file"
-        onclick={() => { creating = 'file'; newName = '' }}><FilePlus size={14} /></button>
+        onclick={() => { creating = 'file'; newName = ''; createBase = '' }}><FilePlus size={14} /></button>
       <button class="rounded-sm p-1 hover:bg-vs-hover" title="New folder" aria-label="New folder"
-        onclick={() => { creating = 'dir'; newName = '' }}><FolderPlus size={14} /></button>
+        onclick={() => { creating = 'dir'; newName = ''; createBase = '' }}><FolderPlus size={14} /></button>
       <button class="rounded-sm p-1 hover:bg-vs-hover" title="Refresh" aria-label="Refresh"
         onclick={() => ide.refreshFiles()}><RefreshCw size={13} /></button>
     </span>
@@ -126,7 +145,7 @@
       <!-- svelte-ignore a11y_autofocus -->
       <input
         class="w-full rounded-sm border border-vs-accent bg-vs-input px-2 py-1 text-xs text-vs-fg outline-none"
-        placeholder={creating === 'dir' ? 'New folder name' : 'New file name'}
+        placeholder={`${creating === 'dir' ? 'New folder' : 'New file'} in ${createBase || ide.path || '.'}`}
         bind:value={newName}
         autofocus
         onkeydown={(e) => { if (e.key === 'Escape') creating = '' }}
@@ -171,6 +190,11 @@
           />
         </form>
       {:else}
+        <button class="w-full px-3 py-1 text-left hover:bg-vs-hover"
+          onclick={() => startCreateIn('file', menu.path, menu.isDir)}>New File…</button>
+        <button class="w-full px-3 py-1 text-left hover:bg-vs-hover"
+          onclick={() => startCreateIn('dir', menu.path, menu.isDir)}>New Folder…</button>
+        <div class="my-1 h-px bg-vs-line"></div>
         <button class="w-full px-3 py-1 text-left hover:bg-vs-hover" onclick={startRename}>Rename…</button>
         <button class="w-full px-3 py-1 text-left hover:bg-vs-hover" onclick={copyPath}>Copy Path</button>
         <div class="my-1 h-px bg-vs-line"></div>

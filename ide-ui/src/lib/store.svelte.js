@@ -170,6 +170,26 @@ class IdeStore {
     }
   }
 
+  /** Expand a folder and re-read its children.
+   *
+   * toggleDirectory caches children and returns early when they are already
+   * loaded, so a file created inside an open folder would not appear until a
+   * full refresh. Creation calls this instead.
+   */
+  async revealDirectory(path) {
+    if (!path || path === '.') return
+    const next = { ...this.treeChildren }
+    delete next[path]
+    this.treeChildren = next
+    this.expanded = { ...this.expanded, [path]: true }
+    try {
+      const data = await api.listFiles(this.connectionId, path)
+      this.treeChildren = { ...this.treeChildren, [path]: data.entries || [] }
+    } catch (error) {
+      this.setStatus(error.message || 'Could not expand folder')
+    }
+  }
+
   async toggleDirectory(path) {
     if (this.expanded[path]) {
       const next = { ...this.expanded }
