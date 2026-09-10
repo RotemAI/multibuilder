@@ -124,3 +124,48 @@ def test_scoped_member_launch_rebinds_identity_after_login_shell_startup(tmp_pat
     assert f"CODEX_HOME={codex_home}" in launch
     assert str(token_path) in launch
     assert "do-not-embed-this-value" not in launch
+
+
+UNOWNED_SESSIONS = SESSIONS + [
+    {"name": "started-from-a-shell", "windows": "1", "created": "3", "attached": False},
+]
+
+
+def test_a_session_with_no_owner_record_is_listed_to_nobody():
+    """A tmux session nobody claimed must not appear in anyone's workspace.
+
+    It used to default to the admin, so on a box where nineteen accounts share
+    one tmux server every session started from a shell showed up in the admin's
+    dashboard as a tab they never opened, and could be closed from there.
+    """
+    with (
+        patch.object(app_module, "_load_users", return_value=[ADMIN, MEMBER]),
+        patch.object(app_module, "_load_session_owners", return_value=OWNERS),
+    ):
+        for user in (ADMIN, MEMBER):
+            listed = [
+                s["name"]
+                for s in app_module._filter_sessions_for_user(UNOWNED_SESSIONS, user)
+            ]
+            assert "started-from-a-shell" not in listed
+
+
+def test_a_session_with_no_owner_record_cannot_be_opened_by_anyone():
+    with patch.object(app_module, "_load_session_owners", return_value=OWNERS):
+        for user in (ADMIN, MEMBER):
+            assert (
+                app_module._user_can_access_session(user, "started-from-a-shell")
+                is False
+            )
+
+
+def test_owner_identity_still_resolves_for_caches_and_config_homes():
+    """Permission says nobody; identity still has to name somebody.
+
+    Cache keys, config homes and session incarnations are derived from
+    _session_owner_id, so it keeps its admin fallback on purpose.
+    """
+    with patch.object(app_module, "_load_session_owners", return_value=OWNERS):
+        assert app_module._recorded_session_owner_id("started-from-a-shell") == ""
+        assert app_module._session_owner_id("started-from-a-shell") == "admin"
+        assert app_module._recorded_session_owner_id("member-work") == "u_member"

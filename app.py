@@ -1794,9 +1794,24 @@ def _load_session_owners() -> dict[str, str]:
 
 def _session_owner_id(session_name: str) -> str:
     """Return the owner user_id for a session. Pre-existing sessions with no
-    recorded owner default to the admin."""
+    recorded owner default to the admin.
+
+    Identity only: cache keys, config homes and session incarnations are derived
+    from this, so it always has to resolve to somebody. Anything deciding who may
+    SEE or OPEN a session uses _recorded_session_owner_id instead.
+    """
     owners = _load_session_owners()
     return owners.get(session_name, "admin")
+
+
+def _recorded_session_owner_id(session_name: str) -> str:
+    """The explicitly recorded owner, or "" when nobody owns this session.
+
+    A tmux session with no ownership record belongs to NOBODY. Falling back to
+    the admin here put every session anyone started from a shell into the
+    admin's dashboard as a tab they never opened.
+    """
+    return _load_session_owners().get(session_name, "")
 
 
 def _set_session_owner(session_name: str, user_id: str):
@@ -1824,7 +1839,7 @@ def _user_can_access_session(user: dict | None, session_name: str) -> bool:
     """Return whether the effective signed-in account owns this session."""
     if not user:
         return False
-    return _session_owner_id(session_name) == user["id"]
+    return _recorded_session_owner_id(session_name) == user["id"]
 
 
 LOGIN_PAGE = """<!doctype html>
@@ -3736,16 +3751,10 @@ async def api_history(request: Request):
     live_sessions = set()
     owners = _load_session_owners()
     for sess in get_tmux_sessions():
-        if owners.get(sess["name"], "admin") == user["id"]:
+        if owners.get(sess["name"]) == user["id"]:
             live_sessions.add(sess["name"])
     out = []
     all_names = set(messages_by_session.keys()) | set(notes_by_session.keys()) | live_sessions
-    # Live sessions for the admin without explicit ownership records
-    if _is_admin(user):
-        for sess in get_tmux_sessions():
-            if owners.get(sess["name"], "admin") == "admin":
-                all_names.add(sess["name"])
-                live_sessions.add(sess["name"])
     for name in all_names:
         msgs = messages_by_session.get(name) or []
         # If the session is currently in cache (memory), prefer the live list
@@ -5545,7 +5554,7 @@ def _history_list_for(target: dict):
     messages_by_session = _load_messages(target)
     notes_by_session = _load_all_notes(target)
     owners = _load_session_owners()
-    live = {s["name"] for s in get_tmux_sessions() if owners.get(s["name"], "admin") == target["id"]}
+    live = {s["name"] for s in get_tmux_sessions() if owners.get(s["name"]) == target["id"]}
     out = []
     for name in set(messages_by_session) | set(notes_by_session) | live:
         msgs = messages_by_session.get(name) or []
@@ -6703,7 +6712,9 @@ def _filter_sessions_for_user(sessions: list, user: dict | None) -> list:
         return []
     owners = _load_session_owners()
     uid = user["id"]
-    return [s for s in sessions if owners.get(s["name"], "admin") == uid]
+    # No default: an unowned session is listed to nobody. See
+    # _recorded_session_owner_id.
+    return [s for s in sessions if owners.get(s["name"]) == uid]
 
 
 def _session_list_for_request(request: Request, sessions: list) -> tuple[list | None, str]:

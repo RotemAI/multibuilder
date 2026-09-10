@@ -15,6 +15,7 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-test-not-real")
 
 from fastapi.testclient import TestClient
 
+import app as app_module
 from app import AUTH_COOKIE, AUTH_PASS, AUTH_USER, _make_token, app
 
 # Auth cookies carry the stable user id, not the configurable display/login name.
@@ -31,6 +32,31 @@ MOCK_SESSIONS = [
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+def own_scratch_session(session_name: str) -> str:
+    """Record the admin as the owner of a throwaway session name.
+
+    Endpoint-shape tests used to lean on an unowned session resolving to the
+    admin. It resolves to nobody now, so each of them says whose session it is.
+    """
+    app_module._set_session_owner(session_name, "admin")
+    return session_name
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_owners(tmp_path, monkeypatch):
+    """API tests must never mutate the live ownership map.
+
+    Every mock session is recorded to the admin explicitly. An unowned session
+    belongs to nobody, so a fixture leaning on the old admin fallback would be
+    asserting a permission the dashboard no longer grants.
+    """
+    monkeypatch.setattr(
+        app_module, "SESSION_OWNERS_FILE", tmp_path / "session_owners.json"
+    )
+    for session in MOCK_SESSIONS:
+        app_module._set_session_owner(session["name"], "admin")
 
 
 @pytest.fixture
@@ -945,6 +971,7 @@ class TestSessionStats:
     def test_session_stats_nonexistent_session(self, mock_jsonl, authed_client):
         # The stats endpoint doesn't validate session existence — it just
         # tries to find JSONL files and returns available:false if none found
+        own_scratch_session("nonexistent")
         resp = authed_client.get("/api/sessions/nonexistent/stats")
         assert resp.status_code == 200
         assert resp.json()["available"] is False
@@ -954,7 +981,7 @@ class TestSessionStats:
         import time
 
         import app
-        unique_session = "cache-hit-test-session"
+        unique_session = own_scratch_session("cache-hit-test-session")
         cached_result = {"available": False, "_ts": time.time(), "_from_cache": True}
         app._session_stats_cache[unique_session] = cached_result
         try:
@@ -1142,7 +1169,7 @@ class TestUploadFileSizeLimit:
     def test_upload_loads_messages_when_cache_entry_empty(self, mock_save, authed_client, tmp_path):
         """Upload should call _load_session_messages when cache entry has no messages key."""
         import app
-        fresh_name = "fresh-upload-xxxx"
+        fresh_name = own_scratch_session("fresh-upload-xxxx")
         fresh_sessions = [{"name": fresh_name, "windows": "1", "created": "0", "attached": False}]
         app.cache.pop(fresh_name, None)  # Ensure no cache entry
         from io import BytesIO
@@ -1503,6 +1530,7 @@ class TestFullSessionsList:
 
 class TestAwayModeStatus:
     def test_returns_disabled_for_unknown_session(self, authed_client):
+        own_scratch_session("no-such-session")
         resp = authed_client.get("/api/sessions/no-such-session/away-mode")
         assert resp.status_code == 200
         data = resp.json()
@@ -1513,6 +1541,7 @@ class TestAwayModeStatus:
     def test_returns_disabled_for_known_session_not_running(self, authed_client):
         import app
         app._away_mode_state.pop("test-clean-session", None)
+        own_scratch_session("test-clean-session")
         resp = authed_client.get("/api/sessions/test-clean-session/away-mode")
         assert resp.status_code == 200
         assert resp.json()["enabled"] is False
@@ -1523,12 +1552,14 @@ class TestAwayModeStatus:
 
 class TestGoNutsModeStatus:
     def test_returns_disabled_for_unknown_session(self, authed_client):
+        own_scratch_session("no-such-session")
         resp = authed_client.get("/api/sessions/no-such-session/go-nuts-mode")
         assert resp.status_code == 200
         data = resp.json()
         assert data["enabled"] is False
 
     def test_status_schema_has_required_fields(self, authed_client):
+        own_scratch_session("any-session")
         resp = authed_client.get("/api/sessions/any-session/go-nuts-mode")
         data = resp.json()
         for field in ("enabled", "phase", "log"):
