@@ -1,0 +1,211 @@
+{
+  "source_repository": "https://github.com/anonymonstar/Claude_tmux_manager.git",
+  "source_branch": "Nimo/dashboard-feature-parity",
+  "source_commit": "5596ad953d5e242f6474ee471526b10732bdd670",
+  "codex_cli": "0.153.4",
+  "deployed_at": "2026-09-14T06:33:05Z",
+  "host_configuration": {
+    "file": "~/.advisor-agent/env",
+    "key": "ADVISOR_AGENT_DASHBOARD",
+    "before": "https://www.dianao.tech/build/",
+    "after": "https://builder5.rotem.ai/"
+  },
+  "files": {
+    "README.md": {
+      "before": "13ff2cb375c95aa6a068cb513026d2ad3c020da8962c58dc9e9c4b64161fe50c",
+      "after": "715267cd9156c2ebc5f7fe9f0fd5137f160b5aaa9b5aed56c66d6ecdeac27399"
+    },
+    "TECHNICAL_SPEC.md": {
+      "before": "5fa9ecf11e275425fd8d0473cc40afb895c771d15548f0f0ef7e98ad4d68d37a",
+      "after": "47fa17930074435eb4a631ee8a752ee8ac11963281d1340a9b8f90dea1fab985"
+    },
+    "app.py": {
+      "before": "1b07ed359525b17aa97ac4eb244ced1d883ac1ca114d06177b10624e861c676f",
+      "after": "7beb93a46ae4922077365960d4f9dfacaa5e553103e842d0d3ed9731436faedd"
+    },
+    "project_saved.py": {
+      "before": "c8f9fcb80f20c8ffa4d2576f114b3a4ea9318e1f3a07127af638cd68bec8f007",
+      "after": "3e64543a2d1839c8846feb8a3a3e3106f251eb722c24d7657a372addb6ce1dc2"
+    },
+    "chat_summaries.py": {
+      "before": null,
+      "after": "b1fd30ce291a9db99b22dd8d22b5f7cec1a85d98e16e294c4880d1e08eec26dc"
+    },
+    "dashboard_spend.py": {
+      "before": null,
+      "after": "d11d872a45c2050b303cda180bd1e1af696df2d59901ea2f6535991f0cd98da0"
+    },
+    "terminal_history.py": {
+      "before": null,
+      "after": "0db84270a98d102034fba6e1f3af50e03b8a74cde2b987e745e5dc374754425c"
+    },
+    "voice-mode.js": {
+      "before": null,
+      "after": "62cdb597e4f703d65e6334964821c64dd7075d92d5ae8aace4872acb6a964478"
+    },
+    "voice_checkin.py": {
+      "before": null,
+      "after": "4d09a539aae33091a0a6d32cf578949cc9a8e5d3060835f61f4eba0ed36e378d"
+    },
+    "voice_diagnostics.py": {
+      "before": null,
+      "after": "71bbc4d3ff3da76bc76bfe48f1bee4eb7921ad8af143a6e25858634984a1dd6e"
+    },
+    "voice_mode.py": {
+      "before": null,
+      "after": "1c4b995db9d3d76e036af4db27f6826e26ed9d59693a0a40f9496ee1e98aeea3"
+    },
+    "voice_session_control.py": {
+      "before": null,
+      "after": "fef060f1fa5772f62ebe69dbabbcd21eaa0d68968e0c99ae20a60c152a030883"
+    },
+    "runtime_hooks/voice_hook.py": {
+      "before": null,
+      "after": "acd6f2da9bea6186290b494cad94506297eb066d9c3dbd37b0e9b76d7393ee72"
+    },
+    "runtime_hooks/voice_requirements.toml": {
+      "before": null,
+      "after": "495c40d7c65a4bb1784a0d6520f566608ac8bf5591d195e48574003042cf0634"
+    },
+    "test_api.py": {
+      "before": "d024f4d72faafb032642e509287ec78fbc8701e91155352e9efd30dc836d5aa8",
+      "after": "505d28d92bd5203c371e6e811fd87f0a84102ca37fda9455551df37ad45bf349"
+    },
+    "test_app.py": {
+      "before": "ce62b7962716f87148308644e9163e3c965fd0e0c6ab717d6d55a3e3281cacc4",
+      "after": "3277aa78ecbe302972c95f856f26f262094bb05dffa706392c7ead44c5f13944"
+    },
+    "test_bug_handoff.py": {
+      "before": "9adab9c72b6093f4bc42b0787a9f72bcb219dbb89f0cfb3c28df58e0de7cb960",
+      "after": "d13f7073d3085765571cd9f1d18bdda8db8c25912a3101fb00e3411d2093c950"
+    },
+    "test_clean_file_diffs.py": {
+      "before": "14d4648cdb79e41b5a0b6999b0b207a8b3beef570e257498a28db86c24549942",
+      "after": "5b8a631df086921ac6fa880d0e6d93f4334ab478d4ef7a16068f3b26f7b0185b"
+    },
+    "test_codex_health.py": {
+      "before": "479d3440ba7f472985fd46c73841a69e9b3914d107a2f4f56dd36ea534967eac",
+      "after": "c2126613f38338c5f9d5837c3d98c3c70520077cf483d2509e156acbb45591d3"
+    },
+    "test_project_session_features.py": {
+      "before": "64882b61a373ee4af85d6acaf54e0cc248baf8bbf666cdcb96a23f3046fba32d",
+      "after": "0165202e05984e0cb2a169283197cb678c1237caee5332c0b1e9eff8a26f3dc1"
+    },
+    "test_project_session_ui.py": {
+      "before": "088af36b58b5ae764506f862b4f93a93068f14503deede266721d388de9226eb",
+      "after": "066905235fd63f66643befeaf860560985633b2fd45b24691335e99ad02505f1"
+    },
+    "test_session_close_ui.py": {
+      "before": "6a743fb819758516d07079e7c06220b8d9775d3f7c7568e7b066b5769ac79ef8",
+      "after": "a3c4734c3c9df4ca9270e88e29f0efc815b47f3aa379bdb183272f680ef1211e"
+    },
+    "test_session_controls.py": {
+      "before": "1e0eebbe17ac9aac624bd7791b8f0ee9f19d37a9aaa006f038fcf50c73b48365",
+      "after": "7a6ec98d0a44df75a7e99edb1137733c262d1de0d7088c3a98dfab1f6377c9f0"
+    },
+    "test_session_launch_options.py": {
+      "before": "a98d5c54b81f89dc10be192a2e77f52972075cc7ddadd53b5408c05baa99252b",
+      "after": "905f5f4e926886d910a4bd2e3739ca51778b10c6cb1a4dc7bbbd02dd14a88d2e"
+    },
+    "test_session_owner_isolation.py": {
+      "before": "b57fd5d57e8599444a91f75a6a868b2b92ed0d23595456e283511c0e53d7873d",
+      "after": "524dd0cff2f5a46004cd6a5b7aec6895227a726c9d43d00de152ce350883db61"
+    },
+    "test_session_roster_ui.py": {
+      "before": "fca35412d4d3d6b92a4e5a2baffd2290a8d832647aca700ff52319d85e6cdc99",
+      "after": "d799b11fad86fdeeb9e666da3ff1fa5e4d1f4723d560910c5805681dcff2fbd1"
+    },
+    "test_session_telemetry_ui.py": {
+      "before": "b5dc8698f017c07c5b77ffb5dd1e7e2796593296f0f7a920b1a446d6be348757",
+      "after": "5b058646304d6b101c844d03bcca0668348aabd35c314a3bd5428e9cf24369a5"
+    },
+    "test_status_toolbar.py": {
+      "before": "4f20b531fda5df43761fa3b36a372b258da26b25ba8009a3cec9e4330e0a237b",
+      "after": "a1522780b80c9d0851512a9c143e007b8ad7b4591fca9df06e5c4ba5a011b3a6"
+    },
+    "test_terminal_refinements.py": {
+      "before": "2a7825662639411af170b0ce272f987f743c688a56680d46e96722be953c2bde",
+      "after": "1f3b09862b0e2d09539506bf03fe5d27009ce0a4294491b28c10fdd0a39761e6"
+    },
+    "test_terminal_render.py": {
+      "before": "eba32fbf1f2a4390b26875e3a2ae06267087af3ce218eb737bb925a62e690c69",
+      "after": "7b70e1228b177fecab632b3e445f822fc54a31995858fe4e639fc28b567524f9"
+    },
+    "conftest.py": {
+      "before": null,
+      "after": "8e76e8c94eccc6fb885c98681af3bbf2740ed89e77f074089fbd640a047dca97"
+    },
+    "test_chat_summaries.py": {
+      "before": null,
+      "after": "3115b317620312c6a57fccff2f308345725ddc524607a8c3beb9e773ea29619b"
+    },
+    "test_chat_summary_parser.py": {
+      "before": null,
+      "after": "86a6c46cba241164743e8d4f3633e6d581224e4ee8510c2297aa0a781653a53f"
+    },
+    "test_chat_ui.py": {
+      "before": null,
+      "after": "6d938508411ae516be6144d74f5925fe98f459d2d3d955523d02e99af2891049"
+    },
+    "test_dashboard_spend.py": {
+      "before": null,
+      "after": "596531921cd81d908f2b07fba64fcf7353af6db1d28fe37c5d574401a5c1cf94"
+    },
+    "test_feature_parity_backend.py": {
+      "before": null,
+      "after": "f1fa24bad88ba5f7a2a3907db482e70035d754218f8201b0734a78ed50d14bb5"
+    },
+    "test_feature_parity_ui.py": {
+      "before": null,
+      "after": "1d02d273b7083962836b96a52f80533059a83bb46f73ff6f11c074a677b9c6c4"
+    },
+    "test_model_restart_contention.py": {
+      "before": null,
+      "after": "d1ab998f9f8b1aacfefb35ec68ca94c6bf628449ccd8b572098372dd371b18e4"
+    },
+    "test_paste_submission.py": {
+      "before": null,
+      "after": "a4d81b74d71a29e69139a73675beb2e6b01de3b98137ee3004c40a43759d603d"
+    },
+    "test_project_saved.py": {
+      "before": null,
+      "after": "56d9ba38c6adfea8439424805df234a590509a807a445815b1a344d239100661"
+    },
+    "test_proxy_parity.py": {
+      "before": null,
+      "after": "4c781ce22749f7507be5c7fab1dcd7c3cf64d3a9d959f725e6a372a792245b69"
+    },
+    "test_session_launch_ui.py": {
+      "before": null,
+      "after": "3347219f6ca580f4fce9a26dc70855cf2dbabd2c10551ae0ba754d693584a0f2"
+    },
+    "test_shared_composer_ui.py": {
+      "before": null,
+      "after": "2a8becb0f538ae0574515cf0c5caa0dd29d39ab4508c367989bba2ad63807fa9"
+    },
+    "test_terminal_history.py": {
+      "before": null,
+      "after": "ac8573a1a34a5e56de6d25e68e17b1ef22a7da3d2bd36ac165d81731e6263768"
+    },
+    "test_terminal_history_ui.py": {
+      "before": null,
+      "after": "738c3d95844b18dc9f95ff997c14a7b34cf45a233f6f301d6cad9e36bae86020"
+    },
+    "test_voice_cross_session_parity.py": {
+      "before": null,
+      "after": "e6fa1e79295aebc86b333b54ebeef10bc4e69436cbcb6f725254b9a691f41fb9"
+    },
+    "test_voice_mode.py": {
+      "before": null,
+      "after": "db02ebedb980f9c650e98e6948daa780bd54e7b1dc04e3dd371b4491532691e0"
+    },
+    "test_voice_mode_ui.py": {
+      "before": null,
+      "after": "3affe7c9ee2e16bf7c17ad13374d8ac81eeb128a581110e64eecd59266289d88"
+    },
+    "test_voice_parity.py": {
+      "before": null,
+      "after": "938362128d4a3aec7bfd7883ea2dec394cd4c6f54ba968de217262ba200a8506"
+    }
+  }
+}
