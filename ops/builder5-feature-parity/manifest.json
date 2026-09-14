@@ -4,6 +4,12 @@
   "source_commit": "5596ad953d5e242f6474ee471526b10732bdd670",
   "codex_cli": "0.153.4",
   "deployed_at": "2026-09-14T06:33:05Z",
+  "host_configuration": {
+    "file": "~/.advisor-agent/env",
+    "key": "ADVISOR_AGENT_DASHBOARD",
+    "before": "https://www.dianao.tech/build/",
+    "after": "https://builder5.rotem.ai/"
+  },
   "files": {
     "README.md": {
       "before": "13ff2cb375c95aa6a068cb513026d2ad3c020da8962c58dc9e9c4b64161fe50c",

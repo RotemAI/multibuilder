@@ -26,6 +26,8 @@ TMUX_DASH_CODEX_API_FALLBACK_ENABLED=0
 
 Keep the environment file mode 0600. The fleet `llm_spend_guard` installation and writable `/var/lib/llm-spend` ledger are required. Install the existing runtime pytest gate at `/usr/local/libexec/tmux-dashboard-python-hooks/tmux_dashboard_pytest_gate.py` as root-owned mode 0444 so an ordinary test run cannot launch a real agent.
 
+The host heartbeat configuration in `~/.advisor-agent/env` must set `ADVISOR_AGENT_DASHBOARD=https://builder5.rotem.ai/`. The retired `https://www.dianao.tech/build/` route returns a valid 301, which the fleet monitor treats as a failed dashboard and remediates by restarting this service after each cooldown. This host-specific configuration is intentionally outside the runtime patch and contains no application credential.
+
 The patch template replaces punctuation that appears only in removed baseline lines with ASCII placeholders, keeping human-facing repository text free of that punctuation. `materialize_patch.py` restores the exact original bytes only while piping the patch to the local patch process.
 
 The application now emits the microphone permissions policy and `media-src 'self' blob:` CSP required by Voice Mode. To roll back, verify the `after` hashes, pipe `materialize_patch.py` to `patch -R -p1`, restore the private environment backup, and restart the same service. See `validation.md` and `security-review.md` for release evidence.

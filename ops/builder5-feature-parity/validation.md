@@ -19,3 +19,5 @@ Real authenticated OpenAI responses passed on `gpt-4o-mini` and `gpt-5.6-terra`.
 Both health routes return 200. The service is active with zero restarts, port 8505 is loopback-only, startup logs show the provider configured, and no application traceback or provider failure appeared after the final restart. All three tmux sessions that existed before deployment remained open. The isolated QA browser was closed and the owner's three existing browser tabs were untouched.
 
 A direct check on the lisa-codex VM confirmed that the live codex.lisa.my `app.py` and eight parity companion modules match `Nimo/dashboard-feature-parity` at `5596ad9`. The repository's newer public `main` is a separate sanitized line, not a later dashboard release.
+
+Post-deploy observation exposed a stale host heartbeat URL. A regression probe returned 301 for retired `www.dianao.tech/build/` before the correction and 200 for canonical `builder5.rotem.ai` after it. A fresh heartbeat stored dashboard code 200, clearing the advisor fleet monitor's false down classification and its ten-minute restart action.
