@@ -1,6 +1,6 @@
 # Builder5 feature parity with codex.lisa.my
 
-Builder5 now runs the codex.lisa.my dashboard feature set from source commit `5596ad953d5e242f6474ee471526b10732bdd670`, while preserving Builder5 account isolation, direct browser routing and frozen-terminal reading position.
+Builder5 now runs the codex.lisa.my dashboard feature set from `Nimo/dashboard-feature-parity` at commit `5596ad953d5e242f6474ee471526b10732bdd670`, while preserving Builder5 account isolation, direct browser routing and frozen-terminal reading position.
 
 The deployed interface opens in Chat, gives Chat and Terminal one composer and live status row, adds concise assistant cards with expandable detail and durable progress, exposes the new-session action on mobile, retains drafts between views, and adds dictation plus Voice Mode. Project-saved URLs, terminal history, unified controls, current model choices and the model-restart contention fix are included.
 
@@ -8,7 +8,7 @@ Voice Mode uses `gpt-live-1`, with `gpt-5.6-terra` for the backend action path. 
 
 ## Deployment
 
-Builder5 is a newer non-git runtime than repository main. This bundle records the exact deployed transition. Check the live runtime against every `before` hash in `manifest.json`, treating null as a required absent file. From the runtime root, pipe `/path/to/ops/builder5-feature-parity/materialize_patch.py` to `patch -p1`, verify all `after` hashes, and restart only `agent-dashboard`. No database migration or production dependency update is required.
+Builder5 is a newer non-git runtime than repository main. The matching Lisa release lives on `Nimo/dashboard-feature-parity`; the repository's public `main` is a separate sanitized line and is not the deployment source. This bundle records the exact deployed transition. Check the live runtime against every `before` hash in `manifest.json`, treating null as a required absent file. From the runtime root, pipe `/path/to/ops/builder5-feature-parity/materialize_patch.py` to `patch -p1`, verify all `after` hashes, and restart only `agent-dashboard`. No database migration or production dependency update is required.
 
 The private runtime environment must retain its existing account, cookie and browser settings, then add the advisor credential `openai-realtime-2026-08-10` as `OPENAI_API_KEY` and these nonsecret values:
 

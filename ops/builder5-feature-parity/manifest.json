@@ -1,5 +1,6 @@
 {
   "source_repository": "https://github.com/anonymonstar/Claude_tmux_manager.git",
+  "source_branch": "Nimo/dashboard-feature-parity",
   "source_commit": "5596ad953d5e242f6474ee471526b10732bdd670",
   "codex_cli": "0.153.4",
   "deployed_at": "2026-09-14T06:33:05Z",

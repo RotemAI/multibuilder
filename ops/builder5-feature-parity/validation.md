@@ -17,3 +17,5 @@ Authenticated desktop and 390 x 844 mobile browser QA passed:
 Real authenticated OpenAI responses passed on `gpt-4o-mini` and `gpt-5.6-terra`. Model retrieval passed for `gpt-live-1` and `whisper-1`. The spend ledger recorded four calls and USD 0.0186, with USD 99.9814 remaining and no degraded state.
 
 Both health routes return 200. The service is active with zero restarts, port 8505 is loopback-only, startup logs show the provider configured, and no application traceback or provider failure appeared after the final restart. All three tmux sessions that existed before deployment remained open. The isolated QA browser was closed and the owner's three existing browser tabs were untouched.
+
+A direct check on the lisa-codex VM confirmed that the live codex.lisa.my `app.py` and eight parity companion modules match `Nimo/dashboard-feature-parity` at `5596ad9`. The repository's newer public `main` is a separate sanitized line, not a later dashboard release.
