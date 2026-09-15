@@ -1,0 +1,42 @@
+--- a/app.py
++++ b/app.py
+@@ -202,6 +202,13 @@
+                 if supported:
+                     efforts[str(model)] = list(dict.fromkeys(supported))
+             last_check = float(data.get("last_check", 0)) if isinstance(data, dict) else 0.0
++            if not efforts:
++                efforts = {
++                    model: list(_SEED_MODEL_EFFORTS[model])
++                    for model in allowed_models
++                    if model in _SEED_MODEL_EFFORTS
++                }
++                last_check = 0.0
+             return rows, efforts, last_check
+     except Exception:
+         logger.debug("No usable Codex model catalog at %s", path, exc_info=True)
+--- a/test_app.py
++++ b/test_app.py
+@@ -102,6 +102,21 @@
+             ["codex", "debug", "models", "--bundled"],
+         ]
+-
++
++    def test_legacy_catalog_without_efforts_uses_seed_and_forces_refresh(
++        self, tmp_path
++    ):
++        import app
++
++        snapshot = tmp_path / "models.json"
++        rows = [["gpt-6-astra", "GPT-6-Astra"]]
++        snapshot.write_text(json.dumps({"models": rows, "last_check": 123.0}))
++
++        assert app._load_model_snapshot(snapshot) == (
++            rows,
++            {"gpt-6-astra": app._SEED_MODEL_EFFORTS["gpt-6-astra"]},
++            0.0,
++        )
++
+     def test_startup_preserves_existing_codex_preferences(self, tmp_path):
+         import app
+-
++
