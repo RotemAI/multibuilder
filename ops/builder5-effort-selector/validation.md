@@ -1,6 +1,6 @@
 # Validation
 
-The regression test first failed against the deployed loader because a catalog containing models but no `model_efforts` was accepted as fresh. It passed after the loader began seeding known effort metadata and setting the refresh timestamp to zero.
+The regression test first failed against the deployed launch validator because a catalog containing verified models but no `model_efforts` could not validate a new session. It passed after the loader began seeding known effort metadata, keeping the verified model list usable, and expiring the incomplete metadata for refresh.
 
 Results on the production host after deployment:
 
