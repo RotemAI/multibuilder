@@ -1,0 +1,117 @@
+--- a/app.py
++++ b/app.py
+@@ -12105,0 +12106,12 @@
++        row = await asyncio.to_thread(_session_lifecycle.get, session_name)
++        # Codex creates the rollout on the first turn, not when its tab opens.
++        # Only a provably unused generation may report this normal waiting state.
++        if (not cursor and row.get("managed") and row.get("owner_id") == owner_id
++                and row.get("desired_state") == "running" and not row.get("resume_uuid")
++                and re.fullmatch(r"[0-9a-f]{32}", str(row.get("generation") or ""))
++                and await asyncio.to_thread(_session_generation_is_unused, session_name, owner_id, row)
++                and await asyncio.to_thread(_strict_session_owner, session_name, owner_id)):
++            return JSONResponse(
++                {"entries": [], "cursor": "", "at_start": False, "pending": True},
++                headers={"Cache-Control": "private, no-store"},
++            )
+@@ -30227,3 +30239,3 @@
+-  parts.button.disabled=h.loading||h.atStart;
+-  parts.button.textContent=h.loading?'Loading earlier history…':h.atStart?'Beginning of session':h.error?'Retry earlier history':'Load earlier history';
+-  parts.note.textContent=h.error||(!h.loaded?'Scroll up to load the saved conversation from its beginning.':h.atStart&&!h.entries.length?'No saved conversation messages yet.':'Saved session history');
++  parts.button.disabled=h.loading||h.atStart||!!h.pending;
++  parts.button.textContent=h.loading?'Loading earlier history…':h.pending?'No earlier history yet':h.atStart?'Beginning of session':h.error?'Retry earlier history':'Load earlier history';
++  parts.note.textContent=h.error||(h.pending?'Saved history will appear after your first message.':!h.loaded?'Scroll up to load the saved conversation from its beginning.':h.atStart&&!h.entries.length?'No saved conversation messages yet.':'Saved session history');
+@@ -30263 +30275 @@
+-  h.loading=true;h.error='';_paintHistoryControl(name,parts,h);
++  h.loading=true;h.error='';h.pending=false;_paintHistoryControl(name,parts,h);
+@@ -30276,0 +30289 @@
++      if(data.pending){h.pending=true;return;}
+@@ -32138 +32151 @@
+-        st.userScrolledUp=!!st.frozen;
++        st.userScrolledUp=!!st.frozen||!!st.userScrolledUp;
+@@ -32142 +32155 @@
+-        if(st.frozen)_setRawScroll(rawEl,cached.scrollTop||0);
++        if(st.userScrolledUp)_setRawScroll(rawEl,cached.scrollTop||0);
+--- a/test_terminal_history.py
++++ b/test_terminal_history.py
+@@ -143,0 +144,42 @@
++
++
++@pytest.fixture
++def unused_history(client, monkeypatch):
++    row = dict(owner_id='admin', generation='a' * 32, managed=True,
++               desired_state='running', had_conversation_input=False)
++    monkeypatch.setattr(app, '_terminal_history_binding', lambda *args: None)
++    monkeypatch.setattr(app._session_lifecycle, 'get', lambda name: dict(row))
++    monkeypatch.setattr(app, '_strict_session_owner', lambda *args: ('admin', {'id': 'admin'}))
++    monkeypatch.setattr(app, '_session_tab_label_rows', lambda: {})
++    monkeypatch.setattr(app, '_away_mode_state', {})
++    monkeypatch.setattr(app, '_go_nuts_state', {})
++    return client, row
++
++
++def test_new_session_without_a_rollout_waits_without_a_history_error(unused_history):
++    client, _ = unused_history
++    response = client.get('/api/sessions/demo/terminal-history')
++    assert response.status_code == 200
++    assert response.json() == {'entries': [], 'cursor': '', 'at_start': False, 'pending': True}
++    assert 'no-store' in response.headers['cache-control']
++
++
++@pytest.mark.parametrize('change', [
++    {'had_conversation_input': True}, {'owner_id': 'other'}, {'managed': False},
++    {'generation': ''}, {'desired_state': 'deleting'}, {'resume_uuid': 'prior-root'},
++])
++def test_missing_existing_or_changed_history_is_still_a_conflict(unused_history, change):
++    client, row = unused_history
++    row.update(change)
++    assert client.get('/api/sessions/demo/terminal-history').status_code == 409
++
++
++def test_stale_cursor_is_not_misreported_as_a_new_session(unused_history):
++    client, _ = unused_history
++    assert client.get('/api/sessions/demo/terminal-history?cursor=old').status_code == 409
++
++
++def test_changed_owner_cannot_receive_the_waiting_state(unused_history, monkeypatch):
++    client, _ = unused_history
++    monkeypatch.setattr(app, '_strict_session_owner', lambda *args: None)
++    assert client.get('/api/sessions/demo/terminal-history').status_code == 409
+--- a/test_terminal_history_ui.py
++++ b/test_terminal_history_ui.py
+@@ -109,0 +110,18 @@
++def test_unstarted_conversation_is_pending_without_a_retry_error():
++    result = run_history(pages=[{"entries": [], "cursor": "", "at_start": False, "pending": True}])
++    assert result["state"]["error"] == ""
++    assert result["state"]["button"] == "No earlier history yet"
++    assert result["state"]["requests"] == 1
++    assert not result["state"]["atStart"]
++
++
++def test_scrolling_again_loads_history_once_the_conversation_starts():
++    result = run_history(again=True, pages=[
++        {"entries": [], "cursor": "", "at_start": False, "pending": True},
++        {"entries": [entry("First message")], "at_start": True},
++    ])
++    assert [row["text"] for row in result["state"]["entries"]] == ["First message"]
++    assert result["state"]["error"] == ""
++    assert result["state"]["button"] == "Beginning of session"
++
++
+--- a/test_terminal_refinements.py
++++ b/test_terminal_refinements.py
+@@ -167 +167,2 @@
+-def test_frozen_scroll_position_survives_roster_redraw():
++@pytest.mark.parametrize('frozen,reading,expected_top', [(True, False, 137), (False, True, 137), (False, False, 900)])
++def test_terminal_scroll_position_survives_roster_redraw(frozen, reading, expected_top):
+@@ -169 +170 @@
+-const fs=require('fs'),vm=require('vm'),src=fs.readFileSync(process.argv[1],'utf8');
++const fs=require('fs'),vm=require('vm'),src=fs.readFileSync(process.argv[1],'utf8'),input=JSON.parse(process.argv[2]);
+@@ -171 +172 @@
+-const rawEl={scrollTop:0};const st={frozen:true};
++const rawEl={scrollTop:0};const st={frozen:input.frozen,userScrolledUp:input.reading};
+@@ -177 +178 @@
+-    response=subprocess.run(['node','-e',script,str(Path(__file__).with_name('app.py'))],capture_output=True,text=True,timeout=10)
++    response=subprocess.run(['node','-e',script,str(Path(__file__).with_name('app.py')),json.dumps({'frozen':frozen,'reading':reading})],capture_output=True,text=True,timeout=10)
+@@ -179 +180 @@
+-    assert json.loads(response.stdout)=={'top':137,'reading':True}
++    assert json.loads(response.stdout)=={'top':expected_top,'reading':frozen or reading}

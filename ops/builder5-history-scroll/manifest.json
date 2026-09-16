@@ -1,0 +1,27 @@
+{
+  "target": "https://builder5.rotem.ai/",
+  "reference": "https://build.grabo.tools/",
+  "reference_app_sha256": "b4c78e100d94b1a8cf40d3fd817093c5f655b136997beba9ff1dc136da7a2976",
+  "reference_history_sha256": "0db84270a98d102034fba6e1f3af50e03b8a74cde2b987e745e5dc374754425c",
+  "files": {
+    "app.py": {
+      "before_sha256": "4dfd80ba7c8c9d82967099597343abe6a51881c21b283b67ae248aaf1c65d237",
+      "after_sha256": "03be1db9e2aece6e451d2ed081236fe938e16990a150a8092dad98c3a69cad29"
+    },
+    "test_terminal_history.py": {
+      "before_sha256": "ac8573a1a34a5e56de6d25e68e17b1ef22a7da3d2bd36ac165d81731e6263768",
+      "after_sha256": "68b97570aa16794eb4825f7595973c226e1b37df4bcc246686d8030158c9e1cd"
+    },
+    "test_terminal_history_ui.py": {
+      "before_sha256": "738c3d95844b18dc9f95ff997c14a7b34cf45a233f6f301d6cad9e36bae86020",
+      "after_sha256": "0cef2e98b495c1ea8f9fc40de43e93619b919e37c9b91411b09055cf3d21fdce"
+    },
+    "test_terminal_refinements.py": {
+      "before_sha256": "1f3b09862b0e2d09539506bf03fe5d27009ce0a4294491b28c10fdd0a39761e6",
+      "after_sha256": "e7376a7083bb4cfa8af82429b6893666341415ce5a9faae52a4c61e6fb76c0c1"
+    }
+  },
+  "deployed": "2026-09-16",
+  "full_tests_passed": 1578,
+  "focused_tests_passed": 124
+}
