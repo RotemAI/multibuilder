@@ -6,6 +6,9 @@ class IdeStore {
   connections = $state([])
   connectionId = $state('')
   connectionState = $state('idle') // idle | connecting | connected | reconnect | error
+  // The server's explanation for the current non-connected state, surfaced in
+  // the UI instead of a generic label.
+  connectionError = $state('')
   statusText = $state('Ready')
   detailText = $state('No file open')
 
@@ -115,6 +118,7 @@ class IdeStore {
       const data = await api.status(this.connectionId)
       if (data.connected) {
         this.connectionState = 'connected'
+        this.connectionError = ''
         this.setStatus(
           `Connected · ${this.connection?.label || 'SSH workspace'}`,
           `SSH terminal: ${data.window_name || 'open'}`,
@@ -123,15 +127,21 @@ class IdeStore {
       } else {
         this.connectionState = 'reconnect'
         this.entries = []
+        // Show WHY. "Reconnect required" alone gave no way to tell a dead host
+        // from a wrong key, a refused password, or a deleted folder — every
+        // cause looked identical, so there was nothing to act on.
+        this.connectionError = data.reason || ''
+        const hint = this.connection?.has_password
+          ? 'Auto-reconnect failed — select Connect to retry'
+          : 'Select Connect to reopen SSH'
         this.setStatus(
           `Reconnect required · ${this.connection?.label || 'SSH workspace'}`,
-          this.connection?.has_password
-            ? 'Auto-reconnect failed — select Connect to retry'
-            : 'Select Connect to reopen SSH',
+          data.reason ? `${data.reason} — ${hint}` : hint,
         )
       }
     } catch (error) {
       this.connectionState = 'error'
+      this.connectionError = error.message || ''
       this.setStatus(error.message || 'Could not check SSH connection')
     }
   }
@@ -143,6 +153,7 @@ class IdeStore {
     try {
       const data = await api.connect(this.connectionId, password)
       this.connectionState = 'connected'
+      this.connectionError = ''
       this.setStatus(
         `Connected · ${this.connection?.label || 'SSH workspace'}`,
         `SSH terminal: ${data.window_name || 'open'}`,
@@ -150,6 +161,7 @@ class IdeStore {
       await this.restoreWorkspace()
     } catch (error) {
       this.connectionState = 'error'
+      this.connectionError = error.message || ''
       this.setStatus(error.message || 'Could not connect')
       // An untrusted host is fixable by the user; surface it so the IDE can
       // show the fingerprint rather than leaving a dead "error" state.

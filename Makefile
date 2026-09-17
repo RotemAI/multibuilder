@@ -90,8 +90,16 @@ install:
 
 # The Remote IDE is a Svelte app compiled into static/ide/. Deploying a
 # change to it needs this build step before restarting the service.
-ide:
+ide: ide-app home-app
+
+# The IDE and the dashboard home are separate Svelte builds on purpose: one
+# build with two entries made their shared stylesheet collide, which left the
+# IDE unstyled. Two outDirs cannot clash.
+ide-app:
 	cd ide-ui && npm ci && npm run build
+
+home-app:
+	cd ide-ui && npx vite build --config vite.home.config.js
 
 ide-dev:
 	cd ide-ui && npm run dev

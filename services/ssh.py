@@ -609,22 +609,45 @@ def _ssh_argv(profile: dict, *, password_auth: bool = False) -> list[str]:
     return argv
 
 
-def _ssh_control_is_alive(profile: dict, session_name: str) -> bool:
-    """Ask OpenSSH whether this session/profile control master is still live."""
+def _ssh_control_state(profile: dict, session_name: str) -> tuple[bool, str]:
+    """Is the control master live, and if not, WHY.
+
+    The boolean alone told the UI "not connected" and nothing else, so a dead
+    host, a missing key, a refused password and a workspace folder that had
+    been deleted all surfaced as the same opaque "Reconnect required". The
+    reason is what makes those distinguishable.
+    """
     # A local workspace is reachable exactly while its folder is a directory,
     # so it reports connected without any transport to check.
     if _is_local_profile(profile):
-        return _normalized_local_root(str(profile.get("workspace_root") or "")) is not None
+        root = str(profile.get("workspace_root") or "")
+        if _normalized_local_root(root) is not None:
+            return True, ""
+        return False, f"Local folder is missing or not a directory: {root or '(unset)'}"
+
     socket_path = _ssh_control_socket(session_name, str(profile.get("id") or ""))
     if not socket_path.exists():
-        return False
+        return False, "No SSH control socket yet — the connection has not been opened"
     target = _ssh_argv(profile).pop()
-    result = subprocess.run(
-        ["ssh", "-S", str(socket_path), "-O", "check", target],
-        capture_output=True,
-        timeout=8,
-    )
-    return result.returncode == 0
+    try:
+        result = subprocess.run(
+            ["ssh", "-S", str(socket_path), "-O", "check", target],
+            capture_output=True, text=True, timeout=8,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"ssh -O check timed out after 8s against {target}"
+    except OSError as exc:
+        return False, f"Could not run ssh: {exc}"
+    if result.returncode == 0:
+        return True, ""
+    detail = (result.stderr or result.stdout or "").strip().splitlines()
+    return False, (detail[-1] if detail else f"ssh -O check exited {result.returncode}")[:400]
+
+
+def _ssh_control_is_alive(profile: dict, session_name: str) -> bool:
+    """Ask OpenSSH whether this session/profile control master is still live."""
+    alive, _reason = _ssh_control_state(profile, session_name)
+    return alive
 
 
 def _ssh_start_control_master(profile: dict, session_name: str, *, password: str = "") -> Path:
@@ -704,6 +727,11 @@ def _ssh_workspace_root(profile: dict) -> str:
     the shell still opens somewhere sensible.
     """
     root = str(profile.get("workspace_root") or "").strip()
+    # "." is what the UI stores when nothing was chosen. Remotely it means "the
+    # directory the login shell happens to start in", i.e. the home directory --
+    # so `cd .` is a no-op that silently ignores the setting. Treat it as unset.
+    if root in (".", "./"):
+        return "~"
     return root or "~"
 
 
@@ -735,6 +763,47 @@ def _ssh_tmux_window_exists(profile: dict, session_name: str, index: int = 0) ->
     if result.returncode != 0:
         return False
     return _ssh_tmux_window_name(profile, index) in result.stdout.split()
+
+
+def _ssh_window_uses_workspace_root(profile: dict, session_name: str, index: int = 0) -> bool:
+    """Does this connection's existing terminal window start in the workspace?
+
+    A window is created once and then reused forever, so a terminal opened
+    before a workspace root was configured (or before the `cd` was added at
+    all) keeps opening in the remote login home no matter what the settings
+    say. Compare what the window is actually running against what we would
+    launch today; a mismatch means the window predates the current setting and
+    should be recreated rather than reattached.
+
+    Local windows are excluded: tmux tracks their directory itself via
+    `new-window -c`, so there is no remote command to compare.
+    """
+    if _is_local_profile(profile):
+        return True
+    if not shutil.which("tmux"):
+        return True
+    root = _ssh_workspace_root(profile)
+    if root == "~":
+        # Nothing was configured, so the login home IS the expected directory.
+        return True
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-t",
+             f"{session_name}:{_ssh_tmux_window_name(profile, index)}",
+             "-F", "#{pane_start_command}"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if result.returncode != 0:
+        return True
+    started = result.stdout or ""
+    if not started.strip():
+        # tmux no longer reports the start command (it forgets after respawn).
+        # Without evidence of a mismatch, leave the window alone: killing a
+        # working terminal is worse than opening in the wrong directory.
+        return True
+    return f"cd {shlex.quote(root)}" in started
 
 
 def _ssh_open_tmux_window(profile: dict, session_name: str, index: int = 0) -> str:

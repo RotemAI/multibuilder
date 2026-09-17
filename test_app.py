@@ -1430,6 +1430,77 @@ class TestSshIdeSafety:
         assert "showSettings && ide.connection" in ide
         assert "fixed inset-0 z-50" in ide
 
+    def test_connection_status_reports_why_it_is_not_connected(self):
+        """"Reconnect required" alone is not debuggable.
+
+        A dead host, a missing key, a refused password and a deleted workspace
+        folder all produced the same opaque label, because the boolean was the
+        only thing that reached the UI and the real failure was swallowed into
+        the server log.
+        """
+        import inspect
+
+        import app
+        from services import ssh as ssh_service
+
+        # The check reports a reason, not just a boolean.
+        state = inspect.getsource(ssh_service._ssh_control_state)
+        assert "stderr" in state, "ssh's own error text is discarded"
+        assert "timed out" in state, "a timeout is indistinguishable from a refusal"
+
+        # A local workspace explains a missing folder rather than saying nothing.
+        ok, reason = ssh_service._ssh_control_state(
+            {"kind": "local", "workspace_root": "/definitely/not/here"}, "s"
+        )
+        assert not ok and "missing" in reason.lower()
+        ok, reason = ssh_service._ssh_control_state(
+            {"kind": "local", "workspace_root": "/var/www/multibuilder"}, "s"
+        )
+        assert ok and reason == "", "a healthy workspace must report no reason"
+
+        # The endpoint passes it on, including the auto-reconnect failure that
+        # previously only ever reached the log.
+        route = inspect.getsource(app.api_ssh_connection_status)
+        assert '"reason"' in route
+        assert "Auto-reconnect failed:" in route
+
+    def test_ide_shows_the_connection_error(self):
+        """The reason must be visible and copyable, not only in a tooltip."""
+        from pathlib import Path
+
+        store = Path("ide-ui/src/lib/store.svelte.js").read_text()
+        assert "connectionError" in store
+        # Cleared on success, or a stale error outlives the failure.
+        assert store.count("this.connectionError = ''") >= 2
+
+        ide = Path("ide-ui/src/lib/Ide.svelte").read_text()
+        assert "ide.connectionError" in ide
+        banner = ide.split("{#if ide.connectionError")[1].split("{/if}")[0]
+        assert "select-text" in banner, "the error must be selectable to paste"
+        assert "clipboard" in banner, "no way to copy the error"
+
+    def test_ide_and_home_are_built_separately(self):
+        """One build with two entries broke the IDE's stylesheet.
+
+        Both apps import the same app.css, so a single build emitted several
+        stylesheets and the fixed asset-name pattern resolved them as
+        ide.css / ide2.css / … — Tailwind's tokens ended up in a file nothing
+        referenced and the IDE rendered unstyled. Separate outDirs cannot clash.
+        """
+        from pathlib import Path
+
+        ide_cfg = Path("ide-ui/vite.config.js").read_text()
+        home_cfg = Path("ide-ui/vite.home.config.js").read_text()
+        assert "src/main.js" in ide_cfg and "src/home.js" not in ide_cfg
+        assert "src/home.js" in home_cfg
+        assert "static/ide" in ide_cfg.replace("'", "").replace('"', "")
+        assert "static/home" in home_cfg.replace("'", "").replace('"', "")
+
+        built = Path("static/ide/ide.css")
+        if built.is_file():
+            # The design tokens must live in the file the IDE actually loads.
+            assert "--color-vs-bg" in built.read_text(), "IDE stylesheet lost its tokens"
+
     def test_explorer_context_menu_can_create_in_place(self):
         """New File/Folder must land in the clicked folder, not the root.
 
@@ -2547,3 +2618,84 @@ class TestSshCredentialVault:
         assert not app_module._ssh_user_may_use_profile(
             {"id": "bob", "role": "member"}, {"id": "conn-1"}
         )
+
+
+def test_agent_launch_never_targets_the_bare_session(monkeypatch):
+    """Agent input must go to the agent's window, not whichever is active.
+
+    A session with an IDE terminal open has an ssh-*/local-* window ACTIVE, so
+    `send-keys -t <session>` types into that remote shell. A locally-built
+    launch command then ran on the SSH host, where the agent binary does not
+    exist: `env: 'claude': No such file or directory`, pane dead (status 127).
+    """
+    import re
+    from pathlib import Path
+
+    source = Path("app.py").read_text()
+    bare = re.findall(
+        r'"tmux",\s*"send-keys",\s*"-t",\s*(session_name|created)\s*,',
+        source,
+    )
+    assert not bare, (
+        f"{len(bare)} send-keys call(s) target the bare session; "
+        "route agent input through _agent_pane_target()"
+    )
+
+
+def test_agent_pane_fallback_never_returns_an_ide_terminal():
+    """The last-resort fallback must not resolve to an IDE terminal window.
+
+    Returning the bare session name makes tmux pick the ACTIVE window, which is
+    an ssh-*/local-* terminal whenever one is attached. Chat prompts and agent
+    launch commands were then typed into a remote shell instead of the agent.
+    """
+    from unittest.mock import patch
+    import services.tmux as tmux_mod
+
+    windows = "0\tclaude\n2\tssh-id-grabo-com-abc\n"
+
+    def fake_run(args, **kwargs):
+        class Result:
+            returncode = 0
+            stdout = ""
+        if "list-panes" in args:
+            raise OSError("tmux busy")  # force the fallback path
+        if "list-windows" in args:
+            Result.stdout = windows
+        return Result
+
+    with patch.object(tmux_mod.subprocess, "run", fake_run):
+        target = tmux_mod._agent_pane_target("Sandbox")
+
+    assert target == "Sandbox:0", target
+    assert target != "Sandbox", "bare session resolves to the active IDE terminal"
+
+
+def test_ssh_window_with_stale_workspace_root_is_detected():
+    """A terminal created before a workspace root was set must be recreated.
+
+    The directory is applied only when the window is created, so reusing an old
+    window opens the remote login home forever and the configured folder is
+    silently ignored.
+    """
+    from unittest.mock import patch
+    import services.ssh as ssh_mod
+
+    profile = {"label": "grabo", "host": "h", "workspace_root": "/srv/app"}
+
+    def run_with(start_command):
+        def fake_run(args, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = start_command
+            return Result
+        with patch.object(ssh_mod.shutil, "which", lambda _n: "/usr/bin/tmux"), \
+             patch.object(ssh_mod.subprocess, "run", fake_run):
+            return ssh_mod._ssh_window_uses_workspace_root(profile, "Sandbox", 0)
+
+    # Window opened before the root existed: no cd at all.
+    assert run_with("ssh -tt host\n") is False
+    # Window opened with the current root.
+    assert run_with("ssh -tt host cd /srv/app 2>/dev/null || true; exec \"$SHELL\" -l\n") is True
+    # tmux forgot the start command: leave a working terminal alone.
+    assert run_with("\n") is True

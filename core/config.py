@@ -197,6 +197,8 @@ DOCVAULT_MCP_SCRIPT = REPO_ROOT / "docvault_mcp.py"
 # only when present so a checkout without a build still starts; the IDE route
 # reports the missing build rather than serving a blank page.
 IDE_BUNDLE_DIR = REPO_ROOT / "static" / "ide"
+# The dashboard home is a separate Svelte build; see vite.home.config.js.
+HOME_BUNDLE_DIR = REPO_ROOT / "static" / "home"
 
 # --- Auth ---
 AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")

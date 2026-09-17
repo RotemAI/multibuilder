@@ -247,7 +247,11 @@ def test_owner_environment_uses_private_codex_home_and_advisor_token(monkeypatch
     )
 
     assert app_module._send_session_owner_environment("work") is True
-    command = calls[0][-1]
+    # Agent input is routed through _agent_pane_target, which probes tmux first,
+    # so the environment export is no longer the first subprocess call.
+    sends = [c for c in calls if "send-keys" in c and "-l" in c]
+    assert sends, f"no literal send-keys issued: {calls}"
+    command = sends[0][-1]
     assert f"export CODEX_HOME={codex_home}" in command
     assert str(codex_home / "advisor-token") in command
     assert "never-print-this-token" not in command

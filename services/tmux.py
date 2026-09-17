@@ -89,9 +89,26 @@ def _agent_pane_target(session_name: str) -> str:
             if not name.startswith(("ssh-", "local-", "ssh:", "local:")):
                 return f"{session_name}:{index}"
     except Exception:  # noqa: BLE001 - resolution is best-effort
-        # Never let pane resolution break the caller: falling back to the bare
-        # session name reproduces the previous behaviour rather than failing.
         logger.debug("Agent pane resolution failed for %s", session_name, exc_info=True)
+    # Last resort. The bare session name resolves to whichever window is ACTIVE,
+    # which is an IDE terminal whenever one is attached -- that is how chat
+    # prompts and agent launch commands ended up typed into an SSH shell on the
+    # remote host. Prefer any window that is NOT an IDE terminal, even if we
+    # could not positively identify an agent in it; only fall back to the bare
+    # session when the session has nothing else, in which case there is no IDE
+    # terminal to mis-target anyway.
+    try:
+        listed = subprocess.run(
+            ["tmux", "list-windows", "-t", session_name, "-F", "#{window_index}\t#{window_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if listed.returncode == 0:
+            for line in (listed.stdout or "").splitlines():
+                index, _, name = line.strip().partition("\t")
+                if index and not name.startswith(("ssh-", "local-", "ssh:", "local:")):
+                    return f"{session_name}:{index}"
+    except Exception:  # noqa: BLE001
+        logger.debug("Agent pane fallback failed for %s", session_name, exc_info=True)
     return session_name
 
 

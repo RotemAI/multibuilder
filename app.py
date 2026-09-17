@@ -113,6 +113,7 @@ from core.config import (  # noqa: E402
     GOOGLE_LOGIN_DOMAINS,
     GOOGLE_LOGIN_EMAILS,
     GOOGLE_MCP_SCRIPT,
+    HOME_BUNDLE_DIR,
     IDE_BUNDLE_DIR,
     MAIL_FROM,
     MAX_IDE_TERMINALS,
@@ -555,6 +556,7 @@ from services.ssh import (  # noqa: E402
     _ssh_connections_store,
     _ssh_control_is_alive,
     _ssh_control_socket,
+    _ssh_control_state,
     _ssh_focus_tmux_window,
     _ssh_host_is_known,
     _ssh_ide_audit_lock,
@@ -588,6 +590,7 @@ from services.ssh import (  # noqa: E402
     _ssh_vault_key,
     _ssh_vault_key_cache,
     _ssh_vault_key_lock,
+    _ssh_window_uses_workspace_root,
     _ssh_workspace_command,
     _ssh_write_ide_state,
     _tmux_window_suffix,
@@ -1270,17 +1273,17 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         # text left on the prompt line (e.g. a "continue" a watchdog typed
         # before this loop took over).
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "C-c"],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "C-c"],
             capture_output=True, text=True, timeout=5)
         await asyncio.sleep(0.2)
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "C-u"],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "C-u"],
             capture_output=True, text=True, timeout=5)
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", launch],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-l", launch],
             capture_output=True, text=True, timeout=5)
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
             capture_output=True, text=True, timeout=5)
 
         # Wait for codex to start (up to 30s)
@@ -1479,6 +1482,8 @@ app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
 IDE_BUNDLE_ENTRY = IDE_BUNDLE_DIR / "ide.js"
 if IDE_BUNDLE_DIR.is_dir():
     app.mount("/static/ide", StaticFiles(directory=str(IDE_BUNDLE_DIR)), name="ide-bundle")
+if HOME_BUNDLE_DIR.is_dir():
+    app.mount("/static/home", StaticFiles(directory=str(HOME_BUNDLE_DIR)), name="home-bundle")
 
 
 @app.exception_handler(RequestValidationError)
@@ -5148,11 +5153,11 @@ def _check_auto_approve(session_name: str, visible: str):
             # Type the number and press Enter
             try:
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "-l", str(target_num)],
+                    ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-l", str(target_num)],
                     capture_output=True, text=True, timeout=3
                 )
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "Enter"],
+                    ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
                     capture_output=True, text=True, timeout=3
                 )
                 _auto_approve_sent[session_name] = time.time()
@@ -5192,11 +5197,11 @@ def _send_option(session_name: str, downs: int):
     try:
         for _ in range(downs):
             subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Down"],
+                ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Down"],
                 capture_output=True, text=True, timeout=3
             )
         subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
             capture_output=True, text=True, timeout=3
         )
         _auto_approve_sent[session_name] = time.time()
@@ -6268,6 +6273,42 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
 
 # --- Routes ---
 
+@app.get("/home", response_class=HTMLResponse)
+async def home_page(request: Request):
+    """The Svelte port of the dashboard home.
+
+    Served alongside the existing page rather than replacing it: the classic
+    dashboard carries every other view (terminal, chat, admin, browser), so
+    swapping the route before those are ported would strand them. Once the rest
+    follows, this becomes `/`.
+    """
+    if not (HOME_BUNDLE_DIR / "home.js").is_file():
+        return HTMLResponse(
+            "<h1>Home bundle is not built</h1>"
+            "<p>Run <code>make ide</code> on the dashboard host, then reload.</p>",
+            status_code=503,
+        )
+    sessions = await asyncio.to_thread(get_tmux_sessions)
+    user = _current_user(request)
+    names = [
+        str(item.get("name") or "")
+        for item in (sessions or [])
+        if item.get("name") and _user_can_access_session(user, str(item.get("name")))
+    ]
+    bootstrap = json.dumps({"rootPath": ROOT_PATH, "sessions": names})
+    return HTMLResponse(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<title>{html.escape(BRAND_NAME)} Dashboard</title>"
+        "<style>html,body{margin:0;height:100%;background:#1e1e1e}#home-root{height:100vh}</style>"
+        f"<link rel=\"stylesheet\" href=\"{ROOT_PATH}/static/home/home.css\">"
+        "</head><body><div id=\"home-root\"></div>"
+        f"<script>window.__HOME_BOOTSTRAP__={bootstrap};</script>"
+        f"<script type=\"module\" src=\"{ROOT_PATH}/static/home/home.js\"></script>"
+        "</body></html>"
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     # Inject the per-user "simple" flag so the member UI is correct from the very
@@ -7089,8 +7130,8 @@ async def api_create_session(request: Request, body: CreateSession):
                 shlex.quote(_proj_dir), shlex.quote(f"{_pub_base}/{_owner_name}/{created}"),
                 shlex.quote(_owner_name), shlex.quote(_git_email),
                 shlex.quote(_owner_name), shlex.quote(_git_email)))
-            subprocess.run(["tmux", "send-keys", "-t", created, "-l", _exports], capture_output=True, text=True, timeout=5)
-            subprocess.run(["tmux", "send-keys", "-t", created, "Enter"], capture_output=True, text=True, timeout=5)
+            subprocess.run(["tmux", "send-keys", "-t", _agent_pane_target(created), "-l", _exports], capture_output=True, text=True, timeout=5)
+            subprocess.run(["tmux", "send-keys", "-t", _agent_pane_target(created), "Enter"], capture_output=True, text=True, timeout=5)
         except Exception:
             logger.debug("Failed to export DASH_* project env for %s", created, exc_info=True)
         # Admins don't receive the member global block, so give them the projects
@@ -7138,14 +7179,14 @@ async def api_create_session(request: Request, body: CreateSession):
         if NEW_SESSION_CMD:
             _pin_model = not (user and not _is_admin(user))
             subprocess.run(
-                ["tmux", "send-keys", "-t", created, "-l",
+                ["tmux", "send-keys", "-t", _agent_pane_target(created), "-l",
                  _session_launch_command(
                      created, _session_launch_base(created, user), pin_model=_pin_model
                  )],
                 capture_output=True, text=True, timeout=5
             )
             subprocess.run(
-                ["tmux", "send-keys", "-t", created, "Enter"],
+                ["tmux", "send-keys", "-t", _agent_pane_target(created), "Enter"],
                 capture_output=True, text=True, timeout=5
             )
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
@@ -8435,7 +8476,23 @@ async def _ws_ssh_ide_terminal(ws: WebSocket, session_name: str, connection_id: 
     # persistent across browser reloads. If that window is gone (killed, or the
     # tmux server restarted) attaching would fail forever, so re-create it and
     # hand the client a working terminal instead of a dead one.
-    if not await asyncio.to_thread(_ssh_tmux_window_exists, profile, session_name, index):
+    # A window that predates the connection's workspace root still opens in the
+    # remote login home, because the directory is only applied when the window
+    # is CREATED. Recreate it so the terminal follows the configured folder
+    # instead of silently ignoring the setting forever.
+    stale_root = await asyncio.to_thread(
+        _ssh_tmux_window_exists, profile, session_name, index
+    ) and not await asyncio.to_thread(
+        _ssh_window_uses_workspace_root, profile, session_name, index
+    )
+    if stale_root:
+        try:
+            await asyncio.to_thread(_ssh_kill_tmux_window, profile, session_name, index)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            logger.info("Could not replace stale terminal window for %s", session_name, exc_info=True)
+    if stale_root or not await asyncio.to_thread(
+        _ssh_tmux_window_exists, profile, session_name, index
+    ):
         try:
             await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name, index)
         except (OSError, RuntimeError, subprocess.TimeoutExpired):
@@ -9385,7 +9442,9 @@ async def api_ssh_connection_status(
     if error:
         return error
     try:
-        connected = await asyncio.to_thread(_ssh_control_is_alive, profile, session_name)
+        connected, reason = await asyncio.to_thread(
+            _ssh_control_state, profile, session_name
+        )
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
     # Auto-reconnect: a stored credential lets a dropped control master come back
@@ -9403,12 +9462,17 @@ async def api_ssh_connection_status(
             await asyncio.to_thread(_ssh_open_tmux_window, profile, session_name)
             await _record_ssh_ide_audit(request, session_name, profile, "auto_reconnected")
             connected = reconnected = True
-        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             logger.info("Auto-reconnect failed for SSH connection %s", connection_id, exc_info=True)
+            # Report it as well as logging it: this was the actual failure the
+            # user needed to see, and it only ever reached the server log.
+            reason = f"Auto-reconnect failed: {exc}"[:400]
     return JSONResponse({
         "connected": connected,
         "reconnected": reconnected,
         "window_name": _ssh_tmux_window_name(profile) if connected else "",
+        # Why it is not connected. Empty when it is.
+        "reason": "" if connected else reason,
     })
 
 
@@ -9803,9 +9867,9 @@ def _send_session_owner_environment(session_name: str):
             + " 2>/dev/null)\""
         )
     try:
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", cmd],
+        subprocess.run(["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-l", cmd],
                        capture_output=True, text=True, timeout=5)
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"],
+        subprocess.run(["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
                        capture_output=True, text=True, timeout=5)
         return True
     except Exception:
@@ -10837,11 +10901,11 @@ _pending_auth: dict = {}
 
 async def _send_line(session_name: str, text: str):
     await asyncio.to_thread(subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "-l", text],
+        ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-l", text],
         capture_output=True, text=True, timeout=10)
     await asyncio.sleep(0.3)
     await asyncio.to_thread(subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "Enter"],
+        ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
         capture_output=True, text=True, timeout=10)
 
 
@@ -10894,7 +10958,7 @@ async def _auto_fix_login(session_name: str) -> dict:
     # Clear a stranded interactive login before restarting Codex.
     for _ in range(3):
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Escape"],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Escape"],
             capture_output=True, text=True, timeout=5)
         await asyncio.sleep(0.4)
     _exported, restarted = await _restart_codex_for_session(session_name)
@@ -10953,7 +11017,7 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
                 pane = await asyncio.to_thread(_pane_text, session_name)
                 if re.search(r"select login method|subscription", pane, re.I):
                     await asyncio.to_thread(subprocess.run,
-                        ["tmux", "send-keys", "-t", session_name, "Enter"],
+                        ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
                         capture_output=True, text=True, timeout=10)
                     await asyncio.sleep(2.5)
             # 2. Scrape the authorize URL.
@@ -12254,7 +12318,7 @@ async def api_interrupt_session(session_name: str):
     await _controller_call("session_touch", session=session_name, source="interrupt")
     try:
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Escape"],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Escape"],
             capture_output=True, text=True, timeout=5
         )
         return JSONResponse({"ok": True, "action": "interrupt"})
@@ -12290,7 +12354,7 @@ async def api_send_keys(session_name: str, body: SendKeys):
             # Allow single printable characters (q, y, n, etc.) and known tmux key names
             if key in ALLOWED_TMUX_KEYS or (len(key) == 1 and key.isprintable()):
                 await asyncio.to_thread(subprocess.run,
-                    ["tmux", "send-keys", "-t", session_name, key],
+                    ["tmux", "send-keys", "-t", _agent_pane_target(session_name), key],
                     capture_output=True, text=True, timeout=5
                 )
             else:
@@ -12319,7 +12383,7 @@ async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody
             # \e[?2004l — disable bracketed paste
             hex_seq = ["1b", "5b", "3f", "32", "30", "30", "34", "6c"]
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-H"] + hex_seq,
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-H"] + hex_seq,
             capture_output=True, text=True, timeout=5,
         )
         return JSONResponse({"ok": True, "bracketed_paste": body.enabled})
@@ -12382,7 +12446,7 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
     try:
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", _agent_quit_command(session_name)],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-l", _agent_quit_command(session_name)],
             capture_output=True,
             text=True,
             timeout=5,
@@ -12390,7 +12454,7 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
         await asyncio.sleep(0.25)
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -12405,7 +12469,7 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
             # launch command while the old Codex process is still alive.
             await asyncio.to_thread(
                 subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "C-c"],
+                ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "C-c"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -12413,7 +12477,7 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
             await asyncio.sleep(0.5)
             await asyncio.to_thread(
                 subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l", _agent_quit_command(session_name)],
+                ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-l", _agent_quit_command(session_name)],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -12421,7 +12485,7 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
             await asyncio.sleep(0.25)
             await asyncio.to_thread(
                 subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -12448,14 +12512,14 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
         )
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", launch],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-l", launch],
             capture_output=True,
             text=True,
             timeout=5,
         )
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -12541,7 +12605,7 @@ async def _quit_running_agent(session_name: str) -> bool:
     for keys in (["-l", _agent_quit_command(session_name)], ["Enter"]):
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, *keys],
+            ["tmux", "send-keys", "-t", _agent_pane_target(session_name), *keys],
             capture_output=True, text=True, timeout=5,
         )
     for _ in range(12):
@@ -12550,7 +12614,7 @@ async def _quit_running_agent(session_name: str) -> bool:
             return True
     await asyncio.to_thread(
         subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "C-c"],
+        ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "C-c"],
         capture_output=True, text=True, timeout=5,
     )
     for _ in range(8):
@@ -12579,13 +12643,13 @@ async def _restart_agent_with_new_flags(session_name: str) -> bool:
     base = _session_launch_base(session_name, owner)
     await asyncio.to_thread(
         subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "-l",
+        ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "-l",
          _session_launch_command(session_name, base, pin_model=False)],
         capture_output=True, text=True, timeout=5,
     )
     await asyncio.to_thread(
         subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "Enter"],
+        ["tmux", "send-keys", "-t", _agent_pane_target(session_name), "Enter"],
         capture_output=True, text=True, timeout=5,
     )
     return True
@@ -12678,7 +12742,7 @@ async def api_set_session_agent(request: Request, session_name: str, body: SetSe
         ):
             await asyncio.to_thread(
                 subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, *keys],
+                ["tmux", "send-keys", "-t", _agent_pane_target(session_name), *keys],
                 capture_output=True, text=True, timeout=5,
             )
     except Exception as exc:  # noqa: BLE001 - report, don't 500 the switch

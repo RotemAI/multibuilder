@@ -72,8 +72,15 @@
       if (!body.private_key) delete body.private_key
       await api.updateConnection(ide.connection.id, body)
       await ide.loadConnections?.()
+      // Close first: the reconnect can take seconds, and leaving the dialog up
+      // while it runs reads as "nothing happened".
       showSettings = false
-      ide.setStatus('Connection settings saved')
+      // Saving settings is only ever done to make the connection work, so
+      // apply them: the old flow saved and left the same stale error on screen
+      // until the user found Connect for themselves.
+      ide.setStatus('Settings saved — reconnecting…')
+      ide.connectionError = ''
+      await ide.connect(settingsForm.password || '')
     } catch (error) {
       ide.setStatus(error.message || 'Could not save connection settings')
     } finally {
@@ -432,11 +439,30 @@
     <span class="mx-auto truncate text-vs-muted" title={ide.connection?.workspace_root}>
       {ide.connection ? `${ide.connection.label} — Multibuilder IDE` : 'Multibuilder IDE'}
     </span>
-    <span class="flex items-center gap-1 {ide.connectionState === 'connected' ? 'text-vs-green' : ide.connectionState === 'connecting' ? 'text-vs-yellow' : ide.connectionState === 'idle' ? 'text-vs-muted' : 'text-vs-red'}">
+    <!-- The reason is on the badge itself (hover) AND spelled out below, so a
+         failure is debuggable without opening the server log. -->
+    <span
+      class="flex items-center gap-1 {ide.connectionState === 'connected' ? 'text-vs-green' : ide.connectionState === 'connecting' ? 'text-vs-yellow' : ide.connectionState === 'idle' ? 'text-vs-muted' : 'text-vs-red'}"
+      title={ide.connectionError || STATE_META[ide.connectionState].label}
+    >
       <StateIcon size={12} />
       {STATE_META[ide.connectionState].label}
     </span>
   </header>
+
+  {#if ide.connectionError && ide.connectionState !== 'connected'}
+    <div class="flex shrink-0 items-start gap-2 border-b border-vs-red/40 bg-vs-red/10 px-3 py-1.5 text-[11px] text-vs-red">
+      <CircleAlert size={12} class="mt-[1px] shrink-0" />
+      <span class="min-w-0 flex-1 break-words select-text">{ide.connectionError}</span>
+      <button
+        class="shrink-0 rounded-sm px-1.5 py-0.5 hover:bg-vs-red/20"
+        title="Copy this error"
+        onclick={() => navigator.clipboard?.writeText(ide.connectionError).catch(() => {})}
+      >Copy</button>
+      <button class="shrink-0 rounded-sm px-1 hover:bg-vs-red/20" title="Dismiss" aria-label="Dismiss error"
+        onclick={() => (ide.connectionError = '')}><X size={12} /></button>
+    </div>
+  {/if}
 
   <div class="flex min-h-0 flex-1">
     <!-- Activity bar -->

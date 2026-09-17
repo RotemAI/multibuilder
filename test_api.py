@@ -1722,7 +1722,13 @@ class TestSshIdeEndpoints:
             )
 
         assert status.status_code == 200
-        assert status.json() == {"connected": False, "reconnected": False, "window_name": ""}
+        body = status.json()
+        assert body["connected"] is False
+        assert body["reconnected"] is False
+        assert body["window_name"] == ""
+        # Not connected must say WHY: the opaque "Reconnect required" gave no
+        # way to tell a dead host from a missing key or a deleted folder.
+        assert body["reason"], "a failed status must explain itself"
 
     def test_focus_terminal_selects_session_ssh_window(self, authed_client, tmp_path, monkeypatch):
         import app as app_module
