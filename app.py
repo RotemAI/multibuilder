@@ -20236,7 +20236,20 @@ def _codex_app_server_account_read(codex_home: Path, refresh_token: bool = True)
         result = response.get("result") or {}
         account = result.get("account")
         if not isinstance(account, dict):
-            return {"ok": False, "error": "Codex reported no active account"}
+            _codex_app_server_send(process, {
+                "method": "account/rateLimits/read",
+                "id": 2,
+                "params": None,
+            })
+            limits_response = _codex_app_server_wait(process, 2, timeout=20)
+            limits_result = limits_response.get("result") or {}
+            limits = limits_result.get("rateLimits")
+            by_limit_id = limits_result.get("rateLimitsByLimitId")
+            if not isinstance(limits, dict) and isinstance(by_limit_id, dict):
+                limits = by_limit_id.get("codex")
+            if not isinstance(limits, dict) or not limits.get("planType"):
+                return {"ok": False, "error": "Codex reported no active account"}
+            account = {"type": "chatgpt", "planType": limits.get("planType")}
         return {"ok": True, "account": account}
     except Exception as exc:
         logger.warning("Codex credential validation failed: %s", type(exc).__name__)
