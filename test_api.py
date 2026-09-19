@@ -1652,6 +1652,44 @@ class TestCodexAuthEndpoints:
         assert state["fallbackActive"] is False
         write_fallback.assert_not_called()
 
+    def test_account_read_accepts_plan_limits_when_account_metadata_is_missing(self):
+        import app as app_module
+
+        process = MagicMock()
+        with (
+            patch("app._codex_app_server_process", return_value=process),
+            patch("app._codex_app_server_initialize"),
+            patch("app._codex_app_server_send"),
+            patch(
+                "app._codex_app_server_wait",
+                side_effect=[
+                    {
+                        "id": 1,
+                        "result": {
+                            "account": None,
+                            "requiresOpenaiAuth": True,
+                        },
+                    },
+                    {
+                        "id": 2,
+                        "result": {
+                            "rateLimits": {
+                                "limitId": "codex",
+                                "planType": "pro",
+                            },
+                        },
+                    },
+                ],
+            ),
+            patch("app._terminate_codex_app_server"),
+        ):
+            result = app_module._codex_app_server_account_read(Path("/tmp/test-codex"))
+
+        assert result == {
+            "ok": True,
+            "account": {"type": "chatgpt", "planType": "pro"},
+        }
+
     @patch("app._start_codex_chatgpt_login")
     def test_chatgpt_device_login_endpoint_surfaces_url_and_code(
         self, mock_start, authed_client
