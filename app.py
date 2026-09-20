@@ -28770,7 +28770,6 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.working{border-color:#d29922}
 .nav-browser-badge.working .nbb-glyph{filter:none}
 .nav-plan-bars{display:flex;flex-direction:column;justify-content:center;gap:2px;font-size:10px;flex-shrink:0}
-.nav-plan-account{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b949e;font-size:.52rem;line-height:1;text-align:center}
 .nav-plan-window{display:flex;align-items:center;gap:5px;white-space:nowrap;line-height:1}
 .nav-plan-window>span:first-child{min-width:22px;color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;text-transform:uppercase}
 .nav-plan-window>span:last-child{width:26px;text-align:right;color:#c9d1d9;font-size:.6rem;font-weight:600;font-variant-numeric:tabular-nums}
@@ -28805,7 +28804,6 @@ body.member-simple .hide-in-simple{display:none!important}
     <span class="nav-compact-stat" id="nav-usage-cap-summary" style="display:none" title="Codex plan usage cap">Usage cap: <span class="stat-val" id="nav-usage-cap-value">&mdash;</span></span>
   </span>
   <span class="nav-plan-bars" aria-label="Codex plan usage">
-    <span class="nav-plan-account" id="plan-account"></span>
     <span id="plan-primary" class="nav-plan-window" style="display:none"><span id="plan-primary-label"></span><span class="nav-plan-meter"><span class="nav-plan-reset" id="plan-primary-reset"></span><span class="nav-usage-bar" id="plan-primary-meter" role="progressbar" aria-label="Primary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-primary-fill"></span></span></span><span id="plan-primary-value"></span></span>
     <span id="plan-secondary" class="nav-plan-window" style="display:none"><span id="plan-secondary-label"></span><span class="nav-plan-meter"><span class="nav-plan-reset" id="plan-secondary-reset"></span><span class="nav-usage-bar" id="plan-secondary-meter" role="progressbar" aria-label="Secondary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-secondary-fill"></span></span></span><span id="plan-secondary-value"></span></span>
   </span>
@@ -29021,6 +29019,10 @@ let _tabOrderSaveSequence=0;
 let _tabTouchCandidate=null;
 const _sessionClientEpoch={};
 const activeTabs={};
+function _defaultSessionView(){
+  return window.matchMedia&&window.matchMedia('(max-width:768px)').matches?'chat':'raw';
+}
+function _sessionView(name){return activeTabs[name]||_defaultSessionView()}
 const rawState={};
 // `frozen`/`frozenAtLines` back the Freeze toggle: streaming and st.fullText carry
 // on exactly as before, only the paint is held.
@@ -30662,7 +30664,7 @@ function updateLiveBar(name){
 // renders everything that arrived in between in one go.
 function readTerminal(action,name){
   if(!sessions.some(s=>s.name===name)||!['last','freeze','latest'].includes(action))return;
-  if((activeTabs[name]||'chat')!=='raw')switchTab(name,'raw');
+  if(_sessionView(name)!=='raw')switchTab(name,'raw');
   const st=getRawState(name);
   if(st.firstLoad&&!st.fullText){
     st.pendingReadAction=action;
@@ -30980,7 +30982,7 @@ function _sessionComposerKey(name,source='chat'){
 }
 function _sessionComposerView(name){
   const node=_sessionComposerNodes[name]||document.getElementById('session-composer-'+name);
-  return (node&&node.dataset.view)||activeTabs[name]||'chat';
+  return (node&&node.dataset.view)||_sessionView(name);
 }
 function _composerElement(id,key){
   const live=document.getElementById(id);
@@ -31769,8 +31771,10 @@ function renderDetail(){
     mainEl.innerHTML='<div class="empty"><strong>Restoring '+esc(sessionTabLabel(s))+'…</strong><br><span>The tab will reconnect automatically when its terminal is ready.</span></div>';
     return;
   }
-  // Everyone starts in Chat; retain an explicitly selected view for this session.
-  const tab=activeTabs[s.name]||'chat';
+  // Phones start in Chat and wider screens start in Terminal. Once selected,
+  // retain that view for this session even if the viewport later changes.
+  const tab=_sessionView(s.name);
+  activeTabs[s.name]=tab;
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
@@ -32293,7 +32297,7 @@ function appendChatBubble(name,role,text,ts,extra){
   if(msg.id&&chatMessages[name].some(m=>m.id===msg.id))return;
   chatMessages[name].push(msg);
   // If this session's chat is visible, append to DOM
-  if(name===selectedSession && (activeTabs[name]||'chat')==='chat'){
+  if(name===selectedSession && _sessionView(name)==='chat'){
     const chatEl=document.getElementById('chat-'+name);
     if(chatEl){
       const wasAtBottom=isChatAtBottom(chatEl);
@@ -32319,7 +32323,7 @@ function reconcileAssistantSummary(name, serverMsgs){
   const before=JSON.stringify(chatMessages[name]||[]);
   mergeChatMessages(name,serverMsgs);
   if(before===JSON.stringify(chatMessages[name]))return;
-  if(name!==selectedSession||(activeTabs[name]||'chat')!=='chat')return;
+  if(name!==selectedSession||_sessionView(name)!=='chat')return;
   const chatEl=document.getElementById('chat-'+name);
   if(!chatEl)return;
   const viewport=_captureChatViewport(chatEl);
@@ -33079,7 +33083,7 @@ function applyRawPayload(name,data){
         infoEl.textContent='Terminal stream reconnecting…';
       }
     }
-    if(st.pendingReadAction&&!st.firstLoad&&(activeTabs[name]||'chat')==='raw')readTerminal(st.pendingReadAction,name);
+    if(st.pendingReadAction&&!st.firstLoad&&_sessionView(name)==='raw')readTerminal(st.pendingReadAction,name);
   }catch(e){}
 }
 
@@ -33342,7 +33346,7 @@ async function refreshOne(name){
 const _chatRefreshState={};
 async function refreshActiveChat(force=false){
   const name=selectedSession;
-  if(!name||document.hidden||(activeTabs[name]||'chat')!=='chat')return;
+  if(!name||document.hidden||_sessionView(name)!=='chat')return;
   const now=Date.now(),state=_chatRefreshState[name]||(_chatRefreshState[name]={at:0,pending:false});
   if(state.pending||(!force&&now-state.at<30000))return;
   state.at=now;state.pending=true;
@@ -34104,12 +34108,10 @@ async function checkCodexAuth(){
 function renderAuthIndicator(){
   const dot=document.getElementById('codex-auth-dot');
   const label=document.getElementById('codex-auth-label');
-  const account=document.getElementById('plan-account');
-  if(!_authCache){dot.className='status-dot unknown';label.textContent='...';if(account)account.textContent='';return}
+  if(!_authCache){dot.className='status-dot unknown';label.textContent='...';return}
   if(_authCache.hasApiKey&&!_authCache.loggedIn){
     dot.className='status-dot';dot.style.background='#d2a8ff';
     label.textContent='API Key';
-    if(account){account.textContent='OpenAI API';account.title='Codex account: OpenAI API key';}
     return;
   }
   if(_authCache.loggedIn){
@@ -34117,11 +34119,9 @@ function renderAuthIndicator(){
     const email=_authCache.email||'';
     const plan=_authCache.subscriptionType||'';
     label.textContent=email+(plan?' · '+plan.charAt(0).toUpperCase()+plan.slice(1):'');
-    if(account){account.textContent=email||'ChatGPT user';account.title='Codex account: '+(email||'ChatGPT user')+(plan?' ('+plan+')':'');}
   }else{
     dot.className='status-dot busy';dot.style.background='';
     label.textContent='Not connected';
-    if(account){account.textContent='Not connected';account.title='Codex account is not connected';}
   }
 }
 

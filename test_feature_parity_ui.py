@@ -38,6 +38,7 @@ for(const id of ['modal-content','modal-overlay','settings-content','users-conte
 const noop=()=>{},escape=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const context=vm.createContext({console,Promise,JSON,Number,String,Math,Date,Set,Map,AbortController,
   BASE:'',MEMBER_SIMPLE:false,selectedSession:'alpha',activeTabs:{alpha:'chat'},_sessionClientEpoch:{},
+  window:{matchMedia:()=>({matches:false})},
   sessions:[{name:'alpha',logical_incarnation:'one',tab_label:'Alpha'}],
   _currentUser:{id:'owner1',role:'admin'},_settingsActiveTab:'preferences',_browserBadgeRequest:null,
   _browserAuth:null,statusInfoEl:{textContent:''},_uploadTab:{},
@@ -56,6 +57,7 @@ const context=vm.createContext({console,Promise,JSON,Number,String,Math,Date,Set
   fetch:(url,options)=>new Promise((resolve,reject)=>requests.push({url,options,resolve,reject})),
 });
 for(const [a,b] of [
+  ['function _defaultSessionView(){','const rawState={};'],
   ['function jumpToLastUserMessage(name){','function rerenderAllRaw(){'],
   ['function readTerminal(action,name){','const CLEAN_VIEW_ON='],
   ['function buildKeyBar(name,tab){','// ── Saved project keys'],
@@ -289,17 +291,14 @@ def test_plan_bars_track_accessible_values_and_disappear_without_plan():
     assert state["hidden"] == "none"
 
 
-def test_compact_plan_header_names_the_codex_account():
+def test_status_dropdown_names_the_codex_account():
     state = run_js("""
-      for(const id of ['codex-auth-dot','codex-auth-label','plan-account'])test.element(id);
+      for(const id of ['codex-auth-dot','codex-auth-label'])test.element(id);
       _authCache={loggedIn:true,email:'owner@example.com',subscriptionType:'pro'};
       renderAuthIndicator();
-      return {text:test.element('plan-account').textContent,title:test.element('plan-account').title};
+      return {text:test.element('codex-auth-label').textContent};
     """)
-    assert state == {
-        "text": "owner@example.com",
-        "title": "Codex account: owner@example.com (pro)",
-    }
+    assert state == {"text": "owner@example.com · Pro"}
 
 
 def test_markup_preserves_mobile_plus_voice_shared_status_and_correct_asset_path():
@@ -308,7 +307,8 @@ def test_markup_preserves_mobile_plus_voice_shared_status_and_correct_asset_path
     assert html.count('id="nav-browser-badge"') == 1
     assert 'type="button" title="Browser not connected"' in html
     assert 'class="nav-new-mobile-btn"' in html
-    assert 'id="plan-account"' in html
+    assert 'id="plan-account"' not in html
+    assert 'id="codex-auth-label"' in html
     assert 'id="plan-primary-reset"' in html and 'id="plan-secondary-reset"' in html
     assert '.nav-plan-bars{display:none}' in html
     assert 'max-height:calc(5.6em + 24px)' in html
@@ -317,7 +317,7 @@ def test_markup_preserves_mobile_plus_voice_shared_status_and_correct_asset_path
     assert 'id="term-live-${s.name}"' in html
     assert 'id="voice-mode-open-${s.name}"' in html
     assert 'src="__ROOT_PATH__/voice-mode.js"' in html
-    assert "const tab=activeTabs[s.name]||'chat';" in html
+    assert "const tab=_sessionView(s.name);" in html
     assert "if(st.frozen&&(!live||live._lineMode!==true))" in html
     assert "readTerminal(st.pendingReadAction,name)" in html
     assert "name_generated:!requested" in html

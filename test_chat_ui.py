@@ -26,12 +26,14 @@ const chat={scrollTop:30,scrollHeight:1000,clientHeight:200,
 const context=vm.createContext({console,Promise,JSON,Set,Map,Math,
   Date:{now:()=>now},BASE:'',MEMBER_SIMPLE:false,selectedSession:'demo',
   activeTabs:{demo:'chat'},chatMessages:{demo:input.messages||[]},
+  window:{matchMedia:()=>({matches:false})},
   sessions:[{name:'demo',logical_incarnation:'one'}],
   esc:escape,_escTermHtml:attr,fmtTime:ts=>'12:00',
   document:{hidden:false,getElementById:id=>id==='chat-demo'?chat:null},
   _sessionLogicalIncarnation:()=>incarnation,updateCard:()=>updates++,
   fetch:async()=>{fetches++;return {ok:true,json:async()=>({messages:[]})}},
 });
+vm.runInContext(section('function _defaultSessionView(){','const rawState={};'),context);
 vm.runInContext(section('/* ── Chat bubbles','function saveRawCache'),context);
 vm.runInContext(section('function mergeChatMessages','function autoGrow'),context);
 vm.runInContext(section('const _chatRefreshState={};','async function refreshFull'),context);
@@ -255,31 +257,40 @@ def test_backfilled_earlier_reply_keeps_visible_message_anchored():
     assert state["top"] == 325
 
 
+@pytest.mark.parametrize(("mobile", "default"), [(True, "chat"), (False, "raw")])
 @pytest.mark.parametrize("simple", [False, True])
 @pytest.mark.parametrize("selected", [None, "chat", "raw", "info"])
-def test_initial_view_defaults_to_chat_and_preserves_explicit_choice(simple, selected):
-    render_detail = APP.read_text().split("function renderDetail(){", 1)[1]
+def test_initial_view_matches_viewport_and_preserves_explicit_choice(
+    mobile, default, simple, selected,
+):
+    source = APP.read_text()
+    helpers = source.split("const activeTabs={};", 1)[1].split("const rawState={};", 1)[0]
+    render_detail = source.split("function renderDetail(){", 1)[1]
     expression = re.search(r"const tab=(.+);", render_detail).group(1)
     state = run_js(f"""
+      window={{matchMedia:()=>({{matches:{json.dumps(mobile)}}})}};
+      {helpers}
       MEMBER_SIMPLE={json.dumps(simple)};
       activeTabs.demo={json.dumps(selected)};
       const s=sessions[0];
       ({expression})
     """)
-    assert state == (selected or "chat")
+    assert state == (selected or default)
 
 
+@pytest.mark.parametrize(("mobile", "expected"), [(True, 1), (False, 0)])
 @pytest.mark.parametrize("simple", [False, True])
-def test_default_chat_refreshes_before_any_view_is_selected(simple):
+def test_default_view_only_refreshes_chat_on_mobile(mobile, expected, simple):
     state = run_js(f"""
       (async()=>{{
+        window.matchMedia=()=>({{matches:{json.dumps(mobile)}}});
         MEMBER_SIMPLE={json.dumps(simple)};
         delete activeTabs.demo;
         await refreshActiveChat();
         return test.counts();
       }})()
     """)
-    assert state["fetches"] == state["updates"] == 1
+    assert state["fetches"] == state["updates"] == expected
 
 
 def test_active_chat_refreshes_without_status_changes_and_is_throttled():
