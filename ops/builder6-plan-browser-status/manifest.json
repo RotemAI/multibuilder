@@ -1,0 +1,46 @@
+{
+  "app.py": {
+    "before": "6124f7121756e6a2497c78e2a0bf9147322f3b11bf5a57497110f2708e3623ce",
+    "after": "b0e3f88a41033e0fa1448e90aab974b4fa1f836a241fa755ff03daae6433a7f8"
+  },
+  "browser_mcp_lease_proxy.py": {
+    "before": "210d10065c4bc1eb6ff8f4fc5ca86137f866d8354d60d693ee2b2c18d06fa6ae",
+    "after": "859844e736663c442a5189c5a6ab89253926cb64047d83ebf4cebd096e2821a8"
+  },
+  "session_metrics.py": {
+    "before": "0b9c1aaadcebfc6624bd5ca1c13952fc6ac1f0878478683dfa9aa70233103016",
+    "after": "2610667ee4aafec986cb06ab3d28b0c945a8cd78275624432da9b5337d4491dc"
+  },
+  "test_api.py": {
+    "before": "61f75c987ff020091b55522e970ba3f802e77f0f5940866fc1725b753dbac7be",
+    "after": "d39b70c8cfe3592221635307444d1d393aaf039b79abbc00f54409d354e88202"
+  },
+  "test_browser_mcp_lease_proxy.py": {
+    "before": null,
+    "after": "8f882e3089137802cf33d990674cdf4a0a59781785720ab26668cb2833a23214"
+  },
+  "test_builder6_plan_auth.py": {
+    "before": null,
+    "after": "75a30f34a4e433167089b079e3d579a53c57edb5d8f888ed938a78e67e5844c3"
+  },
+  "test_builder6_plan_launch.py": {
+    "before": null,
+    "after": "9f5bc6887d92a4b4e25abe69cc2daba4197d3f3ea3edf0bf9f50f23c3bc184c2"
+  },
+  "test_builder6_plan_ui.py": {
+    "before": null,
+    "after": "637835aa76b0a0461c66e3f10215c22b431dcdd9b8b8ae4f9c0089a1e6cb8b02"
+  },
+  "test_relogin_fence.py": {
+    "before": null,
+    "after": "f62219c3b2422e27d529af343561ed6adcfb32bad58396c7cc90963a7069abaf"
+  },
+  "test_session_metrics.py": {
+    "before": "ad55fb19f87a73798dfb05eabf632ccdac93fe8eaedc4370980c4746ad40dfcf",
+    "after": "147db404cf93816e36a2a1ce0f605c9f18510c11e590ac915998f7c36a289967"
+  },
+  "test_session_telemetry_ui.py": {
+    "before": "5b058646304d6b101c844d03bcca0668348aabd35c314a3bd5428e9cf24369a5",
+    "after": "817eb1a469a8990b7bc03f98ca7daa9539e7f38ce0182fe17f3b2b2fffff4a39"
+  }
+}
