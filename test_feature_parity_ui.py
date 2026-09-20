@@ -310,7 +310,7 @@ def test_markup_preserves_mobile_plus_voice_shared_status_and_correct_asset_path
     assert 'id="plan-account"' not in html
     assert 'id="codex-auth-label"' in html
     assert 'id="plan-primary-reset"' in html and 'id="plan-secondary-reset"' in html
-    assert '.nav-plan-bars{display:none}' in html
+    assert '@media(max-width:768px){.nav-plan-bars{display:flex}' in html
     assert 'max-height:calc(5.6em + 24px)' in html
     assert "if(_currentUser) startBrowserAuthPolling();" in html
     assert 'id="session-composer-${s.name}"' in html

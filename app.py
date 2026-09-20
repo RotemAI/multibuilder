@@ -28779,7 +28779,7 @@ body.member-simple .hide-in-simple{display:none!important}
 .message-jumped{background:#263f28;border-radius:4px;outline:1px solid #3fb950}
 @media(max-width:600px){.nav-plan-bars{font-size:9px}.nav-plan-window .nav-usage-bar,.nav-stat-bar{width:20px}}
 
-@media(max-width:768px){.nav-plan-bars{display:none}.nav-right>.nav-browser-badge{min-width:36px;min-height:44px;padding:4px}.nav-right{gap:0;min-width:0}.top-nav{min-width:0}.nav-new-mobile-btn{margin-right:2px}}
+@media(max-width:768px){.nav-plan-bars{display:flex}.nav-right>.nav-browser-badge{min-width:36px;min-height:44px;padding:4px}.nav-right{gap:0;min-width:0}.top-nav{min-width:0}.nav-new-mobile-btn{margin-right:2px}}
 @media(prefers-reduced-motion:reduce){.message-jumped,.nav-browser-badge.working .nbb-dot{animation:none}}
 </style></head>
 <body>
