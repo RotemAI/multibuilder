@@ -29575,6 +29575,7 @@ const _CODEX_VERB_RE=/^(?:Wait(?:ed|ing) for background terminal|Ran|Explored|Ca
 const _CODEX_FILEOP_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
 const _CODEX_FILEOP_TARGET_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\s+(?:\d+\s+files?|\S+)\s*$/;
 const _CODEX_DIFF_ROW_RE=/^\s+\d+(?:\s+[+-]|[+-]\s|[ \t]{2,}\S)/;
+const _CLIPPED_DIFF_ROW_RE=/^\s*\d+(?:\s+[+-]|[+-]\s|[ \t]{2,}\S)/;
 function _isToolHeader(line,followerIsMarker,followerIsDiff=false){
   const stripped=line.replace(_ANY_DECORATION_RE,'');
   if(_TOOL_PAREN_RE.test(stripped))return true;
@@ -29980,14 +29981,17 @@ function _clippedPytestOutput(lines,start){
 }
 function _clippedFileDiff(lines,start){
   // A capture can begin inside an edit preview, after its header is gone.
-  // Require two numbered change rows, keeping ordinary numbered prose intact.
-  let changes=0;
+  // Require two numbered diff rows and at least one signed change, keeping
+  // ordinary numbered prose intact while accepting a context row plus change.
+  let rows=0,changes=0;
   for(let j=start;j>=0&&j<Math.min(lines.length,start+20);j++){
     const row=_plainTerminalRow(lines[j]);
     if(/^\s*[•●⏺❯›»>`~]/.test(row))break;
-    if(/^\s*\d+\s+[+-]/.test(row)){
-      if(++changes===2)return true;
-    }else if(row.trim()&&!/^\s/.test(row)&&!changes)break;
+    if(_CLIPPED_DIFF_ROW_RE.test(row)){
+      rows++;
+      if(/^\s*\d+\s+[+-]/.test(row))changes++;
+      if(rows>=2&&changes>=1)return true;
+    }else if(row.trim()&&!/^\s/.test(row)&&!rows)break;
   }
   return false;
 }
@@ -30062,7 +30066,7 @@ function applyRawFilter(text){
          _clippedIndentedOutput(lines,nextNonEmpty[hintEnd])))mode='output';
       i=hintEnd;continue;
     }
-    if(!mode&&/^\s*\d+\s+[+-]/.test(plain)&&!out.some(row=>row.trim())&&
+    if(!mode&&_CLIPPED_DIFF_ROW_RE.test(plain)&&!out.some(row=>row.trim())&&
        _clippedFileDiff(lines,i)){mode='output';continue;}
     // A quote in visible conversation stays visible. Inside established tool
     // output, pytest's `> assert ...` source marker is part of that output.
@@ -30694,7 +30698,7 @@ function _paintHistoryControl(name,parts,h){
   parts.button.textContent='Retry full session history';
   parts.control.style.display=(h.loading||h.error)?'flex':'none';
   parts.note.textContent=h.error||(h.loading?'Loading full session history…':h.atStart&&!h.entries.length?'No saved conversation messages yet.':'Saved session history');
-  parts.divider.hidden=!h.loaded;
+  parts.divider.hidden=!h.loaded||!h.tools;
 }
 function _terminalParts(name){
   const scroll=document.getElementById('raw-'+name);
