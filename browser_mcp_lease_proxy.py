@@ -11,18 +11,30 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+
+def _host_home() -> Path:
+    """The dashboard's home, not the session account's.
+
+    Sessions now run as their own UNIX user, so $HOME points at that account.
+    The controller socket, the browser profiles and the shared playwright CLI
+    all live in the dashboard owner's home and are reached explicitly.
+    """
+    import os
+    return Path(os.environ.get("TMUX_DASH_HOST_HOME") or Path.home())
 from typing import Any
 
 CONTROLLER_SOCKET = Path(
     os.environ.get(
         "TMUX_DASH_CONTROLLER_SOCKET",
-        str(Path.home() / ".tmux-dashboard" / "controller.sock"),
+        str(_host_home() / ".tmux-dashboard" / "controller.sock"),
     )
 )
 BROWSER_ID = os.environ.get("TMUX_DASH_BROWSER_ID", "default")
@@ -33,10 +45,60 @@ except ValueError:
 BROWSER_OUTPUT_DIR = Path(
     os.environ.get(
         "TMUX_DASH_BROWSER_OUTPUT_DIR",
-        str(Path.home() / ".playwright-mcp" / BROWSER_ID),
+        str(_host_home() / ".playwright-mcp" / BROWSER_ID),
     )
 )
 LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
+PLAYWRIGHT_MCP_PACKAGE = os.environ.get(
+    "TMUX_DASH_PLAYWRIGHT_MCP_PACKAGE", "@playwright/mcp@0.0.82"
+)
+
+
+def _default_upstream_command() -> list[str]:
+    local_cli = (
+        _host_home()
+        / ".claude-browser"
+        / "node_modules"
+        / "@playwright"
+        / "mcp"
+        / "cli.js"
+    )
+    args = [
+        "--cdp-endpoint",
+        f"http://127.0.0.1:{BROWSER_CDP_PORT}",
+        "--output-dir",
+        str(BROWSER_OUTPUT_DIR),
+    ]
+    if local_cli.is_file():
+        return ["node", str(local_cli), *args]
+    return ["npx", "--yes", PLAYWRIGHT_MCP_PACKAGE, *args]
+
+
+def _upstream_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+    return env
+
+
+def _terminate_upstream_group(upstream: subprocess.Popen, timeout: float = 5) -> None:
+    try:
+        os.killpg(upstream.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        upstream.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(upstream.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    upstream.wait()
+
+
+def _shutdown_on_signal(signum: int, _frame: object) -> None:
+    raise SystemExit(128 + signum)
 
 
 def _rpc(message: dict[str, Any], timeout: float = 45) -> dict[str, Any]:
@@ -133,20 +195,15 @@ class LeaseRegistry:
 
 
 def main() -> int:
-    upstream_command = sys.argv[1:] or [
-        "node",
-        str(Path.home() / ".claude-browser" / "node_modules" / "@playwright" / "mcp" / "cli.js"),
-        "--cdp-endpoint",
-        f"http://127.0.0.1:{BROWSER_CDP_PORT}",
-        "--output-dir",
-        str(BROWSER_OUTPUT_DIR),
-    ]
+    upstream_command = sys.argv[1:] or _default_upstream_command()
     upstream = subprocess.Popen(
         upstream_command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
+        env=_upstream_environment(),
+        start_new_session=True,
     )
     assert upstream.stdin is not None
     assert upstream.stdout is not None
@@ -180,6 +237,10 @@ def main() -> int:
     threading.Thread(target=client_to_upstream, daemon=True).start()
     threading.Thread(target=copy_stderr, daemon=True).start()
     threading.Thread(target=leases.renew_loop, daemon=True).start()
+    previous_handlers = {
+        signum: signal.signal(signum, _shutdown_on_signal)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
 
     try:
         for line in upstream.stdout:
@@ -194,12 +255,9 @@ def main() -> int:
         return upstream.wait()
     finally:
         leases.close()
-        if upstream.poll() is None:
-            upstream.terminate()
-            try:
-                upstream.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                upstream.kill()
+        _terminate_upstream_group(upstream)
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
 
 
 if __name__ == "__main__":

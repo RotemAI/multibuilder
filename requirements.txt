@@ -9,3 +9,5 @@ httpx==0.28.1             # browser/noVNC reverse proxy
 websockets==15.0.1        # browser WebSocket reverse proxy
 google-auth[requests]==2.56.2  # Workspace domain-wide delegation preflight
 tomli==2.4.1; python_version < "3.11"  # stdlib tomllib compatibility
+pytest==8.4.2               # test runner (added 2026-09-06: the suite needs it)
+pytest-asyncio==1.4.0       # pyproject sets asyncio_mode=strict; without it 122 async tests error

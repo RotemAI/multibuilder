@@ -1,6 +1,6 @@
 # Claude tmux Manager
 
-A single-file FastAPI web app that turns every `tmux` session on your box into a fully manageable workspace in the browser — built specifically for orchestrating multiple concurrent **Claude Code** sessions.
+A FastAPI web app that turns owner-scoped `tmux` coding sessions into manageable browser workspaces for **Codex and Claude Code**.
 
 ![Claude tmux Manager dashboard](screenshots/tmux-screenshot.png)
 
@@ -8,20 +8,58 @@ A single-file FastAPI web app that turns every `tmux` session on your box into a
 
 Claude Code runs beautifully inside a `tmux` session, but once you start juggling five or ten of them across different projects, the terminal stops scaling. This dashboard gives you:
 
-- A **tabbed view of every session** with live terminal output and a parallel chat transcript
+- A **tabbed view of every session** with live terminal output and a compact, two-sided chat
+- A pinned green **New session** button on phones, beside settings and outside the scrolling tabs
+- A shared Chat/Terminal composer with dictation and a separate **Voice Mode** icon
+- Persistent session labels, account naming preferences, and a private **Saved for this project** drawer for links, credentials, and files
 - **AI-generated titles, descriptions, and progress summaries** (OpenAI) so you know what each session is doing at a glance
 - **System stats**, per-session cost, token usage, idle detection, context-window warnings, and activity sparklines
-- **Keyboard-first navigation** — rename, snooze, duplicate, reorder, mark-done, send-to-all, interrupt, cycle sessions, and more
+- **Keyboard-first navigation**: rename, snooze, duplicate, reorder, mark-done, send-to-all, interrupt, cycle sessions, and more
 - **File upload**, **CLAUDE.md viewer/editor** (home-dir-scoped, path-traversal protected), **sticky notes**, **message bookmarks**, **quick-reply templates**, toast notifications, and sound alerts
-- **Hardened auth** — HMAC session cookie, rate-limited login, CSP/HSTS/Permissions-Policy headers, session-name validation before any shell call
+- **Hardened auth**: HMAC session cookie, rate-limited login, CSP/HSTS/Permissions-Policy headers, session-name validation before any shell call
 
-It's a single Python file with no database — everything persists as JSON under `~/.tmux-dashboard/`.
+The application uses Python modules and browser-native JavaScript, with no frontend build step. Dashboard state persists in private JSON files.
+
+## Chat view
+
+Chat is the default view for everyone, including admins. Switch to Terminal any time.
+Both views share the same message input, including unsent text and attachments.
+A common bottom status bar shows activity, last-turn duration, cumulative session
+tokens, and context usage. Missing measurements appear as unavailable, not zero.
+Chat shows your messages on the right and short assistant replies on the left.
+Replies use a few plain-language sentences, without code or tool logs. Longer
+explanations stay collapsed behind **Read more**; use Terminal for technical output.
+
+During long tasks, new useful assistant output produces a separate progress
+message about every 20 minutes. Unchanged output does not create repeated updates.
+The completed turn gets its own final reply, preserving earlier progress messages.
+Progress collection continues while the browser is closed, and saved chat history
+is restored when you return. If the summarizer is unavailable, concise excerpts of
+the assistant's own prose keep replies visible without inventing results.
+
+## Voice and session controls
+
+The composer microphone records dictation and becomes Send when text or attachments
+are present. The adjacent waveform opens live, two-way Voice Mode. Connecting voice
+does not restart or resume coding work. Microphone permission is explicit, and
+dictation and live voice cannot capture simultaneously.
+
+Managed supervision and the three-minute pre-test check-in are separate advanced
+options, disabled by default. Supervision requires explicit restart acknowledgement.
+The optional check-in never grants deployment consent or bypasses project approvals.
+An explicit tool hold survives End and disconnect. Reconnect and select **Release
+existing tool hold** to release it without restarting or sending new work.
+
+Close session directly stops that session's running work. The tab disappears only
+after the server confirms deletion; closing does not generate an archive or rewrite
+project documentation. See [the technical specification](TECHNICAL_SPEC.md) for
+identity, persistence, privacy, and browser-routing contracts.
 
 ## Prerequisites
 
 - Python 3.9+
 - `tmux` installed and on `PATH`
-- OpenAI API key (optional — required for LLM summaries)
+- OpenAI API key (optional: required for LLM summaries)
 - Nginx or another reverse proxy (recommended for HTTPS)
 
 ## Quick Start
@@ -41,7 +79,7 @@ The dashboard is then available at `http://localhost:8501/`.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TMUX_DASH_USER` | No | `admin` | Login username |
-| `TMUX_DASH_PASS` | **Yes (in production)** | *(empty)* | Login password. **If unset, auth is disabled — all endpoints are publicly accessible.** |
+| `TMUX_DASH_PASS` | **Yes (in production)** | *(empty)* | Login password. **If unset, auth is disabled: all endpoints are publicly accessible.** |
 | `TMUX_DASH_SECRET` | No | *(random on start)* | HMAC secret for session tokens. Set a stable value to survive restarts. |
 | `OPENAI_API_KEY` | No | *(none)* | OpenAI key for LLM-generated titles, descriptions, and summaries. Without it, LLM features are disabled. |
 | `TMUX_DASH_CODEX_API_FALLBACK_ENABLED` | No | `false` | Explicitly permits Codex to fall back to usage-based API-key authentication. When disabled, failed ChatGPT credentials require re-login instead. |
@@ -121,9 +159,9 @@ make backup
 ```
 
 
-**Corrupted state**: If `~/.tmux-dashboard/*.json` becomes corrupt (server crash during write), restore from a backup. You can also delete the corrupt file — the app recreates it on next write with empty state.
+**Corrupted state**: If `~/.tmux-dashboard/*.json` becomes corrupt (server crash during write), restore from a backup. You can also delete the corrupt file: the app recreates it on next write with empty state.
 
-**Secret rotation**: If `TMUX_DASH_SECRET` changes, all existing auth cookies become invalid. Users will be redirected to the login page. This is intentional — rotate by restarting with a new secret.
+**Secret rotation**: If `TMUX_DASH_SECRET` changes, all existing auth cookies become invalid. Users will be redirected to the login page. This is intentional: rotate by restarting with a new secret.
 
 ## Upgrading openai SDK (v1 → v2)
 
@@ -131,10 +169,10 @@ make backup
 
 Current usage in `app.py` (all standard, minimal API surface):
 
-- `openai.AsyncOpenAI(api_key=...)` — client init
-- `client.chat.completions.create(model, messages, max_tokens, temperature)` — single call pattern
-- `resp.choices[0].message.content` — response access
-- `resp.usage.total_tokens` — token counting
+- `openai.AsyncOpenAI(api_key=...)`: client init
+- `client.chat.completions.create(model, messages, max_tokens, temperature)`: single call pattern
+- `resp.choices[0].message.content`: response access
+- `resp.usage.total_tokens`: token counting
 
 **Migration steps** (when ready):
 
@@ -142,14 +180,14 @@ Current usage in `app.py` (all standard, minimal API surface):
 2. Run tests: `make test` (expect failures if any API changed)
 3. Check openai v2 migration guide for any response schema changes
 4. Verify `resp.usage` attribute names (may be `completion_tokens` vs `total_tokens`)
-5. Check error types — `openai.OpenAIError` subclasses may have changed
+5. Check error types: `openai.OpenAIError` subclasses may have changed
 6. Re-run tests and fix any failures before deploying
 
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/sessions-fast` | Session list (cached, no LLM calls) — used by the UI |
+| GET | `/api/sessions-fast` | Session list (cached, no LLM calls): used by the UI |
 | GET | `/api/status` | Per-session activity status only (lightweight) |
 | GET | `/api/stats` | System stats (CPU, memory, disk, uptime) |
 | GET | `/api/health` | Health check (tmux, OpenAI key, data directory accessibility) |
@@ -187,17 +225,17 @@ The percentile step requires **precomputed reference statistics** (mean and stan
 
 The pipeline originally had two methods for computing percentiles:
 
-- **Precomputed stats** — Fixed EUR reference mean/std from pre-scored 1000 Genomes data. Stable and reproducible.
-- **Dynamic scoring** — Re-scored the 1000G panel on-the-fly using only the variants that matched the sample. Unstable: the same sample could get different percentiles across runs because the reference distribution changed with each variant subset.
+- **Precomputed stats**: Fixed EUR reference mean/std from pre-scored 1000 Genomes data. Stable and reproducible.
+- **Dynamic scoring**: Re-scored the 1000G panel on-the-fly using only the variants that matched the sample. Unstable: the same sample could get different percentiles across runs because the reference distribution changed with each variant subset.
 
 We overhauled the pipeline in 6 patches:
 
-1. **Audit** (`pgs_stats_audit.py`) — Inventoried all 269 unique PGS IDs, classified each as `precomputed_ok`, `precomputed_stale`, or `missing` based on available reference stats files
-2. **Hard-fail dynamic scoring** — Removed the unstable dynamic fallback from `_compute_percentile()`. PGS without precomputed stats now return `method=unavailable` instead of unreliable percentiles
-3. **Test gating** — PGS tests without valid stats are disabled at startup via an audit overlay. Disabled tests are hidden from the UI and skipped in "Run All"
-4. **Confidence tagging** — Every PGS result now includes `confidence: "high"|"low"` with reasons (missing stats, low match rate, build mismatch, sanity gates)
-5. **UI confidence display** — Low-confidence badge on results, details in report modal, AI interpretation explicitly warns about low-confidence results
-6. **Registry rebuild** — Replaced the PGS test list with 270 curated entries across 10 categories
+1. **Audit** (`pgs_stats_audit.py`): Inventoried all 269 unique PGS IDs, classified each as `precomputed_ok`, `precomputed_stale`, or `missing` based on available reference stats files
+2. **Hard-fail dynamic scoring**: Removed the unstable dynamic fallback from `_compute_percentile()`. PGS without precomputed stats now return `method=unavailable` instead of unreliable percentiles
+3. **Test gating**: PGS tests without valid stats are disabled at startup via an audit overlay. Disabled tests are hidden from the UI and skipped in "Run All"
+4. **Confidence tagging**: Every PGS result now includes `confidence: "high"|"low"` with reasons (missing stats, low match rate, build mismatch, sanity gates)
+5. **UI confidence display**: Low-confidence badge on results, details in report modal, AI interpretation explicitly warns about low-confidence results
+6. **Registry rebuild**: Replaced the PGS test list with 270 curated entries across 10 categories
 
 ### Scripts
 
@@ -258,7 +296,7 @@ python3 pgs_stats_audit.py
 
 - **270 PGS tests** registered across 10 categories
 - **41 PGS IDs** have precomputed EUR GRCh38 reference stats (`precomputed_ok`)
-- **228 PGS IDs** still missing stats — these are disabled in the UI until stats are generated
+- **228 PGS IDs** still missing stats: these are disabled in the UI until stats are generated
 - Stats generation takes ~2-5 minutes per PGS ID using `generate_pgs_stats.py`
 
 ### Architecture
@@ -266,18 +304,18 @@ python3 pgs_stats_audit.py
 ```
 genom-beast-gpu (34.135.47.236)
 ├── /home/nimrod_rotem/simple-genomics/
-│   ├── app.py              — FastAPI web app (UI + API)
-│   ├── runners.py          — PGS scoring pipeline + _compute_percentile()
-│   ├── test_registry.py    — 370 tests (270 PGS + 14 rsID + 86 non-PGS)
-│   ├── pgs_stats_audit.py  — Audit script → pgs_stats_audit.json
-│   ├── generate_pgs_stats.py — Reference stats generator
-│   └── rebuild_pgs_registry.py — Registry rebuilder from markdown
+│   ├── app.py             : FastAPI web app (UI + API)
+│   ├── runners.py         : PGS scoring pipeline + _compute_percentile()
+│   ├── test_registry.py   : 370 tests (270 PGS + 14 rsID + 86 non-PGS)
+│   ├── pgs_stats_audit.py : Audit script → pgs_stats_audit.json
+│   ├── generate_pgs_stats.py: Reference stats generator
+│   └── rebuild_pgs_registry.py: Registry rebuilder from markdown
 ├── /data/pgs2/
-│   ├── ref_panel_stats/    — 48 precomputed stats JSON files
-│   └── scoring_files/      — Downloaded PGS Catalog scoring files
-└── /data/pgs2/ref_panel/   — 1000G Phase 3 plink2 pgen/pvar/psam files
+│   ├── ref_panel_stats/   : 48 precomputed stats JSON files
+│   └── scoring_files/     : Downloaded PGS Catalog scoring files
+└── /data/pgs2/ref_panel/  : 1000G Phase 3 plink2 pgen/pvar/psam files
 ```
 
 ## License
 
-MIT — see source header in `app.py` for attribution.
+MIT: see source header in `app.py` for attribution.
