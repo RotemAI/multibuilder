@@ -84,10 +84,10 @@ def entry(text):
     return {"kind": "assistant", "text": text, "id": text}
 
 
-def test_empty_filtered_pages_advance_until_visible_history_arrives():
+def test_empty_filtered_pages_advance_until_session_start():
     result = run_history(pages=[{"entries": [], "cursor": "next-1"},
                                 {"entries": [], "cursor": "next-2"},
-                                {"entries": [entry("Original reply")], "cursor": "next-3"}])
+                                {"entries": [entry("Original reply")], "at_start": True}])
     assert [row["text"] for row in result["state"]["entries"]] == ["Original reply"]
     assert [row["url"] for row in result["requests"]] == [
         "/api/sessions/demo/terminal-history?tools=false",
@@ -102,7 +102,7 @@ def test_empty_final_page_marks_beginning_without_refetching():
     result = run_history(pages=[{"entries": [], "cursor": "", "at_start": True}], again=True)
     assert result["state"]["entries"] == []
     assert result["state"]["requests"] == 1
-    assert result["state"]["button"] == "Beginning of session"
+    assert result["state"]["button"] == "Retry full session history"
     assert result["state"]["disabled"]
     assert result["state"]["note"] == "No saved conversation messages yet."
 
@@ -112,7 +112,7 @@ def test_empty_final_page_marks_beginning_without_refetching():
 def test_empty_history_page_without_cursor_progress_is_retryable_not_infinite(pages):
     result = run_history(pages=pages)
     assert "did not advance" in result["state"]["error"]
-    assert result["state"]["button"] == "Retry earlier history"
+    assert result["state"]["button"] == "Retry full session history"
     assert not result["state"]["loading"]
     assert not result["state"]["atStart"]
 
@@ -126,26 +126,43 @@ def test_older_history_prepend_keeps_reader_anchor_and_chronological_order():
     assert result["state"]["userScrolledUp"]
 
 
+def test_one_history_load_fetches_every_page_to_the_session_start():
+    result = run_history(
+        top=50,
+        pages=[
+            {"entries": [entry("Recent")], "cursor": "older"},
+            {"entries": [entry("Middle")], "cursor": "oldest"},
+            {"entries": [entry("Original")], "at_start": True},
+        ],
+    )
+
+    assert [row["text"] for row in result["state"]["entries"]] == [
+        "Original", "Middle", "Recent",
+    ]
+    assert result["state"]["requests"] == 3
+    assert result["state"]["atStart"]
+
+
 def test_concurrent_history_loads_share_the_pending_request():
-    result = run_history(deferred=True, change="duplicate", pages=[{"entries": [entry("Once")]}])
+    result = run_history(deferred=True, change="duplicate", pages=[{"entries": [entry("Once")], "at_start": True}])
     assert result["during"]["loading"]
     assert result["state"]["requests"] == 1
     assert len(result["state"]["entries"]) == 1
 
 
 def test_changed_history_root_clears_old_entries_and_cursor_before_retry():
-    result = run_history(again=True, pages=[{"entries": [entry("Previous root")], "cursor": "old-cursor"},
-                                           {"status": 409, "error": "Session history changed"}])
+    result = run_history(pages=[{"entries": [entry("Previous root")], "cursor": "old-cursor"},
+                                {"status": 409, "error": "Session history changed"}])
     assert result["state"]["entries"] == []
     assert result["state"]["renderedEntries"] == 0
     assert result["state"]["cursor"] == ""
-    assert result["state"]["button"] == "Retry earlier history"
+    assert result["state"]["button"] == "Retry full session history"
     assert not result["state"]["loading"]
 
 
 @pytest.mark.parametrize("change", ["incarnation", "mode", "removed"])
 def test_late_history_response_does_not_cross_session_or_view_binding(change):
-    result = run_history(deferred=True, change=change, pages=[{"entries": [entry("Old private reply")]}])
+    result = run_history(deferred=True, change=change, pages=[{"entries": [entry("Old private reply")], "at_start": True}])
     assert result["state"]["entries"] == []
     assert not result["state"]["loading"]
 

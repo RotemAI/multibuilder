@@ -68,7 +68,7 @@ const sessions=['alpha','beta'].map(name=>({name,activity_status:'idle',messages
 const context=vm.createContext({
   console,Promise,Math,Number,String,JSON,Map,Set,WeakMap,Date,Blob,FormData,
   sessions,selectedSession:'alpha',activeTabs:{alpha:input.start||'chat',beta:'chat'},mainEl:main,
-  document:doc,window:{},BASE:'',_currentUser:null,MEMBER_SIMPLE:true,
+  document:doc,window:{matchMedia:()=>({matches:!!input.mobile})},BASE:'',_currentUser:null,MEMBER_SIMPLE:true,
   draftText:{},_composerAttachments:{},_composerUploadTasks:{},_uploadTab:{},
   _sessionClientEpoch:{},_recording:{},_mediaRec:{},_audioChunks:{},
   getRawState:()=>({live:{},fullText:''}),autoGrow:noop,
@@ -93,6 +93,7 @@ const context=vm.createContext({
   _clipboardImagePreview:async()=> 'data:image/png;base64,AAAA',
   _uploadOneFile:()=>new Promise(resolve=>{resolveUpload=resolve}),
 });
+vm.runInContext(region('function _defaultSessionView(){','const rawState={};'),context);
 vm.runInContext(region('const draftText={};','function updateFavicon('),context);
 vm.runInContext(region('const _COMPOSER_SEND_SVG=','async function sendChat('),context);
 vm.runInContext(region('function handleSessionComposerKey(','// --- WhatsApp-style composer'),context);
@@ -257,10 +258,14 @@ def test_upload_wait_cannot_send_old_draft_to_replacement_session(start):
     assert result["alerts"] == ["Session changed before send completed."]
 
 
+@pytest.mark.parametrize(("mobile", "expected"), [
+    (True, ["chat-key", "chat-send"]),
+    (False, ["raw-key", "raw-send"]),
+])
 @pytest.mark.parametrize("member", [False, True])
-def test_shared_composer_defaults_to_chat_dispatch_for_admin_and_member(member):
-    result = run_composer(action="default-dispatch", member=member)
-    assert result["dispatch"] == ["chat-key", "chat-send"]
+def test_shared_composer_dispatch_matches_default_view(mobile, expected, member):
+    result = run_composer(action="default-dispatch", member=member, mobile=mobile)
+    assert result["dispatch"] == expected
 
 
 MARKUP_DRIVER = r"""
