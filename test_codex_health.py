@@ -99,6 +99,47 @@ def test_missing_config_file_means_no_override(tmp_path):
     assert "openaiDeveloperDocs" not in out
 
 
+def test_explicit_resume_uses_thread_id_and_cwd_instead_of_last(tmp_path):
+    home = _write_config(tmp_path, "")
+    thread_id = "01a020d4-d4e0-75a3-b832-b830e6f4fd87"
+    recovered_cwd = tmp_path / "recovered workspace"
+    recovered_cwd.mkdir()
+
+    out = app._launch_codex_cmd(
+        "codex --yolo",
+        pin_model=False,
+        resume=True,
+        resume_uuid=thread_id,
+        resume_cwd=str(recovered_cwd),
+        codex_home=home,
+    )
+
+    assert f"resume -C '{recovered_cwd}'" in out
+    assert thread_id in out
+    assert "--last" not in out
+    assert "--yolo" in out
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "cwd"),
+    [("--last", "/tmp"), ("01a020d4-d4e0-75a3-b832-b830e6f4fd87", "")],
+)
+def test_exact_resume_fails_closed_for_invalid_identity_or_cwd(
+    tmp_path, thread_id, cwd
+):
+    home = _write_config(tmp_path, "")
+
+    with pytest.raises(ValueError):
+        app._launch_codex_cmd(
+            "codex --yolo",
+            pin_model=False,
+            resume=True,
+            resume_uuid=thread_id,
+            resume_cwd=cwd,
+            codex_home=home,
+        )
+
+
 def test_config_cache_follows_edits(tmp_path):
     home = _write_config(tmp_path, '[mcp_servers.advisor]\nurl = "https://a/mcp"\n')
     assert "openaiDeveloperDocs" not in app._codex_home_mcp_servers(home)
@@ -265,7 +306,7 @@ def test_token_usage_sums_turn_deltas_not_running_totals(tmp_path):
     assert totals["today"]["cacheReadTokens"] == 50
     assert totals["today"]["reasoningTokens"] == 5
     # cached input is a SUBSET of input and reasoning a subset of output, so the
-    # total is input + output — exactly Codex's own total_tokens, not 385.
+    # total is input + output: exactly Codex's own total_tokens, not 385.
     assert totals["today"]["totalTokens"] == 330
     assert totals["today"]["turns"] == 2
 
@@ -379,7 +420,7 @@ nimrod_rotem@grabo-tech:~/p$ exec env CODEX_HOME=/home/nimrod_rotem/.codex-user-
 def test_starting_session_is_never_relaunched_into():
     """Codex takes seconds to appear in the process tree, so a poll can catch a
     session that is still booting. The pane then shows the launch command still
-    sitting on the prompt line and nothing after it — which reads as pending
+    sitting on the prompt line and nothing after it: which reads as pending
     input, and blocks the relaunch. Without that, a watchdog would type a second
     launch line into a booting TUI."""
     assert app._codex_launch_was_attempted(STARTING_PANE)

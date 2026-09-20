@@ -1,8 +1,8 @@
 """The terminal renderer's parsing rules, run as JavaScript.
 
-Everything the terminal does to a pane before it paints it — cutting the live
+Everything the terminal does to a pane before it paints it: cutting the live
 status line out, dropping the pane's chrome, undoing the CLI's hard wraps,
-diffing one paint against the last — is regex-heavy JS living inside app.py's
+diffing one paint against the last: is regex-heavy JS living inside app.py's
 HTML_PAGE. It is fitted to what Codex actually draws, and a stray character in
 one of those patterns is the difference between a clean transcript and a page
 that eats the conversation.
@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 # A pane the way tmux hands it over: the launcher's shell line, the start-up
-# banner, a turn, and the chrome Codex parks at the foot of every frame — twice,
+# banner, a turn, and the chrome Codex parks at the foot of every frame: twice,
 # because the frame that scrolled away left its own copy behind in the history.
 PANE = """\
 nimrod_rotem@grabo-tech:~$ if [ -f /home/nimrod_rotem/.codex-user-u_36f0/auth.json ]; then exec e
@@ -53,7 +53,7 @@ x-user-u_36f0/advisor-token 2>/dev/null)" env -u OPENAI_API_KEY codex --yolo; fi
   │ ss -ltn '( sport = :9234 )' | tail -n +2
   └ clean
 
-• Done — I submitted an Editor access request for susie@nemopowertools.com.
+• Done: I submitted an Editor access request for susie@nemopowertools.com.
   Google confirmed “Request sent.”
 
   You’ll become an editor after the file owner approves it. Open the spreadsheet
@@ -101,6 +101,15 @@ process.stdout.write(JSON.stringify({
   diff_append: ctx._lineDiff(['a','b','c'], ['a','b','c','d']),
   diff_same: ctx._lineDiff(['a','b'], ['a','b']),
   diff_middle: ctx._lineDiff(['a','b','c'], ['a','B','c']),
+  prompt_flags: ctx._userPromptLineFlags([
+    '› A submitted message that wraps',
+    '  onto another terminal row',
+    '',
+    '• The assistant reply stays white',
+    '› Use /skills to list available skills',
+    '',
+    '  gpt-5.6-sol max · /tmp/termqa',
+  ]),
 }));
 """
 
@@ -199,11 +208,263 @@ def test_a_markdown_bullet_is_not_mistaken_for_the_footer():
     assert "docs · /home/x" in text
 
 
+def test_clean_view_hides_wrapped_edit_preview_with_line_number_context_row():
+    pane = "\n".join([
+        "• Edited ~/project/tests/",
+        "test_example.py (+2 -1)",
+        "    110",
+        "    111 -old_call()",
+        "    111 +new_call()",
+        "• The change is ready.",
+    ])
+
+    assert _run(pane)["clean"] == ["• The change is ready."]
+
+
 def test_raw_view_passes_the_pane_through_untouched():
     out = _run(PANE, clean_view=False)
     assert "CODEX_HOME=" in "\n".join(out["clean"])
     # ...but the live row is still cut, in both views.
     assert not any("esc to interrupt" in l for l in out["body"])
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 12])
+def test_clean_view_hides_usage_reset_notice_without_eating_following_prose(count):
+    noun = "reset" if count == 1 else "resets"
+    notice = f"• You have {count} usage limit {noun} available. Run /usage to use one."
+    before = "• The requested change is ready."
+    after = "  This explanation should stay visible."
+    out = _run(f"{before}\n{notice}\n{after}")
+    assert out["clean"] == [before, after]
+
+
+@pytest.mark.parametrize("notice", [
+    "• You have 2 usage limit resets available.\n  Run /usage to use one.",
+    "• You have 2 usage limit\n  resets available. Run /usage\n  to use one.",
+    "• You have 2 usage limit re\nsets available. Run /us\nage to use one.",
+    "\x1b[33m• You have 2 usage limit resets available.\x1b[0m\r\n"
+    "  Run \x1b]8;;https://example.test\x1b\\/usage\x1b]8;;\x1b\\ to use one.\r",
+])
+def test_clean_view_hides_wrapped_and_ansi_usage_reset_notices(notice):
+    out = _run(f"• A real reply\n{notice}\n• Another real reply")
+    assert out["clean"] == ["• A real reply", "• Another real reply"]
+
+
+def test_raw_view_keeps_the_usage_reset_notice():
+    notice = "\x1b[33m• You have 2 usage limit resets available.\r\n  Run /usage to use one.\x1b[0m"
+    out = _run(notice, clean_view=False)
+    assert "\n".join(out["clean"]) == notice
+
+
+def test_clean_view_keeps_usage_limit_discussion_and_quoted_notices():
+    notice = "You have 2 usage limit resets available. Run /usage to use one."
+    rows = [
+        f"› Please hide this notice: {notice}",
+        "• You have 2 usage limit resets available, so you can resume work.",
+        f"• You have 2 usage limit resets available. Run /usage to use one. This is an example.",
+        f"> • {notice}",
+        f"  {notice}",
+        "  ```text",
+        f"• {notice}",
+        "  ```",
+        "• That is the message to hide.",
+    ]
+    out = _run("\n".join(rows))
+    assert out["clean"] == rows
+
+
+TRANSCRIPT_HINT = (
+    f"Earlier messages are available {chr(0x2014)} press ctrl + t to view the full transcript"
+)
+PYTEST_FRAGMENT = """\
+  >       assert send_calls[0] == 1
+  E       assert 0 == 1
+
+test_api.py:9275: AssertionError
+  ________ TestWatchdogRestartMode.test_restart_codex_dead_sets_disabled _________
+  self = <test_api.TestWatchdogRestartMode object at 0x1234>
+      @pytest.mark.asyncio
+      async def test_restart_codex_dead_sets_disabled(self):
+          import logging
+          import app as _app
+"""
+
+
+def test_clean_view_hides_history_clipped_pytest_output():
+    pane = (
+        TRANSCRIPT_HINT + "\n" + PYTEST_FRAGMENT
+        + "\n• The restart check failed; I am fixing it.\n› Keep going"
+    )
+    out = _run(pane)
+    assert out["clean"] == [
+        "• The restart check failed; I am fixing it.", "› Keep going",
+    ]
+
+# A result body whose marker row the ring cut away has no pytest tell and no
+# numbered diff rows to match: just bare, deeply indented source. It used to fall
+# through and print as if the agent had said it, which is how a chunk of this
+# dashboard's own relogin guard appeared in a clean pane.
+def test_clean_view_hides_history_clipped_indented_output():
+    orphan = "\n".join([
+        "              # avoids making model changes depend on a transient open file.",
+        "              fresh_restart = not resume_uuid or (",
+        "                  unused_generation",
+        "                  and (",
+        "                      recorded_resume_uuid != resume_uuid",
+        "                  )",
+        "              )",
+    ])
+    pane = TRANSCRIPT_HINT + "\n" + orphan + "\n\u2022 Restored the guard.\n\u203a Keep going"
+    out = _run(pane)
+    assert out["clean"] == ["\u2022 Restored the guard.", "\u203a Keep going"]
+
+
+# Indent alone must not swallow real prose: a nested list item after the hint is
+# content, and the existing hint tests pin indent 2, so 6 is the first safe level.
+def test_clean_view_keeps_shallow_indented_prose_after_hint():
+    pane = TRANSCRIPT_HINT + "\n\u2022 Findings:\n    - the guard was reverted\n\u203a Keep going"
+    out = _run(pane)
+    assert "- the guard was reverted" in "\n".join(out["clean"])
+
+
+
+
+@pytest.mark.parametrize("source_indent", ["", "  "])
+def test_tool_output_stays_hidden_across_blank_rows_and_pytest_source_markers(source_indent):
+    pane = (
+        "• I am checking the restart.\n• Ran pytest\n  └ tests failed\n\n"
+        + source_indent + ">       assert send_calls[0] == 1\n"
+        + "E       assert 0 == 1\n\ntest_api.py:9275: AssertionError\n"
+        + "• The restart check failed; I am fixing it.\n› Keep going"
+    )
+    text = "\n".join(_run(pane)["clean"])
+    assert "assert send_calls" not in text
+    assert "AssertionError" not in text
+    assert "I am checking the restart." in text
+    assert "The restart check failed; I am fixing it." in text
+    assert "Keep going" in text
+
+
+@pytest.mark.parametrize("header", [
+    "• Edit app.py (+2 -1)",
+    "• Add test_api.py (+4)",
+    "• Added test_api.py (+4)",
+    "• Edit app.py",
+    "• Edit README",
+    "• Added 1 file",
+    "• Edited ~/project/test_terminal_render.py (+105\n-0)",
+    "• Added ~/project/a_very_long_file\n_name.py (+4 -0)",
+])
+def test_clean_view_hides_file_actions_with_diff_evidence(header):
+    pane = header + "\n    12 + import app\n    13 - old_call()\n• The change is ready."
+    assert _run(pane)["clean"] == ["• The change is ready."]
+
+
+@pytest.mark.parametrize("hint", [
+    TRANSCRIPT_HINT,
+    "  " + TRANSCRIPT_HINT,
+    f"Earlier messages are available {chr(0x2014)} press ctrl + t\n  to view the full transcript",
+    f"Earlier messages are available {chr(0x2014)} press ctrl + t to view the full tran\nscript",
+    "\x1b[2m" + TRANSCRIPT_HINT + "\x1b[0m\r",
+])
+def test_transcript_hint_removal_keeps_following_prose(hint):
+    after = "  This explanation should remain visible."
+    assert _run("• A real reply\n" + hint + "\n" + after)["clean"] == [
+        "• A real reply", after,
+    ]
+
+
+def test_clean_view_preserves_quoted_errors_fenced_code_and_action_prose():
+    rows = [
+        "• Added monitoring and edited the final summary.",
+        "• Edit the example below when the requirement changes.",
+        "> " + TRANSCRIPT_HINT,
+        ">       assert send_calls[0] == 1",
+        "  ```text",
+        TRANSCRIPT_HINT,
+        *PYTEST_FRAGMENT.splitlines(),
+        "• Add test_api.py (+4)",
+        "  ```",
+        "• The example above is intentional.",
+    ]
+    assert _run("\n".join(rows))["clean"] == rows
+
+
+def test_clean_view_preserves_a_users_pasted_error_report():
+    rows = [
+        "› Please explain this failure:",
+        TRANSCRIPT_HINT,
+        *PYTEST_FRAGMENT.splitlines(),
+        "• I will explain the failure.",
+    ]
+    assert _run("\n".join(rows))["clean"] == rows
+
+
+def test_clean_view_keeps_an_ambiguous_error_fragment_without_tool_context():
+    assert _run(PYTEST_FRAGMENT)["clean"] == PYTEST_FRAGMENT.splitlines()
+
+
+def test_raw_view_keeps_history_hint_and_pytest_output():
+    pane = (TRANSCRIPT_HINT + "\n" + PYTEST_FRAGMENT).rstrip("\n")
+    assert "\n".join(_run(pane, clean_view=False)["clean"]) == pane
+
+
+def test_running_unbulleted_tool_after_a_user_message_is_hidden():
+    pane = "› Run tests\n\n  Bash(pytest)\n    ⎿ E assert 0 == 1\n      source\n● Done."
+    text = "\n".join(_run(pane)["clean"])
+    assert "Run tests" in text
+    assert "Done." in text
+    assert "Bash(pytest)" not in text
+    assert "E assert" not in text
+
+
+def test_user_fenced_tool_examples_remain_visible():
+    rows = [
+        "› Here is a quoted transcript",
+        "  ```text",
+        "• Add test_api.py (+4)",
+        "    12 + import app",
+        "  ```",
+        "• This is the real response.",
+    ]
+    assert _run("\n".join(rows))["clean"] == rows
+
+
+@pytest.mark.parametrize("rows", [
+    ["• Added two regression tests.", "  Both passed (2)", "• The change is ready."],
+    ["• Added validation for the route.", "  The covered edge cases increased (+4)", "• Done."],
+    ["• Read this patch example:", "  ```text", "  Updated app.py (+2 -1)",
+     "    12 + import app", "  ```", "• This explains the notation."],
+    ["• Add the following code:", "  ```python", "  values = (+4)", "  ```", "• Done."],
+    ["• Added a note about the patch:", "  > Edited app.py (+2 -1)",
+     "  The quoted note should remain.", "• Done."],
+])
+def test_wrapped_file_actions_do_not_consume_prose_quotes_or_fences(rows):
+    assert _run("\n".join(rows))["clean"] == rows
+
+
+def test_history_hint_does_not_hide_an_introduced_pytest_example():
+    rows = [
+        "  This quoted example explains it:",
+        "  > assert send_calls[0] == 1",
+        "  E assert 0 == 1",
+        "• Done.",
+    ]
+    assert _run(TRANSCRIPT_HINT + "\n" + "\n".join(rows))["clean"] == rows
+
+
+@pytest.mark.parametrize("marker", ["●", ">"])
+def test_hook_instructions_remain_visible_including_literal_history_hint(marker):
+    rows = [
+        f"{marker} Ran 1 stop hook (ctrl+o to expand)",
+        "  ⎿ Please address the failed tests before stopping.",
+        "  " + TRANSCRIPT_HINT,
+        "",
+        "  Follow up with verification.",
+        "• Continuing now.",
+    ]
+    expected = ["> Ran 1 stop hook (ctrl+o to expand)", *rows[1:]]
+    assert _run("\n".join(rows))["clean"] == expected
 
 
 def test_flow_mode_rejoins_a_url_cut_at_the_margin(rendered):
@@ -235,3 +496,10 @@ def test_the_paint_rewrites_only_what_moved(rendered):
     assert rendered["diff_append"] == {"from": 3, "remove": 0, "insert": 1}
     assert rendered["diff_same"] == {"from": 2, "remove": 0, "insert": 0}
     assert rendered["diff_middle"] == {"from": 1, "remove": 1, "insert": 1}
+
+
+def test_submitted_user_messages_get_the_green_terminal_style(rendered):
+    assert rendered["prompt_flags"] == [True, True, False, False, False, False, False]
+    source = APP.read_text()
+    assert ".raw-output .tl-user-prompt{color:#3fb950;font-weight:600}" in source
+    assert '<span class="tl-user-prompt">' in source

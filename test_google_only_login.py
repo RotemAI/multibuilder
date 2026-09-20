@@ -1,4 +1,4 @@
-"""Regression coverage for Google-only dashboard login and logout."""
+"""Regression coverage for dashboard login and logout."""
 
 import os
 
@@ -10,7 +10,15 @@ from fastapi.testclient import TestClient
 import app as app_module
 
 
-def test_google_enabled_login_page_hides_the_password_fallback(monkeypatch):
+def test_google_enabled_login_page_still_offers_the_password_fields(monkeypatch):
+    """Owner decision 2026-09-20: both ways in, on every builder box.
+
+    A configured Google client used to REPLACE the username and password
+    fields. POST /login accepted a password the whole time, so every check that
+    posted a credential passed while the browser offered nowhere to type one,
+    and the box was unreachable whenever Google was down or the address was not
+    on the allowlist.
+    """
     monkeypatch.setattr(app_module, "_google_login_enabled", lambda: True)
 
     page = app_module._login_page()
@@ -19,8 +27,16 @@ def test_google_enabled_login_page_hides_the_password_fallback(monkeypatch):
         'id="gbtn"' in page,
         'name="username"' in page,
         'name="password"' in page,
-        "sign in with a password" in page,
-    ) == (True, False, False, False)
+    ) == (True, True, True)
+
+
+def test_login_path_serves_the_page_rather_than_404():
+    """/login had no GET route, so typing the URL gave Not found."""
+    client = TestClient(app_module.app)
+
+    response = client.get("/login")
+
+    assert (response.status_code, 'name="password"' in response.text) == (200, True)
 
 
 def test_password_fallback_remains_available_without_google(monkeypatch):
