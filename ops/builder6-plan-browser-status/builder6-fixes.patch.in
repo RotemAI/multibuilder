@@ -1,0 +1,1548 @@
+--- a/app.py
++++ b/app.py
+@@ -543,7 +543,8 @@
+     ):
+         out += " -c " + shlex.quote(_CODEX_DOCS_MCP_OVERRIDE)
+     if not CODEX_API_FALLBACK_ENABLED:
+-        out = "env -u OPENAI_API_KEY " + out
++        out += " -c " + shlex.quote('forced_login_method="chatgpt"')
++        out = "env -u OPENAI_API_KEY -u CODEX_API_KEY " + out
+     return out
+ 
+ 
+@@ -989,7 +990,8 @@
+         MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+         OPENAI_KEY_FILE.write_text(key)
+         OPENAI_KEY_FILE.chmod(0o600)
+-        _write_codex_api_auth(CODEX_HOME, key)
++        if CODEX_API_FALLBACK_ENABLED:
++            _write_codex_api_auth(CODEX_HOME, key)
+     except Exception:
+         logger.debug("Failed to save OpenAI API key", exc_info=True)
+ 
+@@ -3365,7 +3367,7 @@
+                 desired_config,
+             )
+     key = _active_openai_key()
+-    if key and not (d / "auth.json").exists():
++    if CODEX_API_FALLBACK_ENABLED and key and not (d / "auth.json").exists():
+         try:
+             _write_codex_api_auth(d, key)
+         except Exception:
+@@ -6534,7 +6536,11 @@
+             source = SHARED_CODEX_AUTH
+         else:
+             source = SHARED_CODEX_AUTH
+-            if source.exists():
++            source_allowed = source.exists()
++            if source_allowed and not CODEX_API_FALLBACK_ENABLED:
++                source_data = json.loads(source.read_text())
++                source_allowed = source_data.get("auth_mode") == "chatgpt"
++            if source_allowed:
+                 if target.is_symlink() and target.resolve() == source.resolve():
+                     pass
+                 else:
+@@ -6542,14 +6548,24 @@
+                     if target.is_symlink() or target.exists():
+                         target.unlink()
+                     target.symlink_to(source)
+-            elif _active_openai_key():
++            elif CODEX_API_FALLBACK_ENABLED and not source.exists() and _active_openai_key():
+                 _backup_before_dashboard_write(target)
+                 _write_codex_api_auth(cfg_dir, _active_openai_key())
+         data = json.loads(source.read_text()) if source.exists() else {}
+-        return "subscription" if data.get("auth_mode") == "chatgpt" else "api"
++        if data.get("auth_mode") == "chatgpt":
++            return "subscription"
++        if CODEX_API_FALLBACK_ENABLED and data.get("auth_mode") == "apikey":
++            return "api"
++        if (
++            CODEX_API_FALLBACK_ENABLED
++            and target.exists()
++            and json.loads(target.read_text()).get("auth_mode") == "apikey"
++        ):
++            return "api"
++        return "unconfigured"
+     except Exception:
+         logger.debug("Failed to share Codex auth into %s", cfg_dir, exc_info=True)
+-        return "api" if _active_openai_key() else "unconfigured"
++        return "api" if CODEX_API_FALLBACK_ENABLED and _active_openai_key() else "unconfigured"
+ 
+ 
+ def _seed_trust(cfg_dir: Path, cwd: str):
+@@ -6995,6 +7011,7 @@
+             "[mcp_servers.playwright-browser]\n"
+             'command = "python3"\n'
+             f'args = ["{proxy}"]\n'
++            'startup_timeout_sec = 60\n'
+             "\n[mcp_servers.playwright-browser.env]\n"
+             f'TMUX_DASH_BROWSER_ID = "{browser_id}"\n'
+             f'TMUX_DASH_BROWSER_CDP_PORT = "{cdp_port}"\n'
+@@ -16115,7 +16132,8 @@
+     """Measured cache/turn/token fields flattened onto the session payload."""
+     f = _codex_session_facts(session_name)
+     fields = (
+-        "cache_ttl", "cache_min_tokens", "last_turn_end", "last_turn_seconds", "cache_last_activity",
++        "cache_ttl", "cache_min_tokens", "last_turn_end", "last_turn_seconds", "last_turn_output_tokens",
++        "current_turn_start", "current_turn_output_tokens", "cache_last_activity",
+         "last_input_tokens", "context_tokens", "context_limit", "cache_read_tokens",
+         "cache_model", "detect_sure", "metrics_thread_id", "metrics_catching_up", "session_total_tokens",
+         "session_input_tokens", "session_output_tokens", "avg_tps",
+@@ -20205,19 +20223,63 @@
+     return Response(content=up.content, status_code=up.status_code, headers=headers)
+ 
+ 
++class ReloginRequest(BaseModel):
++    expected_generation: str = Field(default="", max_length=32, strict=True)
++    expected_resume_uuid: str = Field(default="", max_length=36, strict=True)
++    completed_turn_id: str = Field(default="", max_length=36, strict=True)
++    expected_model: str = Field(default="", max_length=128, strict=True)
++    expected_effort: str = Field(default="", max_length=16, strict=True)
++
++
+ @app.post("/api/sessions/{session_name}/relogin")
+-async def api_session_relogin(session_name: str, request: Request):
++async def api_session_relogin(
++    session_name: str,
++    request: Request,
++    body: ReloginRequest | None = None,
++):
+     """Restart Codex with the active CODEX_HOME and resume its latest thread."""
+     user = _current_user(request)
+     if not _user_can_access_session(user, session_name):
+         return JSONResponse({"error": "Session not found"}, status_code=404)
++    owner_id = str(user.get("id") or "")
++    guarded = body is not None and any((
++        body.expected_generation,
++        body.expected_resume_uuid,
++        body.completed_turn_id,
++        body.expected_model,
++        body.expected_effort,
++    ))
++    restart_kwargs = {}
++    if guarded:
++        generation = body.expected_generation.strip()
++        resume_uuid = body.expected_resume_uuid.strip().lower()
++        completed_turn_id = body.completed_turn_id.strip().lower()
++        model = body.expected_model.strip()
++        effort = body.expected_effort.strip()
++        if (
++            not re.fullmatch(r"[0-9a-f]{32}", generation)
++            or _validated_codex_thread_id(resume_uuid) != resume_uuid
++            or _validated_codex_thread_id(completed_turn_id) != completed_turn_id
++            or (effort and effort not in _CODEX_REASONING_EFFORTS)
++        ):
++            return JSONResponse({"error": "Invalid relogin guard"}, status_code=400)
++        restart_kwargs.update({
++            "expected_owner_id": owner_id,
++            "expected_generation": generation,
++            "expected_resume_uuid": resume_uuid,
++            "completed_turn_id": completed_turn_id,
++            "expected_model": model,
++            "expected_effort": effort,
++        })
+     running = await _async_is_codex_running(session_name)
+-    _exported, restarted = await _restart_codex_for_session(session_name)
++    _exported, restarted = await _restart_codex_for_session(
++        session_name, **restart_kwargs
++    )
+     return JSONResponse({
+         "ok": restarted,
+         "relaunched": restarted,
+         "codex_was_running": running,
+-    }, status_code=200 if restarted else 500)
++    }, status_code=200 if restarted else (409 if guarded else 500))
+ 
+ 
+ @app.post("/api/transcribe")
+@@ -20287,6 +20349,9 @@
+     codex_home.mkdir(parents=True, exist_ok=True)
+     env = dict(os.environ)
+     env["CODEX_HOME"] = str(codex_home)
++    if not CODEX_API_FALLBACK_ENABLED:
++        env.pop("OPENAI_API_KEY", None)
++        env.pop("CODEX_API_KEY", None)
+     return subprocess.Popen(
+         [
+             "codex", "app-server", "-c", 'cli_auth_credentials_store="file"',
+@@ -20364,7 +20429,7 @@
+             pass
+ 
+ 
+-def _codex_app_server_account_read(codex_home: Path, refresh_token: bool = True) -> dict:
++def _codex_app_server_account_read(codex_home: Path, refresh_token: bool = False) -> dict:
+     """Ask Codex itself to validate (and, for ChatGPT, refresh) its credential."""
+     process = _codex_app_server_process(codex_home)
+     try:
+@@ -20424,7 +20489,10 @@
+         account: dict = {}
+ 
+         if configured_mode == "apikey" and creds.get("OPENAI_API_KEY"):
+-            active_mode = "apikey"
++            if CODEX_API_FALLBACK_ENABLED:
++                active_mode = "apikey"
++            else:
++                reason = "OpenAI API-key authentication is disabled; ChatGPT plan login is required"
+         elif configured_mode == "chatgpt":
+             tokens = creds.get("tokens")
+             if not isinstance(tokens, dict) or not all(
+@@ -20432,12 +20500,16 @@
+             ):
+                 reason = "ChatGPT credential is missing required tokens"
+             elif validate_chatgpt:
+-                probe = _codex_app_server_account_read(codex_home, refresh_token=True)
++                probe = _codex_app_server_account_read(codex_home, refresh_token=False)
+                 account = probe.get("account") if isinstance(probe.get("account"), dict) else {}
+                 if probe.get("ok") and account.get("type") == "chatgpt":
+                     active_mode = "chatgpt"
+                 else:
+-                    reason = "ChatGPT credential is expired, revoked, or could not be refreshed"
++                    detail = str(probe.get("error") or "credential validation failed")
++                    reason = (
++                        "ChatGPT credential is expired, revoked, or could not be validated: "
++                        f"{detail}"
++                    )
+             else:
+                 active_mode = "chatgpt"
+         elif parse_error:
+@@ -20447,7 +20519,12 @@
+ 
+         stored_key = _active_openai_key()
+         fallback_active = False
+-        if active_mode == "unknown" and reason and stored_key:
++        if (
++            CODEX_API_FALLBACK_ENABLED
++            and active_mode == "unknown"
++            and reason
++            and stored_key
++        ):
+             _write_codex_api_auth(codex_home, stored_key)
+             active_mode = "apikey"
+             fallback_active = True
+@@ -20469,6 +20546,7 @@
+             "loggedIn": active_mode in ("apikey", "chatgpt"),
+             "fallbackActive": fallback_active,
+             "fallbackReason": reason if fallback_active else "",
++            "authError": reason if active_mode == "unknown" else "",
+             "account": account,
+         }
+ 
+@@ -20640,6 +20718,8 @@
+         "configuredMode": auth_state["configuredMode"],
+         "fallbackActive": auth_state["fallbackActive"],
+         "fallbackReason": auth_state["fallbackReason"],
++        "authError": auth_state.get("authError", ""),
++        "apiFallbackEnabled": CODEX_API_FALLBACK_ENABLED,
+         "model": "",
+     }
+     try:
+@@ -20858,7 +20938,7 @@
+     """Return genuine ChatGPT plan windows; never invent API-key quotas."""
+     now = time.time()
+     auth_state = await asyncio.to_thread(
+-        _ensure_codex_auth_with_fallback, CODEX_HOME, True
++        _ensure_codex_auth_with_fallback, CODEX_HOME, False
+     )
+     auth_mode = str(auth_state.get("activeMode") or "unknown")
+     cached = _openai_limits_cache.get("data")
+@@ -22854,6 +22934,10 @@
+     expected_owner_id: str | None = None,
+     expected_generation: str = "",
+     *,
++    expected_resume_uuid: str = "",
++    completed_turn_id: str = "",
++    expected_model: str = "",
++    expected_effort: str = "",
+     autopush_guard: bool = False,
+     expected_binding: dict | None = None,
+     voice_request: Request | None = None,
+@@ -22907,6 +22991,12 @@
+                 if resume_uuid
+                 else ""
+             ) or ""
++            if expected_resume_uuid and (
++                not hmac.compare_digest(resume_uuid, expected_resume_uuid)
++                or not hmac.compare_digest(active_resume_uuid, expected_resume_uuid)
++                or not hmac.compare_digest(recorded_resume_uuid, expected_resume_uuid)
++            ):
++                return False, False
+             unused_generation = _session_generation_is_unused(
+                 session_name, owner_id, row
+             )
+@@ -23051,6 +23141,40 @@
+                     delay_before_last=1.0,
+                 )
+ 
++            if completed_turn_id:
++                if not expected_resume_uuid:
++                    return False, False
++                latest_turn = await asyncio.to_thread(
++                    _model_recovery_event, session_name, owner_id
++                )
++                current_row = _session_lifecycle.get(session_name)
++                current_model, current_effort = _saved_session_model_effort(
++                    session_name, owner_id
++                )
++                if (
++                    not isinstance(latest_turn, dict)
++                    or latest_turn.get("type") != "task_complete"
++                    or not hmac.compare_digest(
++                        str(latest_turn.get("turn_id") or ""), completed_turn_id
++                    )
++                    or not hmac.compare_digest(
++                        str(current_row.get("generation") or ""), generation
++                    )
++                    or not hmac.compare_digest(
++                        str(current_row.get("resume_uuid") or ""),
++                        expected_resume_uuid,
++                    )
++                    or (
++                        expected_model
++                        and not hmac.compare_digest(current_model, expected_model)
++                    )
++                    or (
++                        expected_effort
++                        and not hmac.compare_digest(current_effort, expected_effort)
++                    )
++                ):
++                    return False, False
++
+             if not await request_quit():
+                 return False, False
+             for _ in range(15):
+@@ -23104,6 +23228,10 @@
+     expected_owner_id: str | None = None,
+     expected_generation: str = "",
+     *,
++    expected_resume_uuid: str = "",
++    completed_turn_id: str = "",
++    expected_model: str = "",
++    expected_effort: str = "",
+     autopush_guard: bool = False,
+     expected_binding: dict | None = None,
+     voice_request: Request | None = None,
+@@ -23124,6 +23252,10 @@
+                 session_name,
+                 expected_owner_id,
+                 expected_generation,
++                expected_resume_uuid=expected_resume_uuid,
++                completed_turn_id=completed_turn_id,
++                expected_model=expected_model,
++                expected_effort=expected_effort,
+                 autopush_guard=autopush_guard,
+                 expected_binding=expected_binding,
+                 **({"voice_request": voice_request} if voice_request is not None else {}),
+@@ -25194,7 +25326,7 @@
+         "ts": now,
+         "loggedIn": bool(state.get("loggedIn")),
+         "activeMode": str(state.get("activeMode") or "unknown"),
+-        "reason": str(state.get("fallbackReason") or ""),
++        "reason": str(state.get("fallbackReason") or state.get("authError") or ""),
+         "fallbackActive": bool(state.get("fallbackActive")),
+     })
+     # The API workers cannot see this process's memory: publish it.
+@@ -30714,6 +30846,16 @@
+   if(!busy||live.done)return live.sec;
+   return live.sec+Math.max(0,(_nowMs()-(live.at||_nowMs()))/1000);
+ }
++function _currentTurnSeconds(name,st){
++  const live=st.live||{};
++  if(live.seen&&!live.done){
++    const parsed=_liveSeconds(st,true);
++    if(parsed!==null)return parsed;
++  }
++  const s=sessions.find(x=>x.name===name)||{};
++  const started=_metricNumber(s.current_turn_start);
++  return started===null?null:Math.max(0,Date.now()/1000-started);
++}
+ let _liveTicker=null;
+ function startLiveTicker(){
+   if(_liveTicker)return;
+@@ -30728,9 +30870,9 @@
+     _paintCacheNotice(selectedSession);
+     _paintPillCache(selectedSession);
+     const st=rawState[selectedSession];
+-    if(!st||!st.live||!st.live.seen||st.live.done||!_sessionBusy(selectedSession))return;
++    if(!st||!_sessionBusy(selectedSession))return;
+     const e=document.getElementById('tl-time-'+selectedSession);
+-    const secs=_liveSeconds(st,true);
++    const secs=_currentTurnSeconds(selectedSession,st);
+     if(e&&secs!==null)e.textContent=_fmtElapsed(secs);
+   },1000);
+ }
+@@ -30749,6 +30891,12 @@
+   if(n<1000)return String(n);
+   if(n<1000000)return (n/1000).toFixed(n<10000?1:0)+'k';
+   return (n/1000000).toFixed(1)+'M';
++}
++function _fmtTurnTokens(n){
++  n=n||0;
++  if(n<1000)return String(n);
++  if(n<1000000)return (n/1000).toFixed(1).replace(/\.0$/,'')+'k';
++  return (n/1000000).toFixed(1).replace(/\.0$/,'')+'M';
+ }
+ function _metricNumber(value){
+   if(value===null||value===undefined||value==='')return null;
+@@ -31007,16 +31155,19 @@
+   const verbEl=document.getElementById('tl-verb-'+name);
+   if(verbEl&&sess.activity_status!=='idle')verbEl.title=busy?'Current turn activity.':'Session activity is unavailable.';
+   const measuredSecs=_metricNumber(sess.last_turn_seconds);
+-  const secs=busy&&!live.done?_liveSeconds(st,true):null;
++  const secs=busy?_currentTurnSeconds(name,st):null;
+   set('tl-time-',busy?(secs===null?'elapsed n/a':_fmtElapsed(secs)):
+     'last turn '+(measuredSecs===null?'n/a':_fmtElapsed(measuredSecs)));
+   const timeEl=document.getElementById('tl-time-'+name);
+   if(timeEl)timeEl.title=busy?'Elapsed time in the current turn.':
+     measuredSecs===null?'Duration of the last completed turn is unavailable.':
+     'Fixed duration of the last completed turn.';
+-  set('tl-tok-',live.tok?((live.dir?live.dir+' ':'')+live.tok+' tokens'):'');
++  const measuredTurnTokens=_metricNumber(busy?sess.current_turn_output_tokens:sess.last_turn_output_tokens);
++  set('tl-tok-',live.tok?((live.dir?live.dir+' ':'')+live.tok+' tokens'):
++    measuredTurnTokens===null?'':'↓ '+_fmtTurnTokens(measuredTurnTokens)+' tokens');
+   _paintIdleCounter(name);
+   _paintCacheNotice(name);
++  _paintCacheChip(name);
+   _paintContext(name);
+   _paintSessionMetrics(name);
+   _paintPillCache(name);
+@@ -33927,7 +34078,8 @@
+         // Keep the bar and warning epoch fresh without rebuilding the terminal.
+         sessions[si].activity_status=st.activity_status;
+         sessions[si].activity_detail=st.activity_detail;
+-        for(const field of ['last_turn_end','last_turn_seconds','cache_last_activity',
++        for(const field of ['last_turn_end','last_turn_seconds','last_turn_output_tokens',
++          'current_turn_start','current_turn_output_tokens','cache_last_activity',
+           'cache_ttl','cache_min_tokens','cache_read_tokens','cache_model','cache_keepalive','detect_sure',
+           'context_tokens','context_limit','last_input_tokens','metrics_thread_id',
+           'session_total_tokens','session_input_tokens','session_output_tokens',
+@@ -34591,7 +34743,7 @@
+   const dot=document.getElementById('codex-auth-dot');
+   const label=document.getElementById('codex-auth-label');
+   if(!_authCache){dot.className='status-dot unknown';label.textContent='...';return}
+-  if(_authCache.hasApiKey&&!_authCache.loggedIn){
++  if(_authCache.activeMode==='apikey'&&_authCache.loggedIn){
+     dot.className='status-dot';dot.style.background='#d2a8ff';
+     label.textContent='API Key';
+     return;
+@@ -34666,7 +34818,8 @@
+       <div class="auth-row"><span class="auth-row-label">Email</span><span class="auth-row-value">${esc(_authCache.email||'-')}</span></div>
+       <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(plan)}</span></span></div>
+       <div class="auth-row"><span class="auth-row-label">Auth</span><span class="auth-row-value">${esc(_authCache.authMode||'-')}</span></div>
+-      ${_authCache.hasApiKey?'<div class="auth-row"><span class="auth-row-label">'+(_authCache.activeMode==='chatgpt'?'Fallback API key':'API key')+'</span><span class="auth-row-value" style="color:#3fb950">Stored</span></div>':''}
++      ${_authCache.hasApiKey?'<div class="auth-row"><span class="auth-row-label">'+(_authCache.apiFallbackEnabled?'Fallback API key':'App services API key')+'</span><span class="auth-row-value">Stored</span></div>':''}
++      ${!_authCache.apiFallbackEnabled?'<p class="auth-hint">Codex uses the ChatGPT plan. API fallback is disabled.</p>':''}
+       ${usageHtml}
+       <hr class="auth-divider">
+       ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-bottom:8px" onclick="clearApiKey()">Clear stored API key</button>':''}
+@@ -34676,14 +34829,14 @@
+     el.innerHTML=`
+       <div class="auth-title">Codex: Not Connected</div>
+       <button class="auth-btn auth-btn-primary" style="margin-bottom:10px" onclick="document.getElementById('auth-dropdown').classList.remove('active');openSettings('login')">Sign in with ChatGPT</button>
+-      <p class="auth-hint">Or configure a fallback OpenAI API key for usage-based access:</p>
++      ${_authCache.apiFallbackEnabled?`<p class="auth-hint">Or configure a fallback OpenAI API key for usage-based access:</p>
+       <input type="password" class="auth-api-input" id="auth-api-key-input"
+         placeholder="sk-..." autocomplete="off" spellcheck="false"
+         value="${_authCache.hasApiKey?'••••••••••••••••':''}">
+       <div style="display:flex;gap:8px;margin-top:10px">
+         <button class="auth-btn auth-btn-primary" style="flex:1" onclick="saveApiKey()">Save key</button>
+         ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="flex:1" onclick="clearApiKey()">Clear</button>':''}
+-      </div>
++      </div>`:'<p class="auth-hint">Sign in to use the ChatGPT plan. API fallback is disabled.</p>'}
+       ${usageHtml}
+       <hr class="auth-divider">
+       <p class="auth-hint">Or sign in to ChatGPT by running <code style="color:#79c0ff">codex login</code> in a terminal session.</p>
+@@ -36251,8 +36404,10 @@
+ function renderLoginTab(){
+   const d=_authStatus||{};
+   const active=!!d.loggedIn;
++  const plan=d.subscriptionType||'';
++  const planLabel=d.activeMode==='chatgpt'?'ChatGPT '+(plan.charAt(0).toUpperCase()+plan.slice(1)):plan;
+   const statusLine=active
+-    ? '<span class="bs-dot on"></span> <b>Codex is connected.</b> '+esc(d.email||'')+(d.subscriptionType?' · '+esc(d.subscriptionType):'')
++    ? '<span class="bs-dot on"></span> <b>Codex is connected.</b> '+esc(d.email||'')+(planLabel?' · '+esc(planLabel):'')
+     : '<span class="bs-dot off"></span> <b>Codex is not connected.</b>';
+   const detail='Auth mode: '+esc(d.authMode||'unknown')+(d.model?' · model '+esc(d.model):'');
+   const fallback=d.fallbackActive
+@@ -36266,12 +36421,12 @@
+       '<div class="my-ctx-actions"><button class="btn btn-primary btn-full" onclick="startChatgptLogin()">Sign in with ChatGPT</button></div>'+
+       chatgptLoginHtml()+
+       '<hr class="auth-divider">'+
+-      '<label>Fallback OpenAI API key</label>'+
++      (d.apiFallbackEnabled?'<label>Fallback OpenAI API key</label>'+
+       '<textarea id="login-token" class="my-ctx-settings" placeholder="sk-…" style="min-height:56px"></textarea>'+
+       '<div class="my-ctx-actions"><button class="btn btn-full" onclick="saveLoginToken()">Save fallback API key</button></div>'+
+-      (d.hasApiKey?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="clearLoginToken()">Clear dashboard API key</button></div>':'')+
++      (d.hasApiKey?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="clearLoginToken()">Clear dashboard API key</button></div>':''):'')+
+       (active?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="logoutCodex()">Log Codex out</button></div>':'')+
+-      '<div class="pf-banner" style="margin-top:10px;color:#8b949e">The stored API key remains available as an automatic fallback if ChatGPT authorization expires or is revoked.</div>'+
++      '<div class="pf-banner" style="margin-top:10px;color:#8b949e">'+(d.apiFallbackEnabled?'The stored API key is available as a fallback if ChatGPT authorization expires or is revoked.':'Codex sessions use your ChatGPT subscription. API fallback is disabled. If the plan disconnects, sign in again to continue.')+'</div>'+
+     '</div>';
+ }
+ async function startChatgptLogin(){
+--- a/browser_mcp_lease_proxy.py
++++ b/browser_mcp_lease_proxy.py
+@@ -11,6 +11,7 @@
+ 
+ import json
+ import os
++import signal
+ import socket
+ import subprocess
+ import sys
+@@ -48,6 +49,56 @@
+     )
+ )
+ LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
++PLAYWRIGHT_MCP_PACKAGE = os.environ.get(
++    "TMUX_DASH_PLAYWRIGHT_MCP_PACKAGE", "@playwright/mcp@0.0.82"
++)
++
++
++def _default_upstream_command() -> list[str]:
++    local_cli = (
++        _host_home()
++        / ".claude-browser"
++        / "node_modules"
++        / "@playwright"
++        / "mcp"
++        / "cli.js"
++    )
++    args = [
++        "--cdp-endpoint",
++        f"http://127.0.0.1:{BROWSER_CDP_PORT}",
++        "--output-dir",
++        str(BROWSER_OUTPUT_DIR),
++    ]
++    if local_cli.is_file():
++        return ["node", str(local_cli), *args]
++    return ["npx", "--yes", PLAYWRIGHT_MCP_PACKAGE, *args]
++
++
++def _upstream_environment() -> dict[str, str]:
++    env = os.environ.copy()
++    env.setdefault("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
++    return env
++
++
++def _terminate_upstream_group(upstream: subprocess.Popen, timeout: float = 5) -> None:
++    try:
++        os.killpg(upstream.pid, signal.SIGTERM)
++    except ProcessLookupError:
++        pass
++    try:
++        upstream.wait(timeout=timeout)
++        return
++    except subprocess.TimeoutExpired:
++        pass
++    try:
++        os.killpg(upstream.pid, signal.SIGKILL)
++    except ProcessLookupError:
++        pass
++    upstream.wait()
++
++
++def _shutdown_on_signal(signum: int, _frame: object) -> None:
++    raise SystemExit(128 + signum)
+ 
+ 
+ def _rpc(message: dict[str, Any], timeout: float = 45) -> dict[str, Any]:
+@@ -144,20 +195,15 @@
+ 
+ 
+ def main() -> int:
+-    upstream_command = sys.argv[1:] or [
+-        "node",
+-        str(_host_home() / ".claude-browser" / "node_modules" / "@playwright" / "mcp" / "cli.js"),
+-        "--cdp-endpoint",
+-        f"http://127.0.0.1:{BROWSER_CDP_PORT}",
+-        "--output-dir",
+-        str(BROWSER_OUTPUT_DIR),
+-    ]
++    upstream_command = sys.argv[1:] or _default_upstream_command()
+     upstream = subprocess.Popen(
+         upstream_command,
+         stdin=subprocess.PIPE,
+         stdout=subprocess.PIPE,
+         stderr=subprocess.PIPE,
+         bufsize=0,
++        env=_upstream_environment(),
++        start_new_session=True,
+     )
+     assert upstream.stdin is not None
+     assert upstream.stdout is not None
+@@ -191,6 +237,10 @@
+     threading.Thread(target=client_to_upstream, daemon=True).start()
+     threading.Thread(target=copy_stderr, daemon=True).start()
+     threading.Thread(target=leases.renew_loop, daemon=True).start()
++    previous_handlers = {
++        signum: signal.signal(signum, _shutdown_on_signal)
++        for signum in (signal.SIGINT, signal.SIGTERM)
++    }
+ 
+     try:
+         for line in upstream.stdout:
+@@ -205,12 +255,9 @@
+         return upstream.wait()
+     finally:
+         leases.close()
+-        if upstream.poll() is None:
+-            upstream.terminate()
+-            try:
+-                upstream.wait(timeout=5)
+-            except subprocess.TimeoutExpired:
+-                upstream.kill()
++        _terminate_upstream_group(upstream)
++        for signum, previous in previous_handlers.items():
++            signal.signal(signum, previous)
+ 
+ 
+ if __name__ == "__main__":
+--- a/session_metrics.py
++++ b/session_metrics.py
+@@ -29,6 +29,9 @@
+         "cache_last_activity": 0.0,
+         "last_turn_end": 0.0,
+         "last_turn_seconds": None,
++        "last_turn_output_tokens": None,
++        "current_turn_start": None,
++        "current_turn_output_tokens": None,
+         "session_input_tokens": None,
+         "session_output_tokens": None,
+         "session_total_tokens": None,
+@@ -107,6 +110,8 @@
+                 "measured": False,
+                 "valid": True,
+             }
++            metrics["current_turn_start"] = self.turn["start"] or None
++            metrics["current_turn_output_tokens"] = 0
+             return
+         if kind in ("task_complete", "turn_aborted"):
+             # Replayed completion events cannot change either the idle epoch or
+@@ -123,6 +128,11 @@
+             if end >= metrics["last_turn_end"]:
+                 metrics["last_turn_end"] = end
+                 metrics["last_turn_seconds"] = duration
++                metrics["last_turn_output_tokens"] = (
++                    pending["output"]
++                    if pending and pending["valid"] and pending["measured"]
++                    else None
++                )
+             if (
+                 kind == "task_complete"
+                 and pending
+@@ -137,6 +147,8 @@
+                 metrics["avg_tps"] = metrics["tps_output_tokens"] / metrics["tps_active_seconds"]
+             if pending:
+                 self.turn = None
++                metrics["current_turn_start"] = None
++                metrics["current_turn_output_tokens"] = None
+             self.last_completed_id = turn_id
+             return
+         if kind != "token_count":
+@@ -184,9 +196,11 @@
+             if self.turn:
+                 if reset:
+                     self.turn["valid"] = False
++                    metrics["current_turn_output_tokens"] = None
+                 else:
+                     self.turn["output"] += out - (previous_out or 0)
+                     self.turn["measured"] = True
++                    metrics["current_turn_output_tokens"] = self.turn["output"]
+         self.last_usage_snapshot = snapshot
+ 
+ 
+--- a/test_api.py
++++ b/test_api.py
+@@ -1567,7 +1567,10 @@
+         codex_home.mkdir()
+         auth_path = codex_home / "auth.json"
+         auth_path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {}}))
+-        with patch("app._active_openai_key", return_value="sk-fallback-not-real"):
++        with (
++            patch("app.CODEX_API_FALLBACK_ENABLED", True),
++            patch("app._active_openai_key", return_value="sk-fallback-not-real"),
++        ):
+             state = app_module._ensure_codex_auth_with_fallback(codex_home, True)
+ 
+         assert state["activeMode"] == "apikey"
+@@ -1586,7 +1589,10 @@
+             "auth_mode": "chatgpt",
+             "tokens": {},
+         }))
+-        with patch("app._active_openai_key", return_value="sk-fallback-not-real"):
++        with (
++            patch("app.CODEX_API_FALLBACK_ENABLED", True),
++            patch("app._active_openai_key", return_value="sk-fallback-not-real"),
++        ):
+             status = app_module._codex_auth_display()
+         assert status["authMode"] == "apikey"
+         assert status["activeMode"] == "apikey"
+@@ -1607,6 +1613,7 @@
+             },
+         }))
+         with (
++            patch("app.CODEX_API_FALLBACK_ENABLED", True),
+             patch("app._active_openai_key", return_value="sk-fallback-not-real"),
+             patch(
+                 "app._codex_app_server_account_read",
+@@ -4869,7 +4876,7 @@
+ # ---------------------------------------------------------------------------
+ 
+ class TestOpenAIKeyFunctions:
+-    """OpenAI API keys are stored privately and mirrored into Codex auth.json."""
++    """OpenAI API keys stay private and only become Codex auth when enabled."""
+ 
+     def test_load_returns_key_from_file(self, tmp_path):
+         import app as _app
+@@ -4904,13 +4911,25 @@
+         codex_home = tmp_path / ".codex"
+         with patch.object(_app, "OPENAI_KEY_FILE", key_file), \
+              patch.object(_app, "CODEX_HOME", codex_home), \
++             patch.object(_app, "CODEX_API_FALLBACK_ENABLED", False), \
+              patch("app.MESSAGES_DIR", tmp_path):
+             _app._save_openai_key("sk-new-not-real")
+         assert key_file.exists()
+         assert key_file.read_text() == "sk-new-not-real"
++        assert not (codex_home / "auth.json").exists()
++        assert (key_file.stat().st_mode & 0o777) == 0o600
++
++    def test_save_mirrors_key_into_codex_auth_when_fallback_enabled(self, tmp_path):
++        import app as _app
++        key_file = tmp_path / "openai_api_key"
++        codex_home = tmp_path / ".codex"
++        with patch.object(_app, "OPENAI_KEY_FILE", key_file), \
++             patch.object(_app, "CODEX_HOME", codex_home), \
++             patch.object(_app, "CODEX_API_FALLBACK_ENABLED", True), \
++             patch("app.MESSAGES_DIR", tmp_path):
++            _app._save_openai_key("sk-new-not-real")
+         auth = json.loads((codex_home / "auth.json").read_text())
+         assert auth == {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-new-not-real"}
+-        assert (key_file.stat().st_mode & 0o777) == 0o600
+         assert ((codex_home / "auth.json").stat().st_mode & 0o777) == 0o600
+ 
+     def test_save_handles_write_exception(self, tmp_path):
+--- /dev/null
++++ b/test_browser_mcp_lease_proxy.py
+@@ -0,0 +1,86 @@
++import os
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++import browser_mcp_lease_proxy as proxy
++
++
++def test_missing_local_playwright_cli_uses_pinned_package_runner(monkeypatch, tmp_path):
++    monkeypatch.setattr(proxy, "_host_home", lambda: tmp_path)
++    monkeypatch.setattr(proxy, "BROWSER_CDP_PORT", 9333)
++    monkeypatch.setattr(proxy, "BROWSER_OUTPUT_DIR", Path("/tmp/browser-output"))
++
++    assert proxy._default_upstream_command() == [
++        "npx",
++        "--yes",
++        "@playwright/mcp@0.0.82",
++        "--cdp-endpoint",
++        "http://127.0.0.1:9333",
++        "--output-dir",
++        "/tmp/browser-output",
++    ]
++
++
++def test_upstream_environment_skips_browser_download_by_default(monkeypatch):
++    monkeypatch.delenv("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", raising=False)
++
++    assert proxy._upstream_environment()["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] == "1"
++
++
++@pytest.mark.parametrize("shutdown", ("eof", "terminate"))
++def test_proxy_reaps_upstream_descendants_on_shutdown(tmp_path, shutdown):
++    child_pid_file = tmp_path / "child.pid"
++    stub = tmp_path / "stub_upstream.py"
++    stub.write_text(
++        "import subprocess, sys\n"
++        "from pathlib import Path\n"
++        "child = subprocess.Popen([sys.executable, '-c', "
++        "'import time; time.sleep(60)'], stdin=subprocess.DEVNULL, "
++        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
++        "Path(sys.argv[1]).write_text(str(child.pid))\n"
++        "sys.stdin.buffer.read()\n"
++    )
++    runner = subprocess.Popen(
++        [sys.executable, proxy.__file__, sys.executable, str(stub), str(child_pid_file)],
++        stdin=subprocess.PIPE,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++    child_pid = 0
++    child_gone = False
++    try:
++        deadline = time.monotonic() + 5
++        while time.monotonic() < deadline and not child_pid_file.exists():
++            time.sleep(0.02)
++        if not child_pid_file.exists():
++            raise TimeoutError("stub upstream did not start its child")
++        child_pid = int(child_pid_file.read_text())
++        if shutdown == "eof":
++            runner.stdin.close()
++        else:
++            runner.terminate()
++        runner.wait(timeout=5)
++        deadline = time.monotonic() + 3
++        while time.monotonic() < deadline:
++            try:
++                os.kill(child_pid, 0)
++            except ProcessLookupError:
++                child_gone = True
++                break
++            time.sleep(0.02)
++    finally:
++        if runner.poll() is None:
++            runner.kill()
++            runner.wait(timeout=3)
++        if child_pid and not child_gone:
++            try:
++                os.kill(child_pid, signal.SIGKILL)
++            except ProcessLookupError:
++                pass
++
++    assert child_gone
+--- /dev/null
++++ b/test_builder6_plan_auth.py
+@@ -0,0 +1,278 @@
++import asyncio
++import json
++from unittest.mock import MagicMock, patch
++
++import app
++
++
++def _chatgpt_auth():
++    return {
++        "auth_mode": "chatgpt",
++        "tokens": {
++            "access_token": "access-not-real",
++            "refresh_token": "refresh-not-real",
++            "id_token": "id-not-real",
++        },
++    }
++
++
++def test_disabled_api_fallback_never_rewrites_chatgpt_auth(tmp_path, monkeypatch):
++    codex_home = tmp_path / "codex"
++    codex_home.mkdir()
++    auth_path = codex_home / "auth.json"
++    original = _chatgpt_auth()
++    auth_path.write_text(json.dumps(original))
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++    monkeypatch.setattr(app, "_active_openai_key", lambda: "sk-fallback-not-real")
++    monkeypatch.setattr(
++        app,
++        "_codex_app_server_account_read",
++        lambda *_args, **_kwargs: {"ok": False, "error": "temporary timeout"},
++    )
++
++    state = app._ensure_codex_auth_with_fallback(codex_home, True)
++
++    assert (
++        state["activeMode"],
++        state["fallbackActive"],
++        bool(state["authError"]),
++        json.loads(auth_path.read_text()),
++    ) == (
++        "unknown",
++        False,
++        True,
++        original,
++    )
++
++
++def test_plan_only_policy_rejects_existing_api_auth(tmp_path, monkeypatch):
++    codex_home = tmp_path / "codex"
++    codex_home.mkdir()
++    auth_path = codex_home / "auth.json"
++    api_auth = {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-existing-not-real"}
++    auth_path.write_text(json.dumps(api_auth))
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++
++    state = app._ensure_codex_auth_with_fallback(codex_home, False)
++
++    assert (state["activeMode"], state["loggedIn"], bool(state["authError"])) == (
++        "unknown",
++        False,
++        True,
++    )
++
++
++def test_saving_auxiliary_api_key_preserves_plan_auth(tmp_path, monkeypatch):
++    codex_home = tmp_path / "codex"
++    codex_home.mkdir()
++    auth_path = codex_home / "auth.json"
++    original = _chatgpt_auth()
++    auth_path.write_text(json.dumps(original))
++    key_file = tmp_path / "openai_api_key"
++    monkeypatch.setattr(app, "CODEX_HOME", codex_home)
++    monkeypatch.setattr(app, "OPENAI_KEY_FILE", key_file)
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++    monkeypatch.setattr(app, "_stored_openai_key", "")
++
++    app._save_openai_key("sk-auxiliary-not-real")
++
++    assert (key_file.read_text(), json.loads(auth_path.read_text())) == (
++        "sk-auxiliary-not-real",
++        original,
++    )
++
++
++def test_plan_only_app_server_does_not_inherit_api_credentials(tmp_path, monkeypatch):
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-not-real")
++    monkeypatch.setenv("CODEX_API_KEY", "sk-codex-not-real")
++    captured = {}
++
++    def fake_popen(*args, **kwargs):
++        captured["env"] = kwargs["env"]
++        return MagicMock()
++
++    monkeypatch.setattr(app.subprocess, "Popen", fake_popen)
++
++    app._codex_app_server_process(tmp_path)
++
++    assert {name for name in ("OPENAI_API_KEY", "CODEX_API_KEY") if name in captured["env"]} == set()
++
++
++def test_routine_account_probe_never_forces_token_refresh(tmp_path):
++    process = MagicMock()
++    account = {"type": "chatgpt", "email": "person@example.com", "planType": "pro"}
++    with (
++        patch("app._codex_app_server_process", return_value=process),
++        patch("app._codex_app_server_initialize"),
++        patch("app._codex_app_server_send") as send,
++        patch("app._codex_app_server_wait", return_value={"result": {"account": account}}),
++        patch("app._terminate_codex_app_server"),
++    ):
++        result = app._codex_app_server_account_read(tmp_path)
++
++    assert (result, send.call_args.args[1]["params"]["refreshToken"]) == (
++        {"ok": True, "account": account},
++        False,
++    )
++
++
++def test_auth_status_exposes_api_fallback_policy(tmp_path, monkeypatch):
++    monkeypatch.setattr(app, "CODEX_HOME", tmp_path)
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++    monkeypatch.setattr(
++        app,
++        "_ensure_codex_auth_with_fallback",
++        lambda *_args, **_kwargs: {
++            "loggedIn": False,
++            "activeMode": "unknown",
++            "configuredMode": "unknown",
++            "fallbackActive": False,
++            "fallbackReason": "",
++            "authError": "ChatGPT plan login is required",
++            "account": {},
++        },
++    )
++
++    result = app._codex_auth_display()
++
++    assert (result["apiFallbackEnabled"], result["authError"]) == (
++        False,
++        "ChatGPT plan login is required",
++    )
++
++
++def test_plan_limits_read_does_not_gate_rate_limits_on_account_probe(monkeypatch):
++    validate_values = []
++
++    def fake_auth(_codex_home, validate_chatgpt):
++        validate_values.append(validate_chatgpt)
++        return {"activeMode": "chatgpt", "account": {}}
++
++    monkeypatch.setattr(app, "_ensure_codex_auth_with_fallback", fake_auth)
++    monkeypatch.setattr(
++        app,
++        "_codex_app_server_rate_limits",
++        lambda _codex_home: {
++            "rateLimits": {
++                "limitId": "codex",
++                "planType": "pro",
++                "primary": {
++                    "usedPercent": 99,
++                    "windowDurationMins": 10_080,
++                    "resetsAt": 1_790_222_546,
++                },
++                "secondary": None,
++            }
++        },
++    )
++    monkeypatch.setattr(app, "_openai_limits_cache", {"ts": 0, "data": None})
++
++    response = asyncio.run(app.api_openai_usage_limits())
++
++    assert (validate_values, response.status_code) == ([False], 200)
++
++
++def test_health_state_preserves_plan_only_auth_error(monkeypatch):
++    monkeypatch.setattr(
++        app,
++        "_ensure_codex_auth_with_fallback",
++        lambda *_args, **_kwargs: {
++            "loggedIn": False,
++            "activeMode": "unknown",
++            "fallbackActive": False,
++            "fallbackReason": "",
++            "authError": "ChatGPT plan login is required",
++        },
++    )
++    monkeypatch.setattr(app, "_publish_codex_auth_state", lambda _state: None)
++    monkeypatch.setattr(
++        app,
++        "_codex_health_auth",
++        {"ts": 0.0, "loggedIn": True, "reason": ""},
++    )
++
++    state = asyncio.run(app._codex_auth_health(force=True))
++
++    assert state["reason"] == "ChatGPT plan login is required"
++
++
++def test_plan_only_member_provisioning_does_not_seed_api_auth(tmp_path, monkeypatch):
++    codex_home = tmp_path / "member"
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++    monkeypatch.setattr(app, "TEAM_MODE", False)
++    monkeypatch.setattr(app, "_user_codex_config_dir", lambda _user: codex_home)
++    monkeypatch.setattr(app, "_active_openai_key", lambda: "sk-provision-not-real")
++    monkeypatch.setattr(app, "_is_admin", lambda _user: False)
++    monkeypatch.setattr(app, "_remove_legacy_global_context_from_agents", lambda *_args: None)
++    monkeypatch.setattr(app, "_sync_group_context_into", lambda *_args: None)
++    monkeypatch.setattr(app, "_materialize_member_skills", lambda *_args: None)
++    monkeypatch.setattr(app, "_sync_git_rules_into", lambda *_args: None)
++    monkeypatch.setattr(app, "_configure_member_codex_isolation", lambda *_args: None)
++    monkeypatch.setattr(app, "_set_member_codex_permissions", lambda *_args: None)
++
++    app._ensure_user_codex_config_dir({"id": "member", "username": "Member", "role": "user"})
++
++    assert not (codex_home / "auth.json").exists()
++
++
++def test_plan_only_missing_shared_auth_does_not_seed_member_api(tmp_path, monkeypatch):
++    admin_home = tmp_path / "admin"
++    member_home = tmp_path / "member"
++    monkeypatch.setattr(app, "CODEX_HOME", admin_home)
++    monkeypatch.setattr(app, "SHARED_CODEX_AUTH", admin_home / "auth.json")
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++    monkeypatch.setattr(app, "_active_openai_key", lambda: "sk-member-not-real")
++
++    mode = app._apply_member_auth(member_home)
++
++    assert (mode, (member_home / "auth.json").exists()) == ("unconfigured", False)
++
++
++def test_enabled_fallback_can_seed_missing_member_auth(tmp_path, monkeypatch):
++    admin_home = tmp_path / "admin"
++    member_home = tmp_path / "member"
++    monkeypatch.setattr(app, "CODEX_HOME", admin_home)
++    monkeypatch.setattr(app, "SHARED_CODEX_AUTH", admin_home / "auth.json")
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", True)
++    monkeypatch.setattr(app, "_active_openai_key", lambda: "sk-member-not-real")
++
++    mode = app._apply_member_auth(member_home)
++
++    assert (mode, json.loads((member_home / "auth.json").read_text())["auth_mode"]) == (
++        "api",
++        "apikey",
++    )
++
++
++def test_plan_only_member_shares_existing_chatgpt_auth(tmp_path, monkeypatch):
++    admin_home = tmp_path / "admin"
++    member_home = tmp_path / "member"
++    admin_home.mkdir()
++    shared_auth = admin_home / "auth.json"
++    shared_auth.write_text(json.dumps(_chatgpt_auth()))
++    monkeypatch.setattr(app, "CODEX_HOME", admin_home)
++    monkeypatch.setattr(app, "SHARED_CODEX_AUTH", shared_auth)
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++
++    mode = app._apply_member_auth(member_home)
++
++    assert (mode, (member_home / "auth.json").resolve()) == ("subscription", shared_auth)
++
++
++def test_plan_only_member_does_not_share_existing_api_auth(tmp_path, monkeypatch):
++    admin_home = tmp_path / "admin"
++    member_home = tmp_path / "member"
++    admin_home.mkdir()
++    shared_auth = admin_home / "auth.json"
++    shared_auth.write_text(json.dumps({
++        "auth_mode": "apikey",
++        "OPENAI_API_KEY": "sk-shared-not-real",
++    }))
++    monkeypatch.setattr(app, "CODEX_HOME", admin_home)
++    monkeypatch.setattr(app, "SHARED_CODEX_AUTH", shared_auth)
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++
++    mode = app._apply_member_auth(member_home)
++
++    assert (mode, (member_home / "auth.json").exists()) == ("unconfigured", False)
+--- /dev/null
++++ b/test_builder6_plan_launch.py
+@@ -0,0 +1,29 @@
++"""A plan-only dashboard cannot launch Codex using an inherited API login."""
++import shlex
++
++import app
++
++
++def test_plan_only_launch_requires_chatgpt_even_with_api_auth_file(monkeypatch, tmp_path):
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
++    (tmp_path / "config.toml").write_text("")
++    command = shlex.split(app._launch_codex_cmd("codex --yolo", codex_home=tmp_path))
++    assert 'forced_login_method="chatgpt"' in command
++    for key in ("OPENAI_API_KEY", "CODEX_API_KEY"):
++        index = command.index(key)
++        assert command[index - 1] == "-u"
++
++
++def test_explicit_api_launch_is_not_forced_to_chatgpt(monkeypatch, tmp_path):
++    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", True)
++    (tmp_path / "config.toml").write_text("")
++    assert "forced_login_method" not in app._launch_codex_cmd("codex --yolo", codex_home=tmp_path)
++
++
++def test_browser_config_allows_pinned_package_cold_start(monkeypatch, tmp_path):
++    import tomllib
++
++    monkeypatch.setattr(app, "BROWSER_MCP_ENABLED", True)
++    assert app._ensure_browser_mcp(tmp_path)
++    config = tomllib.loads((tmp_path / "config.toml").read_text())
++    assert config["mcp_servers"]["playwright-browser"]["startup_timeout_sec"] >= 60
+--- /dev/null
++++ b/test_builder6_plan_ui.py
+@@ -0,0 +1,68 @@
++"""Plan identity and billing policy must agree in settings and the header."""
++import json
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++NODE = shutil.which("node")
++pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
++
++
++def render(state):
++    driver = r"""
++const fs=require('fs'),vm=require('vm');
++const source=fs.readFileSync(process.argv[1],'utf8'),state=JSON.parse(process.argv[2]);
++const elements={};
++const context=vm.createContext({
++  _authStatus:state,_authCache:state,
++  esc:s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'),
++  document:{getElementById:id=>elements[id]||(elements[id]={style:{}})},
++  chatgptLoginHtml:()=>'',renderUsageHtml:()=>'',
++});
++for(const [start,end] of [
++  ['function renderLoginTab(){','async function startChatgptLogin(){'],
++  ['function renderAuthIndicator(){','function toggleAuthPanel('],
++  ['function renderAuthPanel(){','async function saveApiKey('],
++]){
++  const from=source.indexOf(start),to=source.indexOf(end,from);
++  if(from<0||to<0)throw Error(start);
++  vm.runInContext(source.slice(from,to),context);
++}
++context.renderLoginTab();context.renderAuthIndicator();context.renderAuthPanel();
++process.stdout.write(JSON.stringify(elements));
++"""
++    result = subprocess.run(
++        [NODE, "-e", driver, str(Path(__file__).with_name("app.py")), json.dumps(state)],
++        capture_output=True, text=True, timeout=10,
++    )
++    assert result.returncode == 0, result.stderr
++    return json.loads(result.stdout)
++
++
++def test_plan_settings_show_identity_and_no_automatic_api_fallback():
++    ui = render({"loggedIn": True, "activeMode": "chatgpt", "authMode": "chatgpt",
++                 "email": "owner@example.test", "subscriptionType": "pro",
++                 "hasApiKey": True, "apiFallbackEnabled": False})
++    settings = ui["settings-content"]["innerHTML"]
++    assert "owner@example.test" in settings
++    assert "ChatGPT Pro" in settings
++    assert "API fallback is disabled" in settings
++    assert "automatic fallback if ChatGPT" not in settings
++    assert "Save fallback API key" not in settings
++    assert "Fallback API key" not in ui["auth-dropdown-content"]["innerHTML"]
++
++
++def test_auxiliary_api_key_does_not_claim_codex_is_connected():
++    ui = render({"loggedIn": False, "activeMode": "unknown", "hasApiKey": True,
++                 "apiFallbackEnabled": False})
++    assert ui["codex-auth-label"]["textContent"] == "Not connected"
++    assert "configure a fallback" not in ui["auth-dropdown-content"]["innerHTML"]
++
++
++def test_explicit_api_policy_still_shows_its_billing_controls():
++    ui = render({"loggedIn": True, "activeMode": "apikey", "authMode": "apikey",
++                 "email": "OpenAI API", "subscriptionType": "API key",
++                 "hasApiKey": True, "apiFallbackEnabled": True})
++    assert "Save fallback API key" in ui["settings-content"]["innerHTML"]
+--- /dev/null
++++ b/test_relogin_fence.py
+@@ -0,0 +1,155 @@
++from contextlib import asynccontextmanager
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++import app
++
++
++@asynccontextmanager
++async def _unlocked(*_args, **_kwargs):
++    yield
++
++
++@pytest.mark.parametrize("newer_turn", [True, False])
++@pytest.mark.asyncio
++async def test_exact_relogin_fences_latest_turn(tmp_path, monkeypatch, newer_turn):
++    generation = "a" * 32
++    root = "01a035f8-3188-7c21-8cca-582b01ad3002"
++    completed_turn = "01a0bfee-0cc9-7631-88e7-c506ca163c25"
++    row = {
++        "managed": True,
++        "generation": generation,
++        "owner_id": "admin",
++        "desired_state": "running",
++        "restore_on_startup": True,
++        "resume_uuid": root,
++        "cwd": str(tmp_path),
++        "launch_options": {"model": "gpt-6-astra", "effort": "xhigh"},
++    }
++    run = MagicMock(return_value=MagicMock(returncode=0))
++
++    monkeypatch.setattr(app, "_async_tmux_server_mutation_lock", _unlocked)
++    monkeypatch.setattr(app, "_settings_restart_operation_lock", _unlocked)
++    monkeypatch.setattr(app, "_strict_session_owner", lambda *_: ("admin", {"id": "admin"}))
++    monkeypatch.setattr(app, "_checkpoint_active_session", lambda *_args, **_kwargs: row)
++    monkeypatch.setattr(app._session_lifecycle, "get", lambda *_: row)
++    monkeypatch.setattr(app._session_lifecycle, "matches", lambda *_args, **_kwargs: True)
++    monkeypatch.setattr(app, "_active_session_root_thread_id", lambda *_: root)
++    monkeypatch.setattr(app, "_validated_session_root_thread_id", lambda *_: root)
++    monkeypatch.setattr(app, "_session_generation_is_unused", lambda *_: False)
++    monkeypatch.setattr(app, "_durable_session_cwd", lambda *_: str(tmp_path))
++    monkeypatch.setattr(app, "get_session_cwd", lambda *_: str(tmp_path))
++    monkeypatch.setattr(app, "_exact_tmux_session_id", lambda *_: "$1")
++    monkeypatch.setattr(app, "_tmux_session_matches_owner", lambda *_: True)
++    monkeypatch.setattr(
++        app,
++        "_saved_session_model_effort",
++        lambda *_: ("gpt-6-astra", "xhigh"),
++    )
++    monkeypatch.setattr(
++        app,
++        "_model_recovery_event",
++        lambda *_: {
++            "type": "task_started" if newer_turn else "task_complete",
++            "turn_id": "newer-turn" if newer_turn else completed_turn,
++        },
++    )
++    monkeypatch.setattr(app.subprocess, "run", run)
++    monkeypatch.setattr(app, "_async_is_codex_running", AsyncMock(return_value=False))
++    ensure_running = AsyncMock(return_value=True)
++    monkeypatch.setattr(app, "_ensure_codex_running", ensure_running)
++    monkeypatch.setattr(app.asyncio, "sleep", AsyncMock())
++
++    result = await app._restart_codex_for_session(
++        "builder6",
++        expected_owner_id="admin",
++        expected_generation=generation,
++        expected_resume_uuid=root,
++        completed_turn_id=completed_turn,
++        expected_model="gpt-6-astra",
++        expected_effort="xhigh",
++    )
++
++    if newer_turn:
++        assert result == (False, False)
++        run.assert_not_called()
++        ensure_running.assert_not_awaited()
++    else:
++        assert result == (True, True)
++        assert run.call_count == 2
++        ensure_running.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_relogin_endpoint_passes_exact_fence(monkeypatch):
++    generation = "b" * 32
++    root = "01a035f8-3188-7c21-8cca-582b01ad3002"
++    completed_turn = "01a0bfee-0cc9-7631-88e7-c506ca163c25"
++    restart = AsyncMock(return_value=(True, True))
++    monkeypatch.setattr(app, "_current_user", lambda *_: {"id": "admin"})
++    monkeypatch.setattr(app, "_user_can_access_session", lambda *_: True)
++    monkeypatch.setattr(app, "_async_is_codex_running", AsyncMock(return_value=True))
++    monkeypatch.setattr(app, "_restart_codex_for_session", restart)
++
++    response = await app.api_session_relogin(
++        "builder6",
++        MagicMock(),
++        SimpleNamespace(
++            expected_generation=generation,
++            expected_resume_uuid=root,
++            completed_turn_id=completed_turn,
++            expected_model="gpt-6-astra",
++            expected_effort="xhigh",
++        ),
++    )
++
++    assert response.status_code == 200
++    restart.assert_awaited_once_with(
++        "builder6",
++        expected_owner_id="admin",
++        expected_generation=generation,
++        expected_resume_uuid=root,
++        completed_turn_id=completed_turn,
++        expected_model="gpt-6-astra",
++        expected_effort="xhigh",
++    )
++
++
++@pytest.mark.asyncio
++async def test_relogin_endpoint_empty_body_preserves_legacy_call(monkeypatch):
++    restart = AsyncMock(return_value=(True, True))
++    monkeypatch.setattr(app, "_current_user", lambda *_: {"id": "admin"})
++    monkeypatch.setattr(app, "_user_can_access_session", lambda *_: True)
++    monkeypatch.setattr(app, "_async_is_codex_running", AsyncMock(return_value=True))
++    monkeypatch.setattr(app, "_restart_codex_for_session", restart)
++
++    response = await app.api_session_relogin("builder6", MagicMock())
++
++    assert response.status_code == 200
++    restart.assert_awaited_once_with("builder6")
++
++
++@pytest.mark.asyncio
++async def test_relogin_endpoint_rejects_partial_guard(monkeypatch):
++    restart = AsyncMock(return_value=(True, True))
++    monkeypatch.setattr(app, "_current_user", lambda *_: {"id": "admin"})
++    monkeypatch.setattr(app, "_user_can_access_session", lambda *_: True)
++    monkeypatch.setattr(app, "_async_is_codex_running", AsyncMock(return_value=True))
++    monkeypatch.setattr(app, "_restart_codex_for_session", restart)
++
++    response = await app.api_session_relogin(
++        "builder6",
++        MagicMock(),
++        SimpleNamespace(
++            expected_generation="",
++            expected_resume_uuid="",
++            completed_turn_id="",
++            expected_model="gpt-6-astra",
++            expected_effort="xhigh",
++        ),
++    )
++
++    assert response.status_code == 400
++    restart.assert_not_awaited()
+--- a/test_session_metrics.py
++++ b/test_session_metrics.py
+@@ -99,6 +99,9 @@
+     assert result["last_input_tokens"] == 4000
+     assert result["last_turn_end"] == 1020
+     assert result["last_turn_seconds"] == 20
++    assert result["last_turn_output_tokens"] == 400
++    assert result["current_turn_start"] == 2000
++    assert result["current_turn_output_tokens"] == 500
+     assert result["cache_last_activity"] == 2010
+     assert result["cache_model"] == "gpt-6-astra"
+     assert result["tps_completed_turns"] == 2
+@@ -296,7 +299,7 @@
+ 
+ def _facts_boundary(tmp_path):
+     path = tmp_path / "rollout.jsonl"
+-    save(path, [meta(), model(), usage(100, 2000, 100)])
++    save(path, [meta(), model(), event("task_started", 90, turn_id="current"), usage(100, 2000, 100)])
+     owner = {"id": "owner"}
+     lifecycle = {"generation": "generation", "resume_uuid": ROOT}
+     state = {"owner": owner, "lifecycle": lifecycle}
+@@ -336,6 +339,8 @@
+     assert result["detect_sure"] is True
+     assert result["last_input_tokens"] == 2000
+     assert result["cache_last_activity"] == 100
++    assert result["current_turn_start"] == 90
++    assert result["current_turn_output_tokens"] == 100
+     api._find_session_transcript_uuid.assert_not_called()
+     api._codex_session_payload("tab")
+     assert api._open_session_close_rollout.call_count == 1
+--- a/test_session_telemetry_ui.py
++++ b/test_session_telemetry_ui.py
+@@ -38,7 +38,7 @@
+ }
+ function setup(options={}){
+   const elements={};
+-  for(const prefix of ['term-live-','status-','tl-verb-','tl-time-','tl-tok-','tl-since-','tl-total-','tl-ctx-','tl-tps-','tl-note-']){
++  for(const prefix of ['term-live-','status-','tl-verb-','tl-time-','tl-tok-','tl-since-','tl-cache-','tl-total-','tl-ctx-','tl-tps-','tl-note-']){
+     elements[prefix+'alpha']=makeElement();
+   }
+   let ticker;
+@@ -47,7 +47,8 @@
+     Date:class extends Date{static now(){return now*1000}},
+     Math,Number,String,JSON,Set,Promise,
+     sessions:[{...base,...options.session}],selectedSession:'alpha',rawState,
+-    CACHE_WARN_LEAD:600,_currentUser:{id:'admin'},
++    CACHE_WARN_LEAD:600,CACHE_ALERT_LEAD:900,_currentUser:{id:'admin'},
++    getIdleNudgeMode:()=> 'normal',
+     localStorage:{getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value)},
+     document:{getElementById:id=>elements[id]||null},
+     window:{performance:{now:()=>now*1000}},performance:{now:()=>now*1000},
+@@ -57,7 +58,9 @@
+     setTimeout:()=>1,
+     _completionAudioPrimed:options.primed!==false,
+     _completionAudioCtx:{state:options.audioState||'running',currentTime:0,destination:{},
+-      createGain:()=>({gain:{setValueAtTime(){}},connect(){},disconnect(){}})},
++      createGain:()=>({gain:{setValueAtTime(){},exponentialRampToValueAtTime(){}},connect(){},disconnect(){}}),
++      createOscillator:()=>({frequency:{setValueAtTime(){}},connect(){},disconnect(){},
++        start(at){beeps.push({start:at})},stop(){},onended:null})},
+     _glassPartial:(ctx,master,freq,start,duration,volume)=>beeps.push({freq,start,duration,volume}),
+   });
+   vm.runInContext(region,context);
+@@ -84,7 +87,7 @@
+   if(scenario==='timeline'){
+     const {context:c,elements,tick}=setup();
+     const states=[];
+-    for(const offset of [0,1199,1200,1500,1800,1900]){
++    for(const offset of [0,899,900,1500,1800,1900]){
+       now=10000+offset;
+       c.updateLiveBar('alpha');
+       tick();
+@@ -166,6 +169,14 @@
+     const overflow=snapshot(elements);
+     return {measured,missing,overflow};
+   }
++  if(scenario==='cache-chip'){
++    const {context:c,elements}=setup();
++    c.updateLiveBar('alpha');
++    const hot=snapshot(elements);
++    now=11801;
++    c.updateLiveBar('alpha');
++    return {hot,cold:snapshot(elements)};
++  }
+   if(scenario==='separate-duration-and-idle'){
+     const {context:c,elements,tick}=setup();
+     c.updateLiveBar('alpha');
+@@ -188,6 +199,20 @@
+     now+=10;
+     tick();
+     return {initial,afterTime,afterPoll,afterHour,unknown,busy,busyLater:snapshot(elements)};
++  }
++  if(scenario==='backend-turn-timing-and-tokens'){
++    const {context:c,elements,tick}=setup({session:{activity_status:'busy',
++      current_turn_start:9992,current_turn_output_tokens:22400,last_turn_output_tokens:400}});
++    Object.assign(c.rawState.alpha.live,{sec:null,seen:false,done:true,at:0,tok:'',dir:''});
++    c.updateLiveBar('alpha');
++    const busy=snapshot(elements);
++    now+=10;
++    tick();
++    const busyLater=snapshot(elements);
++    Object.assign(c.sessions[0],{activity_status:'idle',current_turn_start:null,
++      current_turn_output_tokens:null,last_turn_output_tokens:22400});
++    c.updateLiveBar('alpha');
++    return {busy,busyLater,idle:snapshot(elements)};
+   }
+   if(scenario==='missing-completion'){
+     const {context:c,elements}=setup({session:{last_turn_end:0,last_turn_seconds:null}});
+@@ -235,22 +260,22 @@
+     assert [row["state"]["phase"] for row in rows] == [
+         "warm", "warm", "warning", "warning", "cold", "cold",
+     ]
+-    assert [row["beeps"] for row in rows] == [0, 0, 2, 2, 2, 2]
+-    assert rows[1]["status"] == "Idle 19m 59s"
++    assert [row["beeps"] for row in rows] == [0, 0, 4, 4, 4, 4]
++    assert rows[1]["status"] == "Idle 14m 59s"
+     assert rows[1]["since"] == ""
+     assert "expiring" in rows[2]["pill"]
+     assert "cache-expiring" in rows[2]["bar"]
+     assert "cache is cold (estimated)" in rows[4]["since"]
+     assert "expiring" not in rows[4]["pill"]
+     assert "cache-expiring" not in rows[4]["bar"]
+-    assert result["beeps"][1]["start"] - result["beeps"][0]["start"] == pytest.approx(0.24)
++    assert result["beeps"][1]["start"] - result["beeps"][0]["start"] == pytest.approx(0.14)
+ 
+ 
+ def test_cache_chime_survives_polls_reload_and_resets_for_new_requests():
+     result = run_scenario("dedupe-and-new-work")
+-    assert result["afterPolls"] == result["afterReload"] == result["afterSameEpoch"] == 2
+-    assert result["afterNewEpoch"] == 4
+-    assert result["afterNewThread"] == 6
++    assert result["afterPolls"] == result["afterReload"] == result["afterSameEpoch"] == 4
++    assert result["afterNewEpoch"] == 8
++    assert result["afterNewThread"] == 12
+     assert result["busy"]["tl-since-alpha"]["text"] == ""
+     assert "cache-expiring" not in result["busy"]["term-live-alpha"]["classes"]
+ 
+@@ -260,7 +285,7 @@
+     assert result["locked"]["beeps"] == result["locked"]["records"] == 0
+     assert "cache-expiring" in result["locked"]["bar"]
+     assert result["suspended"] == {"beeps": 0, "records": 0}
+-    assert result["unlocked"] == {"beeps": 2, "records": 1}
++    assert result["unlocked"] == {"beeps": 4, "records": 1}
+ 
+ 
+ def test_no_cache_warning_without_cacheable_request_or_while_busy():
+@@ -293,6 +318,14 @@
+     assert result["overflow"]["tl-tps-alpha"]["text"] == "avg 0.0 tps"
+ 
+ 
++def test_cache_chip_states_hot_or_cold_in_plain_words_and_color_classes():
++    result = run_scenario("cache-chip")
++    assert result["hot"]["tl-cache-alpha"]["text"] == "Cache hot"
++    assert "hot" in result["hot"]["tl-cache-alpha"]["classes"].split()
++    assert result["cold"]["tl-cache-alpha"]["text"] == "Cache cold"
++    assert "cold" in result["cold"]["tl-cache-alpha"]["classes"].split()
++
++
+ def test_shared_status_strip_updates_in_chat_and_terminal_and_keeps_unknowns_visible():
+     result = run_scenario("shared-views")
+     assert result["chat"]["tl-total-alpha"]["text"] == "session 1.2M tokens"
+@@ -304,7 +337,7 @@
+ 
+ def test_tabs_share_alert_claim_and_busy_transition_cancels_queued_sound():
+     result = run_scenario("cross-tab-lock")
+-    assert result == {"acrossTabs": 2, "afterBusyWhileWaiting": 2}
++    assert result == {"acrossTabs": 4, "afterBusyWhileWaiting": 4}
+ 
+ 
+ def test_known_cache_deadline_is_shown_without_a_completion_timestamp():
+@@ -315,7 +348,7 @@
+     assert result["cold"]["tl-since-alpha"]["text"] == "cache is cold (estimated)"
+     assert "completion time is unavailable" in result["cold"]["tl-verb-alpha"]["title"]
+     assert "cache-expiring" not in result["cold"]["term-live-alpha"]["classes"]
+-    assert result["beeps"] == 2
++    assert result["beeps"] == 4
+ 
+ 
+ def test_last_turn_duration_stays_fixed_while_only_idle_counter_ticks():
+@@ -334,6 +367,15 @@
+     assert result["busyLater"]["tl-since-alpha"]["text"] == ""
+ 
+ 
++def test_backend_metrics_fill_turn_clock_and_output_when_terminal_redraw_is_missing():
++    result = run_scenario("backend-turn-timing-and-tokens")
++    assert result["busy"]["tl-time-alpha"]["text"] == "8s"
++    assert result["busy"]["tl-tok-alpha"]["text"] == "↓ 22.4k tokens"
++    assert result["busyLater"]["tl-time-alpha"]["text"] == "18s"
++    assert result["idle"]["tl-time-alpha"]["text"] == "last turn 6m 32s"
++    assert result["idle"]["tl-tok-alpha"]["text"] == "↓ 22.4k tokens"
++
++
+ def test_reduced_motion_keeps_the_warning_visible_without_flashing():
+     source = APP.read_text()
+     reduced = source.split("@media (prefers-reduced-motion:reduce){", 1)[1].split("/* Working", 1)[0]
