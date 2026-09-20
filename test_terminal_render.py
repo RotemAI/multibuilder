@@ -208,6 +208,19 @@ def test_a_markdown_bullet_is_not_mistaken_for_the_footer():
     assert "docs · /home/x" in text
 
 
+def test_clean_view_hides_wrapped_edit_preview_with_line_number_context_row():
+    pane = "\n".join([
+        "• Edited ~/project/tests/",
+        "test_example.py (+2 -1)",
+        "    110",
+        "    111 -old_call()",
+        "    111 +new_call()",
+        "• The change is ready.",
+    ])
+
+    assert _run(pane)["clean"] == ["• The change is ready."]
+
+
 def test_raw_view_passes_the_pane_through_untouched():
     out = _run(PANE, clean_view=False)
     assert "CODEX_HOME=" in "\n".join(out["clean"])

@@ -28152,6 +28152,10 @@ body.member-simple .nav-codex-alert{display:none !important}
 .key-btn.key-slash{color:#d2a8ff;border-color:#d2a8ff44;font-size:.68rem}
 .key-btn.key-slash:hover{background:#d2a8ff22;color:#f0f6fc;border-color:#d2a8ff88}
 .key-bar-sep{width:1px;height:18px;background:#30363d;margin:0 2px}
+.key-button-row{display:flex;align-items:center;gap:4px;width:100%;min-width:0;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}
+.key-button-row .key-btn{padding:4px 7px;font-size:.68rem}
+.key-button-row .key-bar-label{margin-right:1px}
+.key-button-row .key-bar-sep{flex:0 0 1px;margin:0 1px}
 /* Saved project keys/URLs/files inside the Keys & Commands drawer */
 .key-saved{width:100%;display:flex;flex-direction:column;margin-top:8px;padding-top:8px;border-top:1px solid #21262d}
 .key-saved-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:.65rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
@@ -28766,10 +28770,13 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.working{border-color:#d29922}
 .nav-browser-badge.working .nbb-glyph{filter:none}
 .nav-plan-bars{display:flex;flex-direction:column;justify-content:center;gap:2px;font-size:10px;flex-shrink:0}
+.nav-plan-account{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b949e;font-size:.52rem;line-height:1;text-align:center}
 .nav-plan-window{display:flex;align-items:center;gap:5px;white-space:nowrap;line-height:1}
 .nav-plan-window>span:first-child{min-width:22px;color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;text-transform:uppercase}
 .nav-plan-window>span:last-child{width:26px;text-align:right;color:#c9d1d9;font-size:.6rem;font-weight:600;font-variant-numeric:tabular-nums}
-.nav-plan-window .nav-usage-bar{display:inline-block;width:22px;height:4px}
+.nav-plan-meter{display:inline-flex;flex-direction:column;align-items:center;gap:1px;width:22px}
+.nav-plan-reset{height:7px;color:#8b949e;font-size:.48rem;line-height:7px;font-variant-numeric:tabular-nums}
+.nav-plan-window .nav-usage-bar{display:block;width:22px;height:4px}
 .message-jumped{background:#263f28;border-radius:4px;outline:1px solid #3fb950}
 @media(max-width:600px){.nav-plan-bars{font-size:9px}.nav-plan-window .nav-usage-bar,.nav-stat-bar{width:20px}}
 
@@ -28798,8 +28805,9 @@ body.member-simple .hide-in-simple{display:none!important}
     <span class="nav-compact-stat" id="nav-usage-cap-summary" style="display:none" title="Codex plan usage cap">Usage cap: <span class="stat-val" id="nav-usage-cap-value">&mdash;</span></span>
   </span>
   <span class="nav-plan-bars" aria-label="Codex plan usage">
-    <span id="plan-primary" class="nav-plan-window" style="display:none"><span id="plan-primary-label"></span><span class="nav-usage-bar" id="plan-primary-meter" role="progressbar" aria-label="Primary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-primary-fill"></span></span><span id="plan-primary-value"></span></span>
-    <span id="plan-secondary" class="nav-plan-window" style="display:none"><span id="plan-secondary-label"></span><span class="nav-usage-bar" id="plan-secondary-meter" role="progressbar" aria-label="Secondary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-secondary-fill"></span></span><span id="plan-secondary-value"></span></span>
+    <span class="nav-plan-account" id="plan-account"></span>
+    <span id="plan-primary" class="nav-plan-window" style="display:none"><span id="plan-primary-label"></span><span class="nav-plan-meter"><span class="nav-plan-reset" id="plan-primary-reset"></span><span class="nav-usage-bar" id="plan-primary-meter" role="progressbar" aria-label="Primary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-primary-fill"></span></span></span><span id="plan-primary-value"></span></span>
+    <span id="plan-secondary" class="nav-plan-window" style="display:none"><span id="plan-secondary-label"></span><span class="nav-plan-meter"><span class="nav-plan-reset" id="plan-secondary-reset"></span><span class="nav-usage-bar" id="plan-secondary-meter" role="progressbar" aria-label="Secondary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-secondary-fill"></span></span></span><span id="plan-secondary-value"></span></span>
   </span>
   <button class="nav-browser-badge bad" id="nav-browser-badge" type="button" title="Browser not connected" aria-label="Browser not connected" onclick="onBrowserBadgeClick()">
     <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
@@ -29133,7 +29141,9 @@ function _wrappedFileOpHeader(lines,start){
     if(_CODEX_FILEOP_RE.test(header)){
       let next=j+1;
       while(next<lines.length&&!lines[next].trim())next++;
-      return next<lines.length&&_CODEX_DIFF_ROW_RE.test(lines[next]);
+      // Current Codex edit previews can begin with a context line that contains
+      // only its line number. The signed change rows follow it.
+      return next<lines.length&&(_CODEX_DIFF_ROW_RE.test(lines[next])||/^\s+\d+\s*$/.test(lines[next]));
     }
   }
   return false;
@@ -30133,8 +30143,10 @@ function _historyEntryNode(entry){
 }
 function _paintHistoryControl(name,parts,h){
   parts.button.disabled=h.loading||h.atStart;
-  parts.button.textContent=h.loading?'Loading earlier history…':h.atStart?'Beginning of session':h.error?'Retry earlier history':'Load earlier history';
-  parts.note.textContent=h.error||(!h.loaded?'Scroll up to load the saved conversation from its beginning.':h.atStart&&!h.entries.length?'No saved conversation messages yet.':'Saved session history');
+  parts.button.style.display=h.error?'':'none';
+  parts.button.textContent='Retry full session history';
+  parts.control.style.display=(h.loading||h.error)?'flex':'none';
+  parts.note.textContent=h.error||(h.loading?'Loading full session history…':h.atStart&&!h.entries.length?'No saved conversation messages yet.':'Saved session history');
   parts.divider.hidden=!h.loaded;
 }
 function _terminalParts(name){
@@ -30153,7 +30165,7 @@ function _terminalParts(name){
     divider.className='terminal-history-divider';divider.textContent='Live terminal · recent output';
     live.id='raw-live-'+name;
     control.append(button,note);history.append(control,entries,divider);scroll.append(history,live);
-    parts={scroll,history,button,note,entries,divider,live};scroll._terminalParts=parts;
+    parts={scroll,history,control,button,note,entries,divider,live};scroll._terminalParts=parts;
   }
   if(parts.state!==h){
     parts.entries.textContent='';
@@ -30170,9 +30182,10 @@ async function loadTerminalHistory(name){
   const incarnation=_sessionLogicalIncarnation(name);
   h.loading=true;h.error='';_paintHistoryControl(name,parts,h);
   try{
-    let data;
-    // Tool/reasoning-only pages advance the source cursor without adding a
-    // single visible row. Keep paging: no new scroll event can occur at the top.
+    let data,incoming=[];
+    // Exhaust the saved transcript in one request cycle. The terminal should
+    // open as one continuous scroll area, including tool-only pages that add no
+    // visible rows in clean mode.
     do{
       const url=BASE+'/api/sessions/'+encodeURIComponent(name)+'/terminal-history?tools='+h.tools+(h.cursor?'&cursor='+encodeURIComponent(h.cursor):'');
       const response=await fetch(url,{cache:'no-store'});
@@ -30182,18 +30195,19 @@ async function loadTerminalHistory(name){
         if(response.status===409){h.cursor='';h.loaded=false;h.entries=[];parts.state=null;}
         throw Error(data.error||'Could not load earlier history');
       }
-      if(data.at_start||(Array.isArray(data.entries)&&data.entries.length))break;
+      const page=Array.isArray(data.entries)?data.entries:[];
+      incoming=page.concat(incoming);
+      if(data.at_start){h.atStart=true;h.cursor='';break;}
       if(!data.cursor||data.cursor===h.cursor)throw Error('Earlier history did not advance. Retry loading it.');
       h.cursor=data.cursor;
     }while(true);
     const current=_terminalParts(name);
     if(!current)return;
     const top=current.scroll.scrollTop,height=current.scroll.scrollHeight;
-    const incoming=Array.isArray(data.entries)?data.entries:[];
     const fragment=document.createDocumentFragment();
     incoming.forEach(entry=>fragment.appendChild(_historyEntryNode(entry)));
     current.entries.insertBefore(fragment,current.entries.firstChild);
-    h.entries=incoming.concat(h.entries);h.cursor=data.cursor||'';h.loaded=true;h.atStart=!!data.at_start;
+    h.entries=incoming.concat(h.entries);h.loaded=true;
     _paintHistoryControl(name,current,h);
     // Keep the same line under the reader while older pages appear above it.
     st.userScrolledUp=true;
@@ -32139,7 +32153,9 @@ function switchTab(name,tab){
       const rawEl=document.getElementById('raw-'+name),cached=rawCache[name];
       if(rawEl&&cached)_setRawScroll(rawEl,cached.scrollTop||0);
     }
-    startRawPolling(name);updateFreezeUi(name);
+    startRawPolling(name);
+    if(typeof loadTerminalHistory==='function')loadTerminalHistory(name);
+    updateFreezeUi(name);
   }
   if(tab==='info'){
     startStatsPolling(name);
@@ -33087,6 +33103,7 @@ async function loadRaw(name){
   if(infoEl)infoEl.textContent='Loading terminal...';
   stopRawPolling(name);
   startRawPolling(name);
+  if(typeof loadTerminalHistory==='function')loadTerminalHistory(name);
 }
 
 function updateStatusPill(name,status,detail){
@@ -33588,6 +33605,9 @@ function _applyUsageStyle(fillEl,pctNum){
   else if(pctNum>=70)cls='warn';
   fillEl.className='nav-usage-fill'+(cls?' '+cls:'');
 }
+function _compactResetTime(iso){
+  return _fmtResetTime(iso).replace(/^in\s+/, '');
+}
 function _setUsageWindow(slot,windowData){
   const navWrap=document.getElementById('nav-usage-'+slot+'-wrap');
   const visible=!!windowData;
@@ -33611,6 +33631,7 @@ function _setUsageWindow(slot,windowData){
   if(top){
     top.title=title;
     document.getElementById('plan-'+slot+'-label').textContent=label;
+    document.getElementById('plan-'+slot+'-reset').textContent=windowData.resets_at?_compactResetTime(windowData.resets_at):'';
     document.getElementById('plan-'+slot+'-value').textContent=pct+'%';
     const meter=document.getElementById('plan-'+slot+'-meter');
     meter.setAttribute('aria-valuenow',String(Math.min(100,Math.max(0,pct))));
@@ -34083,19 +34104,24 @@ async function checkCodexAuth(){
 function renderAuthIndicator(){
   const dot=document.getElementById('codex-auth-dot');
   const label=document.getElementById('codex-auth-label');
-  if(!_authCache){dot.className='status-dot unknown';label.textContent='...';return}
+  const account=document.getElementById('plan-account');
+  if(!_authCache){dot.className='status-dot unknown';label.textContent='...';if(account)account.textContent='';return}
   if(_authCache.hasApiKey&&!_authCache.loggedIn){
     dot.className='status-dot';dot.style.background='#d2a8ff';
-    label.textContent='API Key';return;
+    label.textContent='API Key';
+    if(account){account.textContent='OpenAI API';account.title='Codex account: OpenAI API key';}
+    return;
   }
   if(_authCache.loggedIn){
     dot.className='status-dot idle';dot.style.background='';
     const email=_authCache.email||'';
     const plan=_authCache.subscriptionType||'';
     label.textContent=email+(plan?' · '+plan.charAt(0).toUpperCase()+plan.slice(1):'');
+    if(account){account.textContent=email||'ChatGPT user';account.title='Codex account: '+(email||'ChatGPT user')+(plan?' ('+plan+')':'');}
   }else{
     dot.className='status-dot busy';dot.style.background='';
     label.textContent='Not connected';
+    if(account){account.textContent='Not connected';account.title='Codex account is not connected';}
   }
 }
 
@@ -34544,11 +34570,10 @@ async function loadWatchdogStatus(name){
 
 // ── Key Bar + Slash Commands ──
 function buildKeyBar(name,tab){
-  const readingControls=`<div class="terminal-read-controls" aria-label="Terminal reading controls">
+  const readingButtons=`
     <button class="key-btn" onclick="readTerminal('last','${esc(name)}')" title="Switch to Terminal and jump to your last message. Click again for earlier messages.">&#8613; My last message</button>
-    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="readTerminal('freeze','${esc(name)}')" title="Switch to Terminal and hold its output still while the session keeps working.">&#10052; Freeze</button>
-    <button class="key-btn" onclick="readTerminal('latest','${esc(name)}')" title="Switch to Terminal and follow the latest output.">&#8595; Latest output</button>
-  </div>`;
+    <button class="key-btn" onclick="readTerminal('latest','${esc(name)}')" title="Switch to Terminal and follow the latest output.">&#8595; Latest output</button>`;
+  const readingControls=`<div class="terminal-read-controls" aria-label="Terminal reading controls">${readingButtons}</div>`;
   // Simplified team members: no keys/commands — a COMPACT single-row upload
   // control. Keeping the footer short means the terminal gets full height and the
   // page doesn't overflow (page overflow would steal the terminal's scroll).
@@ -34573,26 +34598,24 @@ function buildKeyBar(name,tab){
     <span class="chevron">&#x25BC;</span> Keys &amp; Commands
   </div>
   <div class="key-bar${isOpen?' expanded':''}" id="${id}">
+    <div class="key-button-row">
     <span class="key-bar-label">Keys:</span>
-    <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape — exit menus/dialogs">Esc</button>
-    <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U — clear input line (wipes any stale/phantom text from Codex's input buffer without interrupting the running task)">Clear Input</button>
+    <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape: exit menus/dialogs">Esc</button>
+    <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C: interrupt">Ctrl+C</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U: clear input line (wipes any stale/phantom text from Codex's input buffer without interrupting the running task)">Clear Input</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space — scroll pager">Space</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space: scroll pager">Space</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
-    ${readingControls}
+    ${readingButtons}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/new')" title="New conversation">/new</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/status')" title="Session status & usage">/status</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Switch to Plan mode">/plan</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model gpt-5.4-mini')" title="Switch to GPT-5.4-mini">/model mini</button>
+    </div>
     <div class="drop-zone" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
       ondragleave="this.classList.remove('drag-over')"
