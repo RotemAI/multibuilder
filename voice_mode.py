@@ -1276,7 +1276,7 @@ class Connection:
     async def run(self, sdp, proactive_updates=True):
         self.update_scope = update_scope(proactive_updates)
         self.proactive_updates = self.update_scope != 'off'
-        key = self.host._managed_openai_key()
+        key = self.host._voice_openai_key()
         if not key:
             raise VoiceError('Voice mode is not configured with an API credential.')
         self.enforce_spend(need_usd=VOICE_SESSION_RESERVE_USD)
