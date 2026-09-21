@@ -69,6 +69,21 @@ from runtime_control import (
 from session_metrics import CodexRolloutMetrics, empty_metrics
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+#  ONE KEY PER JOB, not one key per box. This dashboard spends metered OpenAI money
+#  on two unrelated things: the voice endpoints (the composer's microphone, the
+#  realtime spoken leg and the spoken reply) and small LLM tasks (chat-mode
+#  summaries and recaps, session titles, progress, notes, autopilot, cache
+#  keepalive). Sharing one key made the daily figure unreadable, which is the whole
+#  reason a spend line naming a box turned out to be naming a KEY. Both fall back to
+#  OPENAI_API_KEY, so a box whose keys have not been split yet behaves as before.
+OPENAI_VOICE_KEY = os.environ.get("OPENAI_VOICE_KEY", "") or OPENAI_API_KEY
+OPENAI_TASKS_KEY = os.environ.get("OPENAI_TASKS_KEY", "") or OPENAI_API_KEY
+#  Names a launched session must never inherit. The dashboard holds a metered voice
+#  key and a metered small-tasks key; a pane gets neither. tmux has no unset for
+#  new-session, so each name goes through EMPTY, which every consumer reads as absent.
+_SESSION_FENCED_ENV = ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
+                       "ANTHROPIC_API_KEY", "CODEX_API_KEY")
 SUMMARY_MODEL = dashboard_spend.configured_model(
     "TMUX_DASH_SUMMARY_MODEL", "gpt-4o-mini"
 )
@@ -545,7 +560,8 @@ def _launch_codex_cmd(
         out += " -c " + shlex.quote(_CODEX_DOCS_MCP_OVERRIDE)
     if not CODEX_API_FALLBACK_ENABLED:
         out += " -c " + shlex.quote('forced_login_method="chatgpt"')
-        out = "env -u OPENAI_API_KEY -u CODEX_API_KEY " + out
+        out = ("env -u OPENAI_API_KEY -u OPENAI_VOICE_KEY -u OPENAI_TASKS_KEY "
+               "-u CODEX_API_KEY " + out)
     return out
 
 
@@ -949,9 +965,15 @@ def _load_openai_key() -> str:
     return _stored_openai_key
 
 
-def _managed_openai_key() -> str:
-    """Return the dashboard key or the host-managed lisa.my service key."""
-    key = _stored_openai_key or OPENAI_API_KEY
+def _managed_openai_key(prefer: str = "") -> str:
+    """Return the dashboard key or the host-managed lisa.my service key.
+
+    `prefer` is the per-job key this caller is meant to spend: the voice key
+    for the microphone and the spoken leg, the small-tasks key for everything
+    else. A key stored through the dashboard still wins, as it always did, and
+    the shared OPENAI_API_KEY is the last resort so an unsplit box is unchanged.
+    """
+    key = _stored_openai_key or prefer or OPENAI_API_KEY
     if key:
         return key
     try:
@@ -1015,7 +1037,19 @@ def _clear_openai_key():
 
 
 _load_openai_key()
-client = openai.AsyncOpenAI(api_key=_managed_openai_key()) if _managed_openai_key() else None
+
+
+def _voice_openai_key() -> str:
+    """The key the microphone and the realtime spoken leg spend."""
+    return _managed_openai_key(OPENAI_VOICE_KEY)
+
+
+def _tasks_openai_key() -> str:
+    """The key the small LLM tasks spend: titles, progress, notes, recaps, autopilot."""
+    return _managed_openai_key(OPENAI_TASKS_KEY)
+
+
+client = openai.AsyncOpenAI(api_key=_tasks_openai_key()) if _tasks_openai_key() else None
 
 
 def _active_openai_key() -> str:
@@ -2230,12 +2264,16 @@ async def lifespan(_app: FastAPI):
     logger.info("Codex Dashboard starting: role=%s port=%s root_path=%s auth=%s openai=%s",
                 PROCESS_ROLE, PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
-                "configured" if _managed_openai_key() else "missing")
+                "tasks=%s voice=%s" % ("set" if _tasks_openai_key() else "missing",
+                                       "set" if _voice_openai_key() else "missing"))
     if not AUTH_PASS:
         logger.warning("TMUX_DASH_PASS is not set: authentication is DISABLED. "
                        "Set TMUX_DASH_PASS to enable auth.")
-    if not _managed_openai_key():
-        logger.warning("No managed OpenAI key is configured: LLM summaries will not work.")
+    if not _tasks_openai_key():
+        logger.warning("No OPENAI_TASKS_KEY (or OPENAI_API_KEY): LLM summaries will not work.")
+    if not _voice_openai_key():
+        logger.warning("No OPENAI_VOICE_KEY (or OPENAI_API_KEY): the mic and the spoken "
+                       "reply will answer 503.")
     if not os.environ.get("TMUX_DASH_SECRET"):
         logger.warning("TMUX_DASH_SECRET is not set: auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
@@ -9936,6 +9974,51 @@ _RE_TIP_CODEX = re.compile(r'Tip:.*codex')
 _RE_COMPLETION_MSG = re.compile(r'[A-Z][a-zé]+ for \d+[ms]')
 
 
+#  THE KEY HINT BAR IS NOT A STATUS LINE. The CLI parks a list of what the keys do
+#  under the composer:
+#    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · esc to interrupt ·…"
+#  and it lists "esc to interrupt" there on a FINISHED pane too, under the
+#  end-of-turn line, with the composer empty. Reading the phrase off that row is
+#  what pinned a finished session on a red "Working" pill for ever, and the escape
+#  hatch built for it - the same bytes for a while - never fires on a pane with a
+#  background-agent list at the foot, because those timers tick.
+_RE_HINT_BAR = re.compile(
+    r'^\s*(?:⏵|\?\s*for shortcuts\b|shift\+tab\b|bypass permissions\b|⧉\s*In\b'
+    r'|↑\s*to (?:edit|recall)\b|←\s*for agents\b|\d+%\s+(?:until|context)\b'
+    r'|✔\s*Update installed\b)', re.I)
+#  The live status row carries the same phrase INSIDE its own parentheses:
+#    "✻ Simmering… (42s · ↓ 1.1k tokens · esc to interrupt)"
+#    "• Working (17s · esc to interrupt)"          <- the Codex shape
+#  That one is painted only while the turn is up, so it is the form worth
+#  trusting. Both shapes are anchored, because the moment anyone works on this
+#  file the words are in the pane as ordinary prose and an unanchored search
+#  reads a grep of this very function as a running turn.
+#  The live row leads with a bullet or a dot as often as a spinner glyph, and the
+#  separators inside it are bullets too, so this test gets its own leading class.
+#  _SPINNER_ICONS is NOT widened: the spinner scan shares it and would then read an
+#  agent's bulleted prose as a running turn.
+_ESC_LIVE_LEAD = _SPINNER_ICONS[:-1] + r'*·•◦]'
+_RE_ESC_LIVE_SPINNER = re.compile(_ESC_LIVE_LEAD + r'\s+\S[^\n]*\besc to interrupt\b', re.I)
+_RE_ESC_LIVE_PAREN = re.compile(r'\(\s*\d+\s*[hms]\b[^)\n]*\besc to interrupt\b', re.I)
+
+
+def _esc_to_interrupt_live(lines) -> bool:
+    """True when "esc to interrupt" is on the CLI's LIVE STATUS row.
+
+    False when the only place it appears is the key hint bar, or the agent's own
+    prose, because neither says a turn is running. See _RE_HINT_BAR above for the
+    pane that proved it.
+    """
+    for line in lines:
+        if "esc to interrupt" not in line.lower():
+            continue
+        if _RE_HINT_BAR.match(line):
+            continue
+        if _RE_ESC_LIVE_SPINNER.search(line) or _RE_ESC_LIVE_PAREN.search(line):
+            return True
+    return False
+
+
 _AUTONOMOUS_KEYWORDS = [
     "don't ask", "without asking", "bypass", "skip permission",
     "autonomous", "all permissions", "proceed without",
@@ -10095,13 +10178,21 @@ def _detect_activity_raw(session_name: str) -> dict:
         while all_lines and not all_lines[-1].strip():
             all_lines.pop()
 
-        # Look at the bottom 6 lines to catch prompt + status bar + separators
-        bottom = all_lines[-6:] if len(all_lines) >= 6 else all_lines
+        # The prompt, the rules around it and the key hint bar. Widened from 6 to
+        # 10: a pane carrying a background-agent list under the hint bar kept the
+        # empty composer just out of reach, so the one row that says "you can type
+        # here" was not being read on exactly the sessions this got wrong.
+        bottom = all_lines[-10:] if len(all_lines) >= 10 else all_lines
         bottom_text = "\n".join(bottom)
 
-        # --- Step 1: Check "esc to interrupt": strongest busy signal ---
-        # This appears in Codex's status bar when a task is actively running.
-        has_esc_to_interrupt = "esc to interrupt" in bottom_text
+        # --- Step 1: Check "esc to interrupt" - strongest busy signal ---
+        # Only where it means something: the live status row, never the key hint
+        # bar under the composer, which lists it on a finished pane too. Read over
+        # the same 25-line window the spinner scan uses, because a pane with a
+        # background-agent list at the foot pushes the status row out of the
+        # handful of lines this used to look at.
+        has_esc_to_interrupt = _esc_to_interrupt_live(
+            all_lines[-25:] if len(all_lines) >= 25 else all_lines)
 
         # --- Step 2: Check for idle prompt indicators in bottom area ---
         idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CODEX, _RE_COMPLETION_MSG]
@@ -10212,7 +10303,7 @@ def _detect_activity_raw(session_name: str) -> dict:
             info["detail"] = "Background tasks"
             verb, secs = "", -1
             for line in reversed(window):
-                if "esc to interrupt" not in line:
+                if not _esc_to_interrupt_live([line]):
                     continue
                 m = _CODEX_WORK_RE.search(line)
                 if m:
@@ -13141,8 +13232,8 @@ def _restore_parked_tmux_shell(
             #  global environment carried OPENAI_API_KEY while the dashboard process did not, so a pane
             #  inherited a 167-char sk-svcacct key that `os.environ` never showed. Gating on the
             #  dashboard's own environment reads as a fence and is dead code. tmux accepts `-e NAME=`
-            #  for a name nothing has set, so send all three every time and both sources are closed.
-            for fenced in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
+            #  for a name nothing has set, so send every name in _SESSION_FENCED_ENV every time, and both sources are closed.
+            for fenced in _SESSION_FENCED_ENV:
                 create_cmd += ["-e", "%s=" % fenced]
             create_cmd += [
                 ";", "set-option", _TMUX_QUARANTINED_OPTION, "1",
@@ -15747,8 +15838,8 @@ async def _api_create_session_tmux_locked(request: Request, body: CreateSession)
         #  global environment carried OPENAI_API_KEY while the dashboard process did not, so a pane
         #  inherited a 167-char sk-svcacct key that `os.environ` never showed. Gating on the
         #  dashboard's own environment reads as a fence and is dead code. tmux accepts `-e NAME=`
-        #  for a name nothing has set, so send all three every time and both sources are closed.
-        for fenced in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
+        #  for a name nothing has set, so send every name in _SESSION_FENCED_ENV every time, and both sources are closed.
+        for fenced in _SESSION_FENCED_ENV:
             cmd += ["-e", "%s=" % fenced]
         if requested_name:
             cmd += ["-s", requested_name]
@@ -17743,7 +17834,7 @@ async def _health_report() -> tuple[dict, int]:
             "ready_durable": int(inventory.get("ready_expected") or 0),
             "missing_durable": len(inventory.get("missing_expected") or []),
         },
-        "openai": bool(_active_openai_key() or (CODEX_HOME / "auth.json").exists()),
+        "openai": bool(_tasks_openai_key() or (CODEX_HOME / "auth.json").exists()),
         "data_dir": False,
     }
     try:
@@ -20363,7 +20454,7 @@ async def api_session_relogin(
 @app.post("/api/transcribe")
 async def api_transcribe(audio: UploadFile = File(...)):
     """Transcribe a recorded voice clip to text (for the composer mic button)."""
-    key = _managed_openai_key()
+    key = _voice_openai_key()
     if not key:
         return JSONResponse({"error": "Transcription is not configured."}, status_code=503)
     try:
