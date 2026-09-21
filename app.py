@@ -7946,30 +7946,64 @@ def _project_dir(username: str, project: str):
 
 
 async def _proxy_to_port(request: Request, port: int, subpath: str):
+    from anyio import CancelScope
+    from starlette.responses import StreamingResponse
+
     url = f"http://127.0.0.1:{port}/{subpath}"
     if request.url.query:
         url += "?" + request.url.query
     body = await request.body()
-    req = urllib.request.Request(url, data=body or None, method=request.method)
-    for h in ("content-type", "accept", "user-agent"):
-        v = request.headers.get(h)
-        if v:
-            req.add_header(h, v)
+    headers = {h: request.headers[h] for h in ("content-type", "accept", "user-agent")
+               if h in request.headers}
+    client = httpx.AsyncClient(timeout=30, follow_redirects=True, trust_env=False)
+    upstream = None
 
-    def _do():
-        return urllib.request.urlopen(req, timeout=30)
+    async def close():
+        # A disconnected browser can cancel the response's task group.
+        with CancelScope(shield=True):
+            try:
+                if upstream is not None:
+                    await upstream.aclose()
+            finally:
+                await client.aclose()
+
     try:
-        resp = await asyncio.to_thread(_do)
-        return Response(content=resp.read(), status_code=resp.status,
-                        media_type=resp.headers.get("Content-Type", "application/octet-stream"))
-    except urllib.error.HTTPError as e:
-        return Response(content=e.read(), status_code=e.code,
-                        media_type=e.headers.get("Content-Type", "text/plain"))
+        req = client.build_request(request.method, url, content=body or None, headers=headers)
+        upstream = await client.send(req, stream=True)
+    except asyncio.CancelledError:
+        await close()
+        raise
     except Exception:
+        await close()
         return HTMLResponse(
             f"Project server isn't reachable on port {port} (is it running?).",
             status_code=502,
         )
+
+    async def chunks():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await close()
+
+    class ProjectResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                # Also covers disconnects before the body iterator starts.
+                await close()
+
+    # Raw bytes retain their encoding. Do not forward hop-by-hop headers or
+    # project cookies into the dashboard's authentication namespace.
+    response_headers = {h: upstream.headers[h] for h in (
+        "content-type", "content-length", "content-encoding", "content-disposition",
+        "cache-control", "etag", "last-modified", "expires", "vary",
+    ) if h in upstream.headers}
+    response_headers.setdefault("content-type", "application/octet-stream")
+    response_headers["x-accel-buffering"] = "no"
+    return ProjectResponse(chunks(), status_code=upstream.status_code, headers=response_headers)
 
 
 QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
