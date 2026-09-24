@@ -321,3 +321,15 @@ def test_markup_preserves_mobile_plus_voice_shared_status_and_correct_asset_path
     assert "if(st.frozen&&(!live||live._lineMode!==true))" in html
     assert "readTerminal(st.pendingReadAction,name)" in html
     assert "name_generated:!requested" in html
+
+
+def test_plan_reset_text_is_readable():
+    css = re.search(r"\.nav-plan-reset\{([^}]*)\}", APP.read_text())[1]
+    size = re.search(r"font-size:([\d.]+)px", css)
+    assert size is not None and float(size[1]) >= 11
+
+
+def test_plan_reset_has_space_above_meter():
+    css = re.search(r"\.nav-plan-meter\{([^}]*)\}", APP.read_text())[1]
+    gap = re.search(r"gap:([\d.]+)px", css)
+    assert gap is not None and float(gap[1]) >= 5

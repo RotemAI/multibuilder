@@ -3,6 +3,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import app
+import pytest
 
 
 def _chatgpt_auth():
@@ -14,6 +15,23 @@ def _chatgpt_auth():
             "id_token": "id-not-real",
         },
     }
+
+
+@pytest.mark.parametrize("validate", [False, True])
+def test_access_only_chatgpt_auth_keeps_plan_usage_available(tmp_path, monkeypatch, validate):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text(json.dumps({
+        "auth_mode": "chatgpt", "tokens": {"access_token": "access-not-real"},
+    }))
+    monkeypatch.setattr(app, "CODEX_API_FALLBACK_ENABLED", False)
+    monkeypatch.setattr(app, "_codex_app_server_account_read", lambda *_args, **_kwargs: {
+        "ok": True, "account": {"type": "chatgpt", "planType": "pro"},
+    })
+
+    state = app._ensure_codex_auth_with_fallback(codex_home, validate)
+
+    assert state["activeMode"] == "chatgpt"
 
 
 def test_disabled_api_fallback_never_rewrites_chatgpt_auth(tmp_path, monkeypatch):
