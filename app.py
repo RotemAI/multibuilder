@@ -20822,10 +20822,8 @@ def _ensure_codex_auth_with_fallback(
                 reason = "OpenAI API-key authentication is disabled; ChatGPT plan login is required"
         elif configured_mode == "chatgpt":
             tokens = creds.get("tokens")
-            if not isinstance(tokens, dict) or not all(
-                tokens.get(name) for name in ("access_token", "refresh_token")
-            ):
-                reason = "ChatGPT credential is missing required tokens"
+            if not isinstance(tokens, dict) or not tokens.get("access_token"):
+                reason = "ChatGPT credential is missing an access token"
             elif validate_chatgpt:
                 probe = _codex_app_server_account_read(codex_home, refresh_token=False)
                 account = probe.get("account") if isinstance(probe.get("account"), dict) else {}
@@ -29465,15 +29463,15 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.working .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299;animation:nbb-blink 1s ease-in-out infinite}
 .nav-browser-badge.working{border-color:#d29922}
 .nav-browser-badge.working .nbb-glyph{filter:none}
-.nav-plan-bars{display:flex;flex-direction:column;justify-content:center;gap:2px;font-size:10px;flex-shrink:0}
-.nav-plan-window{display:flex;align-items:center;gap:5px;white-space:nowrap;line-height:1}
-.nav-plan-window>span:first-child{min-width:22px;color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;text-transform:uppercase}
-.nav-plan-window>span:last-child{width:26px;text-align:right;color:#c9d1d9;font-size:.6rem;font-weight:600;font-variant-numeric:tabular-nums}
-.nav-plan-meter{display:inline-flex;flex-direction:column;align-items:center;gap:1px;width:22px}
-.nav-plan-reset{height:7px;color:#8b949e;font-size:.48rem;line-height:7px;font-variant-numeric:tabular-nums}
-.nav-plan-window .nav-usage-bar{display:block;width:22px;height:4px}
+.nav-plan-bars{display:flex;flex-direction:column;justify-content:center;gap:4px;font-size:11px;flex-shrink:0}
+.nav-plan-window{display:flex;align-items:center;gap:7px;white-space:nowrap;line-height:1}
+.nav-plan-window>span:first-child{min-width:22px;color:#8b949e;font-weight:600;font-size:10px;letter-spacing:.04em;text-transform:uppercase}
+.nav-plan-window>span:last-child{width:32px;text-align:right;color:#c9d1d9;font-size:11px;font-weight:600;font-variant-numeric:tabular-nums}
+.nav-plan-meter{display:inline-flex;flex-direction:column;align-items:center;gap:5px;width:54px}
+.nav-plan-reset{height:13px;color:#aab3bf;font-size:11px;line-height:13px;font-variant-numeric:tabular-nums}
+.nav-plan-window .nav-usage-bar{display:block;width:54px;height:5px}
 .message-jumped{background:#263f28;border-radius:4px;outline:1px solid #3fb950}
-@media(max-width:600px){.nav-plan-bars{font-size:9px}.nav-plan-window .nav-usage-bar,.nav-stat-bar{width:20px}}
+@media(max-width:600px){.nav-stat-bar{width:20px}}
 
 @media(max-width:768px){.nav-plan-bars{display:flex}.nav-right>.nav-browser-badge{min-width:36px;min-height:44px;padding:4px}.nav-right{gap:0;min-width:0}.top-nav{min-width:0}.nav-new-mobile-btn{margin-right:2px}}
 @media(prefers-reduced-motion:reduce){.message-jumped,.nav-browser-badge.working .nbb-dot{animation:none}}
