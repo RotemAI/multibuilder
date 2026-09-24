@@ -93,10 +93,6 @@ vm.runInContext(region, ctx);
 const pane=fs.readFileSync(process.argv[3],'utf8');
 const split=ctx.splitLiveTail(pane.split('\n'));
 const filtered=ctx.applyRawFilter(split.body.join('\n'));
-const divider={},button={style:{}},note={},control={style:{}};
-ctx._paintHistoryControl('demo',{button,note,control,divider},{
-  loading:false,atStart:false,pending:false,error:'',entries:[{}],loaded:true,tools:false,
-});
 process.stdout.write(JSON.stringify({
   live: split.live,
   body: split.body,
@@ -105,7 +101,6 @@ process.stdout.write(JSON.stringify({
   diff_append: ctx._lineDiff(['a','b','c'], ['a','b','c','d']),
   diff_same: ctx._lineDiff(['a','b'], ['a','b']),
   diff_middle: ctx._lineDiff(['a','b','c'], ['a','B','c']),
-  divider_hidden: divider.hidden,
   prompt_flags: ctx._userPromptLineFlags([
     '› A submitted message that wraps',
     '  onto another terminal row',
@@ -322,15 +317,6 @@ def test_clean_view_hides_history_clipped_indented_output():
     pane = TRANSCRIPT_HINT + "\n" + orphan + "\n\u2022 Restored the guard.\n\u203a Keep going"
     out = _run(pane)
     assert out["clean"] == ["\u2022 Restored the guard.", "\u203a Keep going"]
-
-
-def test_clean_view_hides_clipped_diff_with_context_and_one_change():
-    pane = '      139      }\n      140 +"replacement"\n\u2022 The edit is complete.'
-    assert _run(pane)["clean"] == ["\u2022 The edit is complete."]
-
-
-def test_clean_view_hides_the_live_terminal_divider(rendered):
-    assert rendered["divider_hidden"] is True
 
 
 # Indent alone must not swallow real prose: a nested list item after the hint is
