@@ -1,0 +1,22 @@
+{
+  "source": "https://builder7.rotem.ai/",
+  "source_snapshot": "2026-09-21T03:10:46Z",
+  "deployed": "2026-09-21",
+  "app_sha256": "5d1c61c7ee1f45a3c549d4c52152c12eaed3c6876e7155fb9e44c02432fe5530",
+  "upstream_app_sha256": "73bfd24d301179b5aed63f9e755a5541dc61861778a0bb66be9485914ce3dd77",
+  "reference_hosts": {
+    "builder6.rotem.ai": "89897c49c56f9e55428f5b4a23eb22fc8e0aa6213e47591250eb6e7927d2dcc2",
+    "builder7.rotem.ai": "73bfd24d301179b5aed63f9e755a5541dc61861778a0bb66be9485914ce3dd77"
+  },
+  "runtime_hooks_sha256": {
+    "tmux_dashboard_pytest_gate.py": "770280e9b8507052ab22eaa8445f667eaa831df06e47902f9311329a07ba88bc"
+  },
+  "local_adaptations": [
+    "shared model catalog",
+    "ChatGPT plan authentication",
+    "per-app API spending cap",
+    "manager customer password reset permission",
+    "dashboard launch transcript filtering",
+    "terminal history internal context filtering"
+  ]
+}

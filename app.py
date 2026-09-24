@@ -69,21 +69,15 @@ from runtime_control import (
 from session_metrics import CodexRolloutMetrics, empty_metrics
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-
 #  ONE KEY PER JOB, not one key per box. This dashboard spends metered OpenAI money
-#  on two unrelated things: the voice endpoints (the composer's microphone, the
-#  realtime spoken leg and the spoken reply) and small LLM tasks (chat-mode
-#  summaries and recaps, session titles, progress, notes, autopilot, cache
-#  keepalive). Sharing one key made the daily figure unreadable, which is the whole
-#  reason a spend line naming a box turned out to be naming a KEY. Both fall back to
-#  OPENAI_API_KEY, so a box whose keys have not been split yet behaves as before.
+#  on two unrelated things: the composer's microphone, and small LLM tasks (chat-mode
+#  summaries and recaps, session titles, progress, notes, autopilot, cache keepalive).
+#  Sharing one key made the daily figure unreadable, and the fallback below reached
+#  into lisa.my THE PRODUCT's secrets file, so a dev dashboard and the product billed
+#  one line. Both fall back to OPENAI_API_KEY, so a box whose keys have not been
+#  split behaves exactly as before.
 OPENAI_VOICE_KEY = os.environ.get("OPENAI_VOICE_KEY", "") or OPENAI_API_KEY
 OPENAI_TASKS_KEY = os.environ.get("OPENAI_TASKS_KEY", "") or OPENAI_API_KEY
-#  Names a launched session must never inherit. The dashboard holds a metered voice
-#  key and a metered small-tasks key; a pane gets neither. tmux has no unset for
-#  new-session, so each name goes through EMPTY, which every consumer reads as absent.
-_SESSION_FENCED_ENV = ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
-                       "ANTHROPIC_API_KEY", "CODEX_API_KEY")
 SUMMARY_MODEL = dashboard_spend.configured_model(
     "TMUX_DASH_SUMMARY_MODEL", "gpt-4o-mini"
 )
@@ -138,8 +132,8 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 _CODEX_MIN_CLI_VERSION = os.environ.get("TMUX_DASH_MIN_CODEX_VERSION", "0.145.0").strip()
 _CODEX_DEFAULT_MODEL = os.environ.get(
     "TMUX_DASH_DEFAULT_MODEL",
-    os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol"),
-).strip() or "gpt-5.6-sol"
+    os.environ.get("CODEX_DEFAULT_MODEL", "gpt-6-sol"),
+).strip() or "gpt-6-sol"
 _CODEX_REASONING_EFFORTS = (
     "none", "low", "medium", "high", "xhigh", "max", "ultra"
 )
@@ -149,14 +143,14 @@ _CODEX_REASONING_EFFORT_ALIASES = {
 }
 _CODEX_DEFAULT_REASONING_EFFORT = os.environ.get(
     "TMUX_DASH_DEFAULT_REASONING_EFFORT",
-    os.environ.get("CODEX_DEFAULT_REASONING_EFFORT", "max"),
+    os.environ.get("CODEX_DEFAULT_REASONING_EFFORT", "high"),
 ).strip().lower()
 _CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
     _CODEX_DEFAULT_REASONING_EFFORT,
     _CODEX_DEFAULT_REASONING_EFFORT,
 )
 if _CODEX_DEFAULT_REASONING_EFFORT not in _CODEX_REASONING_EFFORTS:
-    _CODEX_DEFAULT_REASONING_EFFORT = "max"
+    _CODEX_DEFAULT_REASONING_EFFORT = "high"
 
 # Codex 0.146 can leave its TUI blocked in MCP startup for minutes when the
 # OpenAI developer-docs HTTP server is configured. Dashboard sessions have web
@@ -172,6 +166,8 @@ MODELS_FILE = Path.home() / ".tmux-dashboard" / "codex-models.json"
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{2,80}$")
 _SEED_MODEL_CATALOG = [
     ["gpt-6-astra", "GPT-6 Astra"],
+    ["gpt-6-sol", "GPT-6 Sol"],
+    ["gpt-6-luna", "GPT-6 Luna"],
     ["gpt-5.6-sol", "GPT-5.6 Sol"],
     ["gpt-5.6-terra", "GPT-5.6 Terra"],
     ["gpt-5.6-luna", "GPT-5.6 Luna"],
@@ -181,6 +177,8 @@ _SEED_MODEL_CATALOG = [
 ]
 _SEED_MODEL_EFFORTS = {
     "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-6-luna": ["low", "medium", "high", "xhigh", "max"],
     "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
@@ -360,6 +358,11 @@ async def _refresh_model_catalog(
         )
         if not detected:
             return False
+        pinned_models = _SEED_MODEL_CATALOG[:3]
+        pinned_ids = {row[0] for row in pinned_models}
+        detected = pinned_models + [row for row in detected if row[0] not in pinned_ids]
+        for model_id in pinned_ids:
+            detected_efforts[model_id] = list(_SEED_MODEL_EFFORTS[model_id])
         changed = detected != current_catalog or detected_efforts != current_efforts
         _save_model_catalog(detected, now, detected_efforts, path)
         if path == MODELS_FILE:
@@ -560,8 +563,7 @@ def _launch_codex_cmd(
         out += " -c " + shlex.quote(_CODEX_DOCS_MCP_OVERRIDE)
     if not CODEX_API_FALLBACK_ENABLED:
         out += " -c " + shlex.quote('forced_login_method="chatgpt"')
-        out = ("env -u OPENAI_API_KEY -u OPENAI_VOICE_KEY -u OPENAI_TASKS_KEY "
-               "-u CODEX_API_KEY " + out)
+        out = "env -u OPENAI_API_KEY -u OPENAI_VOICE_KEY -u OPENAI_TASKS_KEY -u CODEX_API_KEY " + out
     return out
 
 
@@ -847,7 +849,7 @@ PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH 
 DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 # Team-mode default model + reasoning effort, pinned into every session's config.
 TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", _CODEX_DEFAULT_MODEL)
-TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "max")
+TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "high")
 # Email domain used for per-user git commit identity (commits are AUTHORED by the
 # member even though everyone shares one OS user).
 GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "grabo.tech")
@@ -965,15 +967,16 @@ def _load_openai_key() -> str:
     return _stored_openai_key
 
 
-def _managed_openai_key(prefer: str = "") -> str:
-    """Return the dashboard key or the host-managed lisa.my service key.
+def _managed_openai_key(job: str = "tasks") -> str:
+    """Return the per-job dashboard key, else the host-managed lisa.my service key.
 
-    `prefer` is the per-job key this caller is meant to spend: the voice key
-    for the microphone and the spoken leg, the small-tasks key for everything
-    else. A key stored through the dashboard still wins, as it always did, and
-    the shared OPENAI_API_KEY is the last resort so an unsplit box is unchanged.
+    "voice" is the composer's microphone; "tasks" is every small LLM call the
+    dashboard makes. Each falls back to OPENAI_API_KEY at import, so a box whose
+    keys have not been split behaves exactly as before, including the last-resort
+    read of the product's key file below.
     """
-    key = _stored_openai_key or prefer or OPENAI_API_KEY
+    per_job = OPENAI_VOICE_KEY if job == "voice" else OPENAI_TASKS_KEY
+    key = _stored_openai_key or per_job
     if key:
         return key
     try:
@@ -1037,23 +1040,16 @@ def _clear_openai_key():
 
 
 _load_openai_key()
-
-
-def _voice_openai_key() -> str:
-    """The key the microphone and the realtime spoken leg spend."""
-    return _managed_openai_key(OPENAI_VOICE_KEY)
-
-
-def _tasks_openai_key() -> str:
-    """The key the small LLM tasks spend: titles, progress, notes, recaps, autopilot."""
-    return _managed_openai_key(OPENAI_TASKS_KEY)
-
-
-client = openai.AsyncOpenAI(api_key=_tasks_openai_key()) if _tasks_openai_key() else None
+client = (openai.AsyncOpenAI(api_key=_managed_openai_key("tasks"))
+          if _managed_openai_key("tasks") else None)
 
 
 def _active_openai_key() -> str:
-    return _stored_openai_key or OPENAI_API_KEY
+    #  The metered key the dashboard itself holds. After the per-job split that is
+    #  the tasks key, which still falls back to OPENAI_API_KEY. It is only read to
+    #  report WHETHER a key exists; the one path that would hand it to a Codex
+    #  session, _write_codex_api_auth, refuses outright on plan-only policy.
+    return _stored_openai_key or OPENAI_TASKS_KEY
 
 
 def _codex_launch_env_prefix() -> str:
@@ -2264,16 +2260,17 @@ async def lifespan(_app: FastAPI):
     logger.info("Codex Dashboard starting: role=%s port=%s root_path=%s auth=%s openai=%s",
                 PROCESS_ROLE, PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
-                "tasks=%s voice=%s" % ("set" if _tasks_openai_key() else "missing",
-                                       "set" if _voice_openai_key() else "missing"))
+                "tasks=%s voice=%s" % (
+                    "set" if _managed_openai_key("tasks") else "missing",
+                    "set" if _managed_openai_key("voice") else "missing"))
     if not AUTH_PASS:
         logger.warning("TMUX_DASH_PASS is not set: authentication is DISABLED. "
                        "Set TMUX_DASH_PASS to enable auth.")
-    if not _tasks_openai_key():
+    if not _managed_openai_key("tasks"):
         logger.warning("No OPENAI_TASKS_KEY (or OPENAI_API_KEY): LLM summaries will not work.")
-    if not _voice_openai_key():
-        logger.warning("No OPENAI_VOICE_KEY (or OPENAI_API_KEY): the mic and the spoken "
-                       "reply will answer 503.")
+    if not _managed_openai_key("voice"):
+        logger.warning("No OPENAI_VOICE_KEY (or OPENAI_API_KEY): the composer mic will "
+                       "answer 503.")
     if not os.environ.get("TMUX_DASH_SECRET"):
         logger.warning("TMUX_DASH_SECRET is not set: auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
@@ -2371,7 +2368,6 @@ async def lifespan(_app: FastAPI):
         ("session tab labels", _session_tab_label_loop()),
         ("session chat summaries", _session_chat_summary_loop()),
         ("controller snapshot", _controller_snapshot_loop()),
-        ("uploads retention", _uploads_retention_loop()),
         ("advisor account sync", sync_advisor_accounts()),
     )
     for label, coroutine in controller_loops:
@@ -7004,14 +7000,15 @@ def _ensure_tenant_browser(user: dict) -> dict:
         slot = 1
         while slot in used:
             slot += 1
+        display, rfb_port, vnc_port, cdp_port = _browser_runtime_coordinates(slot)
         row = {
             "id": sid,
             "name": f"{str(user.get('username') or 'member')[:40]} browser",
             "slot": slot,
-            "display": 99 + slot,
-            "rfb_port": 5900 + slot,
-            "vnc_port": 6080 + slot,
-            "cdp_port": 9222 + slot,
+            "display": display,
+            "rfb_port": rfb_port,
+            "vnc_port": vnc_port,
+            "cdp_port": cdp_port,
             "managed": True,
             "lifecycle_managed": True,
             "owner_id": str(user.get("id") or ""),
@@ -7272,10 +7269,21 @@ GROUPS_DIR = MESSAGES_DIR / "groups"
 PROJECTS_ROOT = Path.home() / "web-projects"
 _GROUP_CTX_BEGIN = "<!-- TEAM PERMISSION GROUP (managed; edits inside are overwritten) -->"
 _GROUP_CTX_END = "<!-- END TEAM GROUP CONTEXT -->"
-ADVISOR_BASE_URL = os.environ.get(
-    "TMUX_DASH_ADVISOR_URL",
-    "https://advisor.rotem.ai",
-).rstrip("/")
+#  A BOX MUST SAY WHICH ADVISOR IT IS ON. There is more than one, deliberately:
+#  the fleet advisor, and separate ones holding a single product's estate and
+#  nothing else. They must not see each other's records, and this URL is written
+#  straight into every session's MCP config, so a box that quietly takes the
+#  default hands its agents the wrong advisor's tools and never says so. The
+#  fallback stays, because nothing should fail to boot over this, but it is
+#  audible.
+_ADVISOR_URL_ENV = (os.environ.get("TMUX_DASH_ADVISOR_URL") or "").strip()
+ADVISOR_BASE_URL = (_ADVISOR_URL_ENV or "https://advisor.rotem.ai").rstrip("/")
+if not _ADVISOR_URL_ENV:
+    logger.warning(
+        "TMUX_DASH_ADVISOR_URL is not set, defaulting to %s. Set it explicitly "
+        "in this box's environment: a box belonging to a different advisor that "
+        "relies on this default writes the wrong advisor into every session's "
+        "MCP config and never says so.", ADVISOR_BASE_URL)
 ADVISOR_ADMIN_TOKEN_FILE = Path.home() / ".advisor-token"
 ADVISOR_HOST_NAME = os.environ.get(
     "TMUX_DASH_ADVISOR_HOST",
@@ -7947,30 +7955,64 @@ def _project_dir(username: str, project: str):
 
 
 async def _proxy_to_port(request: Request, port: int, subpath: str):
+    from anyio import CancelScope
+    from starlette.responses import StreamingResponse
+
     url = f"http://127.0.0.1:{port}/{subpath}"
     if request.url.query:
         url += "?" + request.url.query
     body = await request.body()
-    req = urllib.request.Request(url, data=body or None, method=request.method)
-    for h in ("content-type", "accept", "user-agent"):
-        v = request.headers.get(h)
-        if v:
-            req.add_header(h, v)
+    headers = {h: request.headers[h] for h in ("content-type", "accept", "user-agent")
+               if h in request.headers}
+    client = httpx.AsyncClient(timeout=30, follow_redirects=True, trust_env=False)
+    upstream = None
 
-    def _do():
-        return urllib.request.urlopen(req, timeout=30)
+    async def close():
+        # A disconnected browser can cancel the response's task group.
+        with CancelScope(shield=True):
+            try:
+                if upstream is not None:
+                    await upstream.aclose()
+            finally:
+                await client.aclose()
+
     try:
-        resp = await asyncio.to_thread(_do)
-        return Response(content=resp.read(), status_code=resp.status,
-                        media_type=resp.headers.get("Content-Type", "application/octet-stream"))
-    except urllib.error.HTTPError as e:
-        return Response(content=e.read(), status_code=e.code,
-                        media_type=e.headers.get("Content-Type", "text/plain"))
+        req = client.build_request(request.method, url, content=body or None, headers=headers)
+        upstream = await client.send(req, stream=True)
+    except asyncio.CancelledError:
+        await close()
+        raise
     except Exception:
+        await close()
         return HTMLResponse(
             f"Project server isn't reachable on port {port} (is it running?).",
             status_code=502,
         )
+
+    async def chunks():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await close()
+
+    class ProjectResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                # Also covers disconnects before the body iterator starts.
+                await close()
+
+    # Raw bytes retain their encoding. Do not forward hop-by-hop headers or
+    # project cookies into the dashboard's authentication namespace.
+    response_headers = {h: upstream.headers[h] for h in (
+        "content-type", "content-length", "content-encoding", "content-disposition",
+        "cache-control", "etag", "last-modified", "expires", "vary",
+    ) if h in upstream.headers}
+    response_headers.setdefault("content-type", "application/octet-stream")
+    response_headers["x-accel-buffering"] = "no"
+    return ProjectResponse(chunks(), status_code=upstream.status_code, headers=response_headers)
 
 
 QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
@@ -9968,6 +10010,26 @@ _RE_COMPLETION = re.compile(
 _RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
 _RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
 _RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
+#  THE KEY HINT BAR IS NOT A STATUS LINE. Codex parks a list of what the keys do
+#  under the composer, and on this box that footer literally BEGINS with the phrase:
+#    "esc to interrupt · ctrl+c to quit"
+#  It is there on a FINISHED pane too, so reading the phrase anywhere in the bottom
+#  rows pinned a session on a red "Working" pill after its turn was over. While a
+#  turn IS up, Codex paints it inside the live bullet row instead (captured on this
+#  box): "• Working (51s • esc to interrupt) · 1 background terminal running".
+#  These two mirror _CHROME_HINT_RE and _LIVE_BULLET_RE, which the browser side of
+#  this same file already uses, so both halves now agree on what a status row is.
+_RE_HINT_BAR = re.compile(
+    r'^\s*(?:⏵|\?\s*for shortcuts\b|shift\+tab\b|ctrl\+[a-z0-9]+ to\b'
+    r'|esc to (?:interrupt|undo|clear)\b|⧉\s*In\b|↑\s*to (?:edit|recall)\b|⌥'
+    r'|bypass(?:ing)? permissions\b|\d+%\s+context left\b|←\s*for agents\b'
+    r'|✔\s*Update installed\b)', re.I)
+#  Anchored on purpose, both of them: the moment anyone works on this file the words
+#  are in the pane as ordinary prose, and an unanchored search reads a grep of this
+#  very function as a running turn.
+_RE_ESC_LIVE_SPINNER = re.compile(
+    r'^ {0,6}(?:' + _SPINNER_ICONS + r'|[•◦])\s+\S[^\n]*\besc to interrupt\b', re.I)
+_RE_ESC_LIVE_PAREN = re.compile(r'\(\s*\d+\s*[hms]\b[^)\n]*\besc to interrupt\b', re.I)
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
 _RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
 _RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
@@ -9975,40 +10037,11 @@ _RE_TIP_CODEX = re.compile(r'Tip:.*codex')
 _RE_COMPLETION_MSG = re.compile(r'[A-Z][a-zé]+ for \d+[ms]')
 
 
-#  THE KEY HINT BAR IS NOT A STATUS LINE. The CLI parks a list of what the keys do
-#  under the composer:
-#    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · esc to interrupt ·…"
-#  and it lists "esc to interrupt" there on a FINISHED pane too, under the
-#  end-of-turn line, with the composer empty. Reading the phrase off that row is
-#  what pinned a finished session on a red "Working" pill for ever, and the escape
-#  hatch built for it - the same bytes for a while - never fires on a pane with a
-#  background-agent list at the foot, because those timers tick.
-_RE_HINT_BAR = re.compile(
-    r'^\s*(?:⏵|\?\s*for shortcuts\b|shift\+tab\b|bypass permissions\b|⧉\s*In\b'
-    r'|↑\s*to (?:edit|recall)\b|←\s*for agents\b|\d+%\s+(?:until|context)\b'
-    r'|✔\s*Update installed\b)', re.I)
-#  The live status row carries the same phrase INSIDE its own parentheses:
-#    "✻ Simmering… (42s · ↓ 1.1k tokens · esc to interrupt)"
-#    "• Working (17s · esc to interrupt)"          <- the Codex shape
-#  That one is painted only while the turn is up, so it is the form worth
-#  trusting. Both shapes are anchored, because the moment anyone works on this
-#  file the words are in the pane as ordinary prose and an unanchored search
-#  reads a grep of this very function as a running turn.
-#  The live row leads with a bullet or a dot as often as a spinner glyph, and the
-#  separators inside it are bullets too, so this test gets its own leading class.
-#  _SPINNER_ICONS is NOT widened: the spinner scan shares it and would then read an
-#  agent's bulleted prose as a running turn.
-_ESC_LIVE_LEAD = _SPINNER_ICONS[:-1] + r'*·•◦]'
-_RE_ESC_LIVE_SPINNER = re.compile(_ESC_LIVE_LEAD + r'\s+\S[^\n]*\besc to interrupt\b', re.I)
-_RE_ESC_LIVE_PAREN = re.compile(r'\(\s*\d+\s*[hms]\b[^)\n]*\besc to interrupt\b', re.I)
-
-
 def _esc_to_interrupt_live(lines) -> bool:
-    """True when "esc to interrupt" is on the CLI's LIVE STATUS row.
+    """True when "esc to interrupt" is on Codex's LIVE status row.
 
     False when the only place it appears is the key hint bar, or the agent's own
-    prose, because neither says a turn is running. See _RE_HINT_BAR above for the
-    pane that proved it.
+    prose, because neither says a turn is running. See _RE_HINT_BAR above.
     """
     for line in lines:
         if "esc to interrupt" not in line.lower():
@@ -10179,19 +10212,17 @@ def _detect_activity_raw(session_name: str) -> dict:
         while all_lines and not all_lines[-1].strip():
             all_lines.pop()
 
-        # The prompt, the rules around it and the key hint bar. Widened from 6 to
-        # 10: a pane carrying a background-agent list under the hint bar kept the
+        # The prompt, the rules around it and the hint bar. Widened from 6 to 10:
+        # a pane carrying a background-terminal list under the hint bar kept the
         # empty composer just out of reach, so the one row that says "you can type
         # here" was not being read on exactly the sessions this got wrong.
         bottom = all_lines[-10:] if len(all_lines) >= 10 else all_lines
-        bottom_text = "\n".join(bottom)
 
-        # --- Step 1: Check "esc to interrupt" - strongest busy signal ---
-        # Only where it means something: the live status row, never the key hint
-        # bar under the composer, which lists it on a finished pane too. Read over
-        # the same 25-line window the spinner scan uses, because a pane with a
-        # background-agent list at the foot pushes the status row out of the
-        # handful of lines this used to look at.
+        # --- Step 1: "esc to interrupt", the strongest busy signal ---
+        # Only where it means something: the live bullet row, never the key hint
+        # bar under the composer, which carries it on a finished pane too. Read
+        # over the same 25 lines the window below uses, because a background
+        # terminal list at the foot pushes the status row out of the bottom six.
         has_esc_to_interrupt = _esc_to_interrupt_live(
             all_lines[-25:] if len(all_lines) >= 25 else all_lines)
 
@@ -10298,13 +10329,14 @@ def _detect_activity_raw(session_name: str) -> dict:
                 info["confirmed_idle"] = True
             return info
 
-        # "esc to interrupt" is on screen. Say WHAT it is doing, and whether it is still moving.
+        # "esc to interrupt" is on the LIVE status row, not the key hint bar, which
+        # no longer reaches here. Say WHAT it is doing, and whether it is moving.
         if has_esc_to_interrupt:
             info["status"] = "busy"
             info["detail"] = "Background tasks"
             verb, secs = "", -1
             for line in reversed(window):
-                if not _esc_to_interrupt_live([line]):
+                if "esc to interrupt" not in line:
                     continue
                 m = _CODEX_WORK_RE.search(line)
                 if m:
@@ -12190,8 +12222,7 @@ async def api_refresh_all_tiers(session_name: str):
     return JSONResponse(build_session_response(sess, entry, activity=activity))
 
 
-@app.get("/api/status")
-async def api_status(request: Request):
+async def _activity_payload(request: Request) -> JSONResponse:
     """Lightweight: return only activity status per session, no LLM calls."""
     sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
     if sessions is None:
@@ -12225,6 +12256,21 @@ async def api_status(request: Request):
     return JSONResponse(out)
 
 
+
+#  Busy -> idle is only ever learned from this poll, so it has TWO paths on
+#  purpose. A request that never reaches the server cannot be fixed on the
+#  server, and a URL that is being dropped somewhere between browser and box is
+#  indistinguishable from a box that has nothing to say. The twin carries the
+#  identical payload under a name nothing has an opinion about, and the page
+#  falls back to it after three misses in a row.
+@app.get("/api/status")
+async def api_status(request: Request):
+    return await _activity_payload(request)
+
+
+@app.get("/api/activity")
+async def api_activity(request: Request):
+    return await _activity_payload(request)
 @app.get("/api/tab-labels")
 async def api_tab_labels(request: Request):
     """Return only this account's current nav labels for cheap live repainting."""
@@ -13233,8 +13279,9 @@ def _restore_parked_tmux_shell(
             #  global environment carried OPENAI_API_KEY while the dashboard process did not, so a pane
             #  inherited a 167-char sk-svcacct key that `os.environ` never showed. Gating on the
             #  dashboard's own environment reads as a fence and is dead code. tmux accepts `-e NAME=`
-            #  for a name nothing has set, so send every name in _SESSION_FENCED_ENV every time, and both sources are closed.
-            for fenced in _SESSION_FENCED_ENV:
+            #  for a name nothing has set, so send all three every time and both sources are closed.
+            for fenced in ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
+                           "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
                 create_cmd += ["-e", "%s=" % fenced]
             create_cmd += [
                 ";", "set-option", _TMUX_QUARANTINED_OPTION, "1",
@@ -15496,8 +15543,8 @@ async def ws_session_raw(ws: WebSocket, session_name: str):
 class CreateSession(BaseModel):
     name: str = ""
     name_generated: bool = Field(default=False, strict=True)
-    model: str = os.environ.get("TMUX_DASH_NEW_SESSION_MODEL", "gpt-6-astra")
-    effort: str = os.environ.get("TMUX_DASH_NEW_SESSION_EFFORT", "max")
+    model: str = os.environ.get("TMUX_DASH_NEW_SESSION_MODEL", "gpt-6-sol")
+    effort: str = os.environ.get("TMUX_DASH_NEW_SESSION_EFFORT", "high")
     no_fallback: bool = False
 
 
@@ -15839,8 +15886,9 @@ async def _api_create_session_tmux_locked(request: Request, body: CreateSession)
         #  global environment carried OPENAI_API_KEY while the dashboard process did not, so a pane
         #  inherited a 167-char sk-svcacct key that `os.environ` never showed. Gating on the
         #  dashboard's own environment reads as a fence and is dead code. tmux accepts `-e NAME=`
-        #  for a name nothing has set, so send every name in _SESSION_FENCED_ENV every time, and both sources are closed.
-        for fenced in _SESSION_FENCED_ENV:
+        #  for a name nothing has set, so send all three every time and both sources are closed.
+        for fenced in ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
+                       "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
             cmd += ["-e", "%s=" % fenced]
         if requested_name:
             cmd += ["-s", requested_name]
@@ -16190,13 +16238,6 @@ async def _api_delete_session_unlocked(
         )
         if _load_session_owners().get(session_name) == owner_id:
             _clear_session_owner(session_name)
-        # Files uploaded into this session die with it.
-        try:
-            gone = await asyncio.to_thread(_remove_session_uploads, session_name)
-            if gone:
-                logger.info("Session '%s': removed uploads %s", session_name, gone)
-        except Exception:
-            logger.warning("Session '%s': uploads cleanup failed", session_name, exc_info=True)
         logger.info("Session deleted: '%s'", session_name)
         payload = {"ok": True, "killed": session_name}
         if virtual:
@@ -16327,156 +16368,6 @@ UPLOADS_DIR = MESSAGES_DIR / "uploads"
 
 def _session_uploads_dir(session_name: str) -> Path:
     return _user_uploads_dir(_user_for_session(session_name)) / session_name
-
-
-# Uploads used to outlive their session forever: a deleted session left its files
-# under ~/.tmux-dashboard/uploads/ and users/<id>/uploads/ (492 MB on builder6,
-# 2026-09-23). A session's own dir now goes when the session is deleted, and a
-# periodic sweep removes a dir that no live or durable session can own once nothing
-# in it has changed for UPLOADS_RETENTION_DAYS (0 disables the sweep).
-UPLOADS_RETENTION_DAYS = float(os.environ.get("TMUX_DASH_UPLOADS_RETENTION_DAYS", "14") or 0)
-UPLOADS_PRUNE_INTERVAL_S = 6 * 3600
-
-
-def _upload_roots() -> list[Path]:
-    """The admin uploads root plus every account's, without creating any."""
-    roots = [UPLOADS_DIR]
-    users_dir = MESSAGES_DIR / "users"
-    try:
-        for entry in sorted(users_dir.iterdir()):
-            root = entry / "uploads"
-            if not entry.is_symlink() and not root.is_symlink() and root.is_dir():
-                roots.append(root)
-    except OSError:
-        pass
-    return roots
-
-
-def _upload_dir_inside(path: Path, root: Path) -> bool:
-    """True only for a real directory directly under `root` (never a symlink)."""
-    try:
-        return (path.name not in ("", ".", "..") and not path.is_symlink()
-                and path.is_dir() and path.resolve().parent == root.resolve())
-    except OSError:
-        return False
-
-
-def _remove_session_uploads(session_name: str) -> list[str]:
-    """Delete a deleted session's upload dir under every root.
-
-    Session names are unique on the tmux server, and an admin uploading into a
-    member's session writes under the admin root, so the name is looked up in all.
-    """
-    removed = []
-    if not session_name:
-        return removed
-    for root in _upload_roots():
-        target = root / session_name
-        if _upload_dir_inside(target, root):
-            shutil.rmtree(target, ignore_errors=True)
-            if not target.exists():
-                removed.append(str(target))
-    return removed
-
-
-def _live_tmux_session_names() -> set[str] | None:
-    """Every session on this dashboard's tmux server. None when tmux could not be
-    asked: the caller must then delete nothing."""
-    try:
-        r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
-                           capture_output=True, text=True, timeout=10)
-    except Exception:
-        return None
-    if r.returncode != 0:
-        err = (r.stderr or "").lower()
-        if "no server running" in err or "no sessions" in err:
-            return set()
-        return None
-    return {n.strip() for n in r.stdout.splitlines() if n.strip()}
-
-
-def _durable_session_names() -> set[str] | None:
-    """Sessions the lifecycle store still means to keep (a parked tab has no tmux
-    session but will come back with its uploads). None when unreadable."""
-    try:
-        snap = _session_lifecycle.snapshot()
-    except Exception:
-        return None
-    rows = (snap or {}).get("sessions") or {}
-    return {str(name) for name in rows}
-
-
-def _newest_mtime(path: Path) -> float:
-    newest = path.lstat().st_mtime
-    for base, dirs, files in os.walk(path):
-        for n in dirs + files:
-            try:
-                newest = max(newest, os.lstat(os.path.join(base, n)).st_mtime)
-            except OSError:
-                pass
-    return newest
-
-
-def _prune_orphan_uploads(max_age_days: float | None = None,
-                          now: float | None = None) -> dict:
-    """Remove upload dirs that belong to no live or durable session and have not
-    changed for max_age_days."""
-    days = UPLOADS_RETENTION_DAYS if max_age_days is None else max_age_days
-    out = {"removed": [], "kept_live": 0, "kept_recent": 0, "freed_bytes": 0}
-    if not days or days <= 0:
-        return out
-    live = _live_tmux_session_names()
-    durable = _durable_session_names()
-    if live is None or durable is None:
-        out["skipped"] = "tmux or lifecycle unavailable"
-        return out
-    owned = live | durable
-    cutoff = (now or time.time()) - days * 86400
-    for root in _upload_roots():
-        try:
-            entries = sorted(root.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            if not _upload_dir_inside(entry, root):
-                continue
-            if entry.name in owned:
-                out["kept_live"] += 1
-                continue
-            try:
-                if _newest_mtime(entry) >= cutoff:
-                    out["kept_recent"] += 1
-                    continue
-                size = sum(f.lstat().st_size for f in entry.rglob("*")
-                           if f.is_file() and not f.is_symlink())
-            except OSError:
-                continue
-            shutil.rmtree(entry, ignore_errors=True)
-            if not entry.exists():
-                out["removed"].append(str(entry))
-                out["freed_bytes"] += size
-    return out
-
-
-async def _uploads_retention_loop():
-    """Sweep orphaned upload dirs 10 minutes after boot, then every 6 hours."""
-    await asyncio.sleep(float(os.environ.get("TMUX_DASH_UPLOADS_FIRST_SWEEP_S", "600")))
-    while True:
-        try:
-            res = await asyncio.to_thread(_prune_orphan_uploads)
-            logger.info(
-                "Uploads retention: removed %d orphaned dir(s), %.1f MB; kept %d live, %d recent%s",
-                len(res["removed"]), res["freed_bytes"] / 1e6, res["kept_live"],
-                res["kept_recent"],
-                f" ({res['skipped']})" if res.get("skipped") else "",
-            )
-            if res["removed"]:
-                logger.info("Uploads retention removed: %s", ", ".join(res["removed"][:20]))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Uploads retention sweep failed")
-        await asyncio.sleep(UPLOADS_PRUNE_INTERVAL_S)
 
 
 @app.post("/api/sessions/{session_name}/upload")
@@ -17992,7 +17883,7 @@ async def _health_report() -> tuple[dict, int]:
             "ready_durable": int(inventory.get("ready_expected") or 0),
             "missing_durable": len(inventory.get("missing_expected") or []),
         },
-        "openai": bool(_tasks_openai_key() or (CODEX_HOME / "auth.json").exists()),
+        "openai": bool(_active_openai_key() or (CODEX_HOME / "auth.json").exists()),
         "data_dir": False,
     }
     try:
@@ -18379,6 +18270,16 @@ BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-sessio
 _browser_starting: dict[str, float] = {}
 _browser_sessions_lock = threading.Lock()
 BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
+
+
+def _browser_runtime_coordinates(slot: int) -> tuple[int, int, int, int]:
+    """Map a dashboard-local browser slot into host-global display and ports."""
+    try:
+        offset = int(os.environ.get("CB_BROWSER_SLOT_OFFSET") or 0)
+    except ValueError:
+        offset = 0
+    runtime_slot = max(0, int(slot)) + max(0, offset)
+    return 99 + runtime_slot, 5900 + runtime_slot, 6080 + runtime_slot, 9222 + runtime_slot
 _browser_operation_locks: dict[str, asyncio.Lock] = {}
 BROWSER_AUDIT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 BROWSER_AUDIT_MAX_EVENTS = 120
@@ -18399,7 +18300,7 @@ AUTO_AUTH_ENABLED = os.environ.get("TMUX_DASH_AUTO_AUTH", "0") == "1"
 # The launcher is self-bootstrapped (write-if-missing) so the feature is portable
 # and doesn't depend on a hand-placed file. Mirrors the pre-existing default
 # browser's start scripts, parameterized per session (display/ports/profile).
-_BROWSER_LAUNCHER_SCRIPT = r'''#!/usr/bin/env bash
+_BROWSER_LAUNCHER_SCRIPT_TEMPLATE = r'''#!/usr/bin/env bash
 # Parameterized EXTRA "Claude browser" session: a second/third independent
 # browser alongside the default one (display :99). Each gets its OWN Xvfb
 # display, fluxbox, x11vnc, websockify (localhost: reached via the tmux-dashboard
@@ -18482,6 +18383,15 @@ wait "$CHROME_PID"
 '''
 
 
+def _browser_launcher_script() -> str:
+    return _BROWSER_LAUNCHER_SCRIPT_TEMPLATE.replace(
+        "export HOME=/home/nimrod_rotem", f"export HOME={Path.home()}"
+    )
+
+
+_BROWSER_LAUNCHER_SCRIPT = _browser_launcher_script()
+
+
 def _ensure_browser_launcher():
     """Keep the on-disk launcher in sync with the copy above.
 
@@ -18504,11 +18414,12 @@ def _ensure_browser_launcher():
 # maps /ups-vnc/ -> 6080) with a password-protected x11vnc, so this dashboard's
 # viewer landed on UPS's RFB and hung on a VNC password prompt. There the
 # claude-vnc unit runs on 5902/6082 and these env vars point us at it.
+_DEFAULT_DISPLAY, _DEFAULT_RFB, _DEFAULT_VNC, _DEFAULT_CDP = _browser_runtime_coordinates(0)
 _DEFAULT_BROWSER_SESSION = {
-    "id": "default", "name": "Main browser", "slot": 0, "display": 99,
-    "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
-    "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
-    "cdp_port": int(os.environ.get("CB_DEFAULT_CDP_PORT") or 9222),
+    "id": "default", "name": "Main browser", "slot": 0, "display": _DEFAULT_DISPLAY,
+    "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or _DEFAULT_RFB),
+    "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or _DEFAULT_VNC),
+    "cdp_port": int(os.environ.get("CB_DEFAULT_CDP_PORT") or _DEFAULT_CDP),
     "managed": False,
     "lifecycle_managed": True,
     "systemd_unit": os.environ.get("CB_DEFAULT_SYSTEMD_UNIT", "claude-vnc.service"),
@@ -19134,7 +19045,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
         return JSONResponse({"error": f"Limit reached ({BROWSER_MAX_EXTRA} extra sessions)."}, status_code=400)
     slot = _next_browser_slot(sessions)
     sid = f"s{slot}"
-    disp, rfb, vnc, cdp = 99 + slot, 5900 + slot, 6080 + slot, 9222 + slot
+    disp, rfb, vnc, cdp = _browser_runtime_coordinates(slot)
     name = (body.name or "").strip() or f"Browser {slot + 1}"
     entry = {"id": sid, "name": name, "slot": slot, "display": disp, "rfb_port": rfb,
              "vnc_port": vnc, "cdp_port": cdp, "managed": True,
@@ -20612,7 +20523,7 @@ async def api_session_relogin(
 @app.post("/api/transcribe")
 async def api_transcribe(audio: UploadFile = File(...)):
     """Transcribe a recorded voice clip to text (for the composer mic button)."""
-    key = _voice_openai_key()
+    key = _managed_openai_key("voice")
     if not key:
         return JSONResponse({"error": "Transcription is not configured."}, status_code=503)
     try:
@@ -28542,6 +28453,9 @@ body.member-simple .nav-codex-alert{display:none !important}
 .nav-usage-meta{color:#6e7681;font-size:.58rem;font-family:'SF Mono','Fira Code',Consolas,monospace;min-width:92px}
 .nav-usage.disabled{display:none}
 .nav-status-text{display:none}
+/* The one thing worth the room is the page admitting it has STOPPED watching:
+   a stale pill is indistinguishable from a live one, so say it out loud. */
+.nav-status-text.poll-stalled{display:inline-flex;align-items:center;gap:6px;background:#3a2d0b;color:#d29922;border:1px solid #5a4510;border-radius:999px;padding:3px 10px;font-size:.7rem;font-weight:600;white-space:nowrap}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
@@ -29469,8 +29383,8 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-plan-window{display:flex;align-items:center;gap:5px;white-space:nowrap;line-height:1}
 .nav-plan-window>span:first-child{min-width:22px;color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;text-transform:uppercase}
 .nav-plan-window>span:last-child{width:26px;text-align:right;color:#c9d1d9;font-size:.6rem;font-weight:600;font-variant-numeric:tabular-nums}
-.nav-plan-meter{display:inline-flex;flex-direction:column;align-items:center;gap:1px;width:22px}
-.nav-plan-reset{height:7px;color:#8b949e;font-size:.48rem;line-height:7px;font-variant-numeric:tabular-nums}
+.nav-plan-meter{display:inline-flex;flex-direction:column;align-items:center;gap:2px;width:22px}
+.nav-plan-reset{height:8px;color:#8b949e;font-size:.53rem;line-height:8px;font-variant-numeric:tabular-nums;transform:translateY(-1px)}
 .nav-plan-window .nav-usage-bar{display:block;width:22px;height:4px}
 .message-jumped{background:#263f28;border-radius:4px;outline:1px solid #3fb950}
 @media(max-width:600px){.nav-plan-bars{font-size:9px}.nav-plan-window .nav-usage-bar,.nav-stat-bar{width:20px}}
@@ -29824,7 +29738,6 @@ const _CODEX_VERB_RE=/^(?:Wait(?:ed|ing) for background terminal|Ran|Explored|Ca
 const _CODEX_FILEOP_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
 const _CODEX_FILEOP_TARGET_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\s+(?:\d+\s+files?|\S+)\s*$/;
 const _CODEX_DIFF_ROW_RE=/^\s+\d+(?:\s+[+-]|[+-]\s|[ \t]{2,}\S)/;
-const _CLIPPED_DIFF_ROW_RE=/^\s*\d+(?:\s+[+-]|[+-]\s|[ \t]{2,}\S)/;
 function _isToolHeader(line,followerIsMarker,followerIsDiff=false){
   const stripped=line.replace(_ANY_DECORATION_RE,'');
   if(_TOOL_PAREN_RE.test(stripped))return true;
@@ -30230,17 +30143,14 @@ function _clippedPytestOutput(lines,start){
 }
 function _clippedFileDiff(lines,start){
   // A capture can begin inside an edit preview, after its header is gone.
-  // Require two numbered diff rows and at least one signed change, keeping
-  // ordinary numbered prose intact while accepting a context row plus change.
-  let rows=0,changes=0;
+  // Require two numbered change rows, keeping ordinary numbered prose intact.
+  let changes=0;
   for(let j=start;j>=0&&j<Math.min(lines.length,start+20);j++){
     const row=_plainTerminalRow(lines[j]);
     if(/^\s*[•●⏺❯›»>`~]/.test(row))break;
-    if(_CLIPPED_DIFF_ROW_RE.test(row)){
-      rows++;
-      if(/^\s*\d+\s+[+-]/.test(row))changes++;
-      if(rows>=2&&changes>=1)return true;
-    }else if(row.trim()&&!/^\s/.test(row)&&!rows)break;
+    if(/^\s*\d+\s+[+-]/.test(row)){
+      if(++changes===2)return true;
+    }else if(row.trim()&&!/^\s/.test(row)&&!changes)break;
   }
   return false;
 }
@@ -30315,7 +30225,7 @@ function applyRawFilter(text){
          _clippedIndentedOutput(lines,nextNonEmpty[hintEnd])))mode='output';
       i=hintEnd;continue;
     }
-    if(!mode&&_CLIPPED_DIFF_ROW_RE.test(plain)&&!out.some(row=>row.trim())&&
+    if(!mode&&/^\s*\d+\s+[+-]/.test(plain)&&!out.some(row=>row.trim())&&
        _clippedFileDiff(lines,i)){mode='output';continue;}
     // A quote in visible conversation stays visible. Inside established tool
     // output, pytest's `> assert ...` source marker is part of that output.
@@ -30947,7 +30857,7 @@ function _paintHistoryControl(name,parts,h){
   parts.button.textContent='Retry full session history';
   parts.control.style.display=(h.loading||h.error)?'flex':'none';
   parts.note.textContent=h.error||(h.loading?'Loading full session history…':h.atStart&&!h.entries.length?'No saved conversation messages yet.':'Saved session history');
-  parts.divider.hidden=!h.loaded||!h.tools;
+  parts.divider.hidden=!h.loaded;
 }
 function _terminalParts(name){
   const scroll=document.getElementById('raw-'+name);
@@ -32129,6 +32039,8 @@ function catalogModelId(model){
 // Seed list; refreshed from the installed Codex CLI through /api/models.
 let MODEL_CHOICES=[
   ['gpt-6-astra','GPT-6 Astra'],
+  ['gpt-6-sol','GPT-6 Sol'],
+  ['gpt-6-luna','GPT-6 Luna'],
   ['gpt-5.6-sol','GPT-5.6 Sol'],
   ['gpt-5.6-terra','GPT-5.6 Terra'],
   ['gpt-5.6-luna','GPT-5.6 Luna'],
@@ -32139,6 +32051,8 @@ let MODEL_CHOICES=[
 let EFFORT_CHOICES=['none','low','medium','high','xhigh','max','ultra'];
 let MODEL_EFFORTS={
   'gpt-6-astra':['low','medium','high','xhigh','max','ultra'],
+  'gpt-6-sol':['low','medium','high','xhigh','max','ultra'],
+  'gpt-6-luna':['low','medium','high','xhigh','max'],
   'gpt-5.6-sol':['low','medium','high','xhigh','max','ultra'],
   'gpt-5.6-terra':['low','medium','high','xhigh','max','ultra'],
   'gpt-5.6-luna':['low','medium','high','xhigh','max'],
@@ -32146,8 +32060,8 @@ let MODEL_EFFORTS={
   'gpt-5.4-mini':['low','medium','high','xhigh'],
   'gpt-5.3-codex-spark':['low','medium','high','xhigh'],
 };
-let DEFAULT_EFFORT='xhigh';
-let NEW_SESSION_DEFAULTS={model:'gpt-6-astra',effort:'max',no_fallback:false};
+let DEFAULT_EFFORT='high';
+let NEW_SESSION_DEFAULTS={model:'gpt-6-sol',effort:'high',no_fallback:false};
 (function loadModelChoices(){
   try{
     fetch(BASE+'/api/models').then(r=>r.ok?r.json():null).then(d=>{
@@ -32252,8 +32166,13 @@ function _paintModelBadge(name){
   const me=document.getElementById('more-effort-'+name);
   if(me)me.textContent=effort+' ▾';
 }
+function confirmExpensiveSettings(model,effort){
+  if(!/astra/i.test(model||'')&&!['max','ultra'].includes(String(effort||'').toLowerCase()))return true;
+  return confirm('Are you sure? Current benchmarks show that Astra, Max, and Ultra burn many more tokens for little benefit. Continue?');
+}
 async function setSessionModel(name,model){
   closeModelMenu();
+  if(!confirmExpensiveSettings(model,''))return;
   const si=sessions.findIndex(s=>s.name===name);
   const prev=si>=0?(sessions[si].model_pending||''):'';
   let saved=false;
@@ -32294,6 +32213,7 @@ async function setSessionModel(name,model){
 
 async function setSessionEffort(name,effort){
   closeModelMenu();
+  if(!confirmExpensiveSettings('',effort))return;
   const s=sessions.find(x=>x.name===name);
   const previous=s?s.effort:'';
   let saved=false;
@@ -34479,7 +34399,50 @@ async function pollTabLabels(){
   }catch(e){}
 }
 
+// Two URLs for one payload, and the page swaps between them after three misses
+// in a row. Measured on the Claude line 2026-09-21: a browser ran ~2,175 poll
+// ticks over six hours and not one GET /api/status left it, while other fetches
+// from the same function arrived every time.
+const _STATUS_URLS=['/api/status','/api/activity'];
+let _statusUrlIdx=0;
+let _pollFails=0;
+let _lastPollOk=Date.now();
+let _pollInFlight=false;
+// A poll that never answers used to hold the loop for ever: no request, no
+// error, no sign. Eight seconds is longer than this endpoint takes even while
+// it walks a dozen panes, and an abort at least fails LOUDLY.
+async function _fetchStatus(){
+  const url=BASE+_STATUS_URLS[_statusUrlIdx];
+  if(typeof AbortController!=='function')return fetch(url);
+  const ctl=new AbortController();
+  const t=setTimeout(()=>ctl.abort(),8000);
+  try{return await fetch(url,{signal:ctl.signal})}
+  finally{clearTimeout(t)}
+}
+// Silence is what let a frozen page pass for a live one. Name the state.
+function _paintPollHealth(){
+  if(typeof statusInfoEl==='undefined'||!statusInfoEl)return;
+  const stalled=_pollFails>0&&Date.now()-_lastPollOk>25000;
+  statusInfoEl.classList.toggle('poll-stalled',stalled);
+  if(!stalled)return;
+  const secs=Math.round((Date.now()-_lastPollOk)/1000);
+  statusInfoEl.textContent='Live status stalled '+(secs<120?secs+'s':Math.round(secs/60)+'m')+' - retrying';
+}
+// The poll timer can die outright: a throw in the callback, a tab the browser
+// froze and resumed without its timers. A second, cheaper clock supervises it.
+// 17s so it cannot fall into step with the 10s poll and double every tick.
+setInterval(function(){
+  if(Date.now()-_lastPollOk<30000)return;
+  if(typeof pollTimer!=='undefined'&&!pollTimer&&typeof startStatusPolling==='function')startStatusPolling();
+  try{pollStatus()}catch(e){}
+  _paintPollHealth();
+},17000);
 async function pollStatus(){
+  if(_pollInFlight)return;
+  _pollInFlight=true;
+  try{await _pollStatusOnce()}finally{_pollInFlight=false}
+}
+async function _pollStatusOnce(){
   await reconcileSessionRoster();
   refreshActiveChat();
   // A hidden tab normally rests, but a tab waiting to announce a request must
@@ -34493,8 +34456,12 @@ async function pollStatus(){
   const needsCacheStatus=sessions.some(s=>['warm','warning'].includes(_cacheTelemetryState(s).phase));
   if(document.hidden&&!Object.keys(_completionWatch).length&&!hasBusySession&&!needsIdleNudgeStatus&&!needsCacheStatus)return;
   try{
-    const resp=await fetch(BASE+'/api/status');
+    const resp=await _fetchStatus();
+    if(!resp.ok)throw new Error('HTTP '+resp.status);
     const statuses=await resp.json();
+    _pollFails=0;
+    _lastPollOk=Date.now();
+    if(typeof statusInfoEl!=='undefined'&&statusInfoEl)statusInfoEl.classList.remove('poll-stalled');
     let changed=false;
     for(const st of statuses){
       const prev=lastStatus[st.name];
@@ -34544,7 +34511,15 @@ async function pollStatus(){
       }
     }
     if(!changed)statusInfoEl.textContent='Watching for changes...';
-  }catch(e){statusInfoEl.textContent='Status poll failed'}
+  }catch(e){
+    _pollFails++;
+    // Three in a row is not a slow box, it is a path that is not working. Swap
+    // URLs every third miss, so each name gets the same three chances.
+    if(_pollFails%3===0)_statusUrlIdx=(_statusUrlIdx+1)%_STATUS_URLS.length;
+    _paintPollHealth();
+    // One off-cycle second chance, and only the first time.
+    if(_pollFails===1)setTimeout(function(){try{pollStatus()}catch(e2){}},1500);
+  }
   _authPollCount++;
   if(_authPollCount%5===0)checkCodexAuth();
   // Refresh inline server stats every 3rd poll (~30s)
@@ -34913,6 +34888,7 @@ async function recoverTabs(){
 }
 
 let _sessionCreatePending=false;
+let _newSessionCostConfirmed=false;
 function _autoSessionName(){
   const chars='abcdefghijklmnopqrstuvwxyz0123456789';
   const bytes=crypto.getRandomValues(new Uint8Array(8));
@@ -34941,6 +34917,7 @@ async function _waitForCreatedSession(name){
 }
 function showCreateModal(prefill='',choices=null){
   if(_sessionCreatePending)return;
+  if(!choices)_newSessionCostConfirmed=false;
   const modal=document.getElementById('modal-content');
   modal.classList.remove('modal-wide');
   const selected=choices||NEW_SESSION_DEFAULTS;
@@ -34950,10 +34927,10 @@ function showCreateModal(prefill='',choices=null){
     <p class="conn-note">Leave empty to generate a random name. Automatic naming is optional in Settings.</p>
     <div style="display:flex;gap:12px;flex-wrap:wrap;margin:16px 0">
       <label style="flex:1;min-width:150px" for="new-session-model">Model
-        <select id="new-session-model" style="display:block;width:100%;margin-top:6px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;color-scheme:dark" onchange="updateNewSessionEfforts()">${MODEL_CHOICES.map(([id,label])=>`<option value="${esc(id)}" ${id===selected.model?'selected':''}>${esc(label)}</option>`).join('')}</select>
+        <select id="new-session-model" style="display:block;width:100%;margin-top:6px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;color-scheme:dark" onchange="onNewSessionModelChange()">${MODEL_CHOICES.map(([id,label])=>`<option value="${esc(id)}" ${id===selected.model?'selected':''}>${esc(label)}</option>`).join('')}</select>
       </label>
       <label style="flex:1;min-width:110px" for="new-session-effort">Effort
-        <select id="new-session-effort" style="display:block;width:100%;margin-top:6px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;color-scheme:dark"></select>
+        <select id="new-session-effort" style="display:block;width:100%;margin-top:6px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;color-scheme:dark" onchange="onNewSessionEffortChange()"></select>
       </label>
     </div>
     <label style="display:flex;align-items:flex-start;gap:8px" for="new-session-nofb"><input id="new-session-nofb" type="checkbox" ${selected.no_fallback?'checked':''} style="width:auto;margin-top:3px">Refuse automatic model fallback</label>
@@ -34963,17 +34940,43 @@ function showCreateModal(prefill='',choices=null){
     <button class="modal-confirm-create" onclick="createSession()">Create</button></div>`;
   document.getElementById('modal-overlay').classList.add('active');
   updateNewSessionEfforts(selected.effort);
+  document.getElementById('new-session-model').dataset.previous=selected.model;
+  document.getElementById('new-session-effort').dataset.previous=selected.effort;
   setTimeout(()=>document.getElementById('new-session-name')?.focus(),50);
+}
+function onNewSessionModelChange(){
+  const select=document.getElementById('new-session-model');
+  if(!select)return;
+  const previous=select.dataset.previous||NEW_SESSION_DEFAULTS.model;
+  if(select.value!==previous&&!confirmExpensiveSettings(select.value,'')){
+    select.value=previous;
+  }else if(select.value!==previous&&/astra/i.test(select.value)){
+    _newSessionCostConfirmed=true;
+  }
+  select.dataset.previous=select.value;
+  updateNewSessionEfforts();
+}
+function onNewSessionEffortChange(){
+  const select=document.getElementById('new-session-effort');
+  if(!select)return;
+  const previous=select.dataset.previous||NEW_SESSION_DEFAULTS.effort;
+  if(select.value!==previous&&!confirmExpensiveSettings('',select.value)){
+    select.value=previous;
+  }else if(select.value!==previous&&['max','ultra'].includes(select.value)){
+    _newSessionCostConfirmed=true;
+  }
+  select.dataset.previous=select.value;
 }
 function updateNewSessionEfforts(preferred){
   const model=document.getElementById('new-session-model');
   const select=document.getElementById('new-session-effort');
   if(!model||!select)return;
-  const requested=preferred||select.value||'max';
+  const requested=preferred||select.value||'high';
   const supported=MODEL_EFFORTS[model.value]||[];
   const ceiling=EFFORT_CHOICES.indexOf(requested);
   const chosen=supported.includes(requested)?requested:EFFORT_CHOICES.slice(0,ceiling>=0?ceiling+1:6).reverse().find(e=>supported.includes(e));
   select.innerHTML=supported.map(e=>`<option value="${esc(e)}" ${e===chosen?'selected':''}>${esc(e==='xhigh'?'Extra high':e.charAt(0).toUpperCase()+e.slice(1))}</option>`).join('');
+  select.dataset.previous=chosen||'';
 }
 function createSessionAuto(){showCreateModal()}
 async function createSession(){
@@ -34982,6 +34985,8 @@ async function createSession(){
   const choices={model:document.getElementById('new-session-model')?.value||NEW_SESSION_DEFAULTS.model,
     effort:document.getElementById('new-session-effort')?.value||NEW_SESSION_DEFAULTS.effort,
     no_fallback:!!document.getElementById('new-session-nofb')?.checked};
+  if(!_newSessionCostConfirmed&&!confirmExpensiveSettings(choices.model,choices.effort))return;
+  if(/astra/i.test(choices.model)||['max','ultra'].includes(choices.effort))_newSessionCostConfirmed=true;
   _sessionCreatePending=true;
   const run=++_sessionCreateRun;
   const overlay=document.getElementById('modal-overlay');

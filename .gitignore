@@ -1,75 +1,80 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environments
-venv/
-.venv/
-env/
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# Linters
-.ruff_cache/
-.mypy_cache/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Backup files
-*.bak-*
-*.orig
-*.pre-skills-backup
-
-# Pidfiles, archives
-*.pid
-*.tar.gz
-
-# Local QA artifacts and one-off patch scripts
-qa-output/
-fix_*.py
-patch_*.py
-patch[0-9]*.py
-
-# Codex local config
-.codex/
-.codex-config.toml
-codex-config.tmp.toml
-
-# Project-specific: non-source files in repo root
-*.zip
-*.xlsx
-*.csv
-*.png
-*.jpg
-*.jpeg
-
-# ...but allow screenshots used in README
-!screenshots/
-!screenshots/**
-
-# Generated data / logs
-*.jsonl
-*.log
-
-# Environment / secrets
 .env
 .env.*
+*.pem
+*.key
+*token*
+users.json
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.bak*
+*.orig
+*.log
+logs/
+data/
+evidence/
+pipelinesdocs*/
+
+# --- per-tree ignores (runtime state and stray copies) ---
+.codex-builder-usage/
+.codex2-incident-*/
+.converge-backup-*/
+.upgrade-backup-*/
+.backup-plan-only-*/
+.usage-header-pr/
+.ruff_cache/
+.work/
+.worktrees/
+screenshots/
+*.orig
+*.before-*
+=s
+patent-submission-rules.zip
+
+# --- live-tree safety block (added 2026-09-24 when this live tree went into git) ---
+*.bak
+*.bak-*
+*.bak.*
+*.bak_*
+*.orig
+*.pyc
+__pycache__/
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+.tenant_secret
+*.secret
+*secret*.json
+*secret*.txt
+*token*.json
+*token*.txt
+.*token*
+*.token
+credentials*.json
+service-account*.json
+*.db
+*.db-*
+*.db.*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.log
+*.log.*
+logs/
+venv/
+.venv/
+venv*/
+node_modules/
+uploads/
+backups/
+backup_*/
+code-backups/
+.pytest_cache/
