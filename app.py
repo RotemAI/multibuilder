@@ -2368,6 +2368,7 @@ async def lifespan(_app: FastAPI):
         ("session tab labels", _session_tab_label_loop()),
         ("session chat summaries", _session_chat_summary_loop()),
         ("controller snapshot", _controller_snapshot_loop()),
+        ("uploads retention", _uploads_retention_loop()),
         ("advisor account sync", sync_advisor_accounts()),
     )
     for label, coroutine in controller_loops:
@@ -16238,6 +16239,13 @@ async def _api_delete_session_unlocked(
         )
         if _load_session_owners().get(session_name) == owner_id:
             _clear_session_owner(session_name)
+        # Files uploaded into this session die with it.
+        try:
+            gone = await asyncio.to_thread(_remove_session_uploads, session_name)
+            if gone:
+                logger.info("Session '%s': removed uploads %s", session_name, gone)
+        except Exception:
+            logger.warning("Session '%s': uploads cleanup failed", session_name, exc_info=True)
         logger.info("Session deleted: '%s'", session_name)
         payload = {"ok": True, "killed": session_name}
         if virtual:
@@ -16368,6 +16376,156 @@ UPLOADS_DIR = MESSAGES_DIR / "uploads"
 
 def _session_uploads_dir(session_name: str) -> Path:
     return _user_uploads_dir(_user_for_session(session_name)) / session_name
+
+
+# Uploads used to outlive their session forever: a deleted session left its files
+# under ~/.tmux-dashboard/uploads/ and users/<id>/uploads/ (492 MB on builder6,
+# 2026-09-23). A session's own dir now goes when the session is deleted, and a
+# periodic sweep removes a dir that no live or durable session can own once nothing
+# in it has changed for UPLOADS_RETENTION_DAYS (0 disables the sweep).
+UPLOADS_RETENTION_DAYS = float(os.environ.get("TMUX_DASH_UPLOADS_RETENTION_DAYS", "14") or 0)
+UPLOADS_PRUNE_INTERVAL_S = 6 * 3600
+
+
+def _upload_roots() -> list[Path]:
+    """The admin uploads root plus every account's, without creating any."""
+    roots = [UPLOADS_DIR]
+    users_dir = MESSAGES_DIR / "users"
+    try:
+        for entry in sorted(users_dir.iterdir()):
+            root = entry / "uploads"
+            if not entry.is_symlink() and not root.is_symlink() and root.is_dir():
+                roots.append(root)
+    except OSError:
+        pass
+    return roots
+
+
+def _upload_dir_inside(path: Path, root: Path) -> bool:
+    """True only for a real directory directly under `root` (never a symlink)."""
+    try:
+        return (path.name not in ("", ".", "..") and not path.is_symlink()
+                and path.is_dir() and path.resolve().parent == root.resolve())
+    except OSError:
+        return False
+
+
+def _remove_session_uploads(session_name: str) -> list[str]:
+    """Delete a deleted session's upload dir under every root.
+
+    Session names are unique on the tmux server, and an admin uploading into a
+    member's session writes under the admin root, so the name is looked up in all.
+    """
+    removed = []
+    if not session_name:
+        return removed
+    for root in _upload_roots():
+        target = root / session_name
+        if _upload_dir_inside(target, root):
+            shutil.rmtree(target, ignore_errors=True)
+            if not target.exists():
+                removed.append(str(target))
+    return removed
+
+
+def _live_tmux_session_names() -> set[str] | None:
+    """Every session on this dashboard's tmux server. None when tmux could not be
+    asked: the caller must then delete nothing."""
+    try:
+        r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        err = (r.stderr or "").lower()
+        if "no server running" in err or "no sessions" in err:
+            return set()
+        return None
+    return {n.strip() for n in r.stdout.splitlines() if n.strip()}
+
+
+def _durable_session_names() -> set[str] | None:
+    """Sessions the lifecycle store still means to keep (a parked tab has no tmux
+    session but will come back with its uploads). None when unreadable."""
+    try:
+        snap = _session_lifecycle.snapshot()
+    except Exception:
+        return None
+    rows = (snap or {}).get("sessions") or {}
+    return {str(name) for name in rows}
+
+
+def _newest_mtime(path: Path) -> float:
+    newest = path.lstat().st_mtime
+    for base, dirs, files in os.walk(path):
+        for n in dirs + files:
+            try:
+                newest = max(newest, os.lstat(os.path.join(base, n)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def _prune_orphan_uploads(max_age_days: float | None = None,
+                          now: float | None = None) -> dict:
+    """Remove upload dirs that belong to no live or durable session and have not
+    changed for max_age_days."""
+    days = UPLOADS_RETENTION_DAYS if max_age_days is None else max_age_days
+    out = {"removed": [], "kept_live": 0, "kept_recent": 0, "freed_bytes": 0}
+    if not days or days <= 0:
+        return out
+    live = _live_tmux_session_names()
+    durable = _durable_session_names()
+    if live is None or durable is None:
+        out["skipped"] = "tmux or lifecycle unavailable"
+        return out
+    owned = live | durable
+    cutoff = (now or time.time()) - days * 86400
+    for root in _upload_roots():
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not _upload_dir_inside(entry, root):
+                continue
+            if entry.name in owned:
+                out["kept_live"] += 1
+                continue
+            try:
+                if _newest_mtime(entry) >= cutoff:
+                    out["kept_recent"] += 1
+                    continue
+                size = sum(f.lstat().st_size for f in entry.rglob("*")
+                           if f.is_file() and not f.is_symlink())
+            except OSError:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                out["removed"].append(str(entry))
+                out["freed_bytes"] += size
+    return out
+
+
+async def _uploads_retention_loop():
+    """Sweep orphaned upload dirs 10 minutes after boot, then every 6 hours."""
+    await asyncio.sleep(float(os.environ.get("TMUX_DASH_UPLOADS_FIRST_SWEEP_S", "600")))
+    while True:
+        try:
+            res = await asyncio.to_thread(_prune_orphan_uploads)
+            logger.info(
+                "Uploads retention: removed %d orphaned dir(s), %.1f MB; kept %d live, %d recent%s",
+                len(res["removed"]), res["freed_bytes"] / 1e6, res["kept_live"],
+                res["kept_recent"],
+                f" ({res['skipped']})" if res.get("skipped") else "",
+            )
+            if res["removed"]:
+                logger.info("Uploads retention removed: %s", ", ".join(res["removed"][:20]))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Uploads retention sweep failed")
+        await asyncio.sleep(UPLOADS_PRUNE_INTERVAL_S)
 
 
 @app.post("/api/sessions/{session_name}/upload")
@@ -29379,15 +29537,15 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.working .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299;animation:nbb-blink 1s ease-in-out infinite}
 .nav-browser-badge.working{border-color:#d29922}
 .nav-browser-badge.working .nbb-glyph{filter:none}
-.nav-plan-bars{display:flex;flex-direction:column;justify-content:center;gap:2px;font-size:10px;flex-shrink:0}
-.nav-plan-window{display:flex;align-items:center;gap:5px;white-space:nowrap;line-height:1}
-.nav-plan-window>span:first-child{min-width:22px;color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;text-transform:uppercase}
-.nav-plan-window>span:last-child{width:26px;text-align:right;color:#c9d1d9;font-size:.6rem;font-weight:600;font-variant-numeric:tabular-nums}
-.nav-plan-meter{display:inline-flex;flex-direction:column;align-items:center;gap:2px;width:22px}
-.nav-plan-reset{height:8px;color:#8b949e;font-size:.53rem;line-height:8px;font-variant-numeric:tabular-nums;transform:translateY(-1px)}
-.nav-plan-window .nav-usage-bar{display:block;width:22px;height:4px}
+.nav-plan-bars{display:flex;flex-direction:column;justify-content:center;gap:4px;font-size:11px;flex-shrink:0}
+.nav-plan-window{display:flex;align-items:center;gap:7px;white-space:nowrap;line-height:1}
+.nav-plan-window>span:first-child{min-width:22px;color:#8b949e;font-weight:600;font-size:10px;letter-spacing:.04em;text-transform:uppercase}
+.nav-plan-window>span:last-child{width:32px;text-align:right;color:#c9d1d9;font-size:11px;font-weight:600;font-variant-numeric:tabular-nums}
+.nav-plan-meter{display:inline-flex;flex-direction:column;align-items:center;gap:5px;width:54px}
+.nav-plan-reset{height:13px;color:#aab3bf;font-size:11px;line-height:13px;font-variant-numeric:tabular-nums}
+.nav-plan-window .nav-usage-bar{display:block;width:54px;height:5px}
 .message-jumped{background:#263f28;border-radius:4px;outline:1px solid #3fb950}
-@media(max-width:600px){.nav-plan-bars{font-size:9px}.nav-plan-window .nav-usage-bar,.nav-stat-bar{width:20px}}
+@media(max-width:600px){.nav-stat-bar{width:20px}}
 
 @media(max-width:768px){.nav-plan-bars{display:flex}.nav-right>.nav-browser-badge{min-width:36px;min-height:44px;padding:4px}.nav-right{gap:0;min-width:0}.top-nav{min-width:0}.nav-new-mobile-btn{margin-right:2px}}
 @media(prefers-reduced-motion:reduce){.message-jumped,.nav-browser-badge.working .nbb-dot{animation:none}}
