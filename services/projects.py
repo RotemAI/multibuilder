@@ -553,6 +553,11 @@ def _projects_page_html(title: str, rows):
 
 
 def _run_api_server(workers: int) -> None:
+    # Honour the TMUX_DASH_BIND documented in .env.example rather than always
+    # listening on every interface. On grabo.cc this app's own login is off
+    # (nginx SSO gates it instead), so a non-loopback bind would hand out
+    # passwordless shells to anything that can reach port 8501.
+    bind_host = os.environ.get("TMUX_DASH_BIND", "0.0.0.0").strip() or "0.0.0.0"
     # WebSocket keepalive — this is what stopped the noVNC viewers dropping every
     # ~minute. A viewer watching a STATIC desktop sends/receives nothing, and
     # uvicorn's default ws implementation on websockets>=14 ("websockets_sansio")
@@ -563,11 +568,11 @@ def _run_api_server(workers: int) -> None:
     # so a Ping/Pong flows every 25s and every hop keeps the tunnel open. The
     # generous ping_timeout avoids killing a healthy viewer over one late pong.
     try:
-        uvicorn.run("app:app", host="0.0.0.0", port=PORT, workers=workers,
+        uvicorn.run("app:app", host=bind_host, port=PORT, workers=workers,
                     ws="websockets", ws_ping_interval=25, ws_ping_timeout=120)
     except (ValueError, ImportError, KeyError):
         # The legacy implementation is deprecated upstream; if a future uvicorn
         # drops it, fall back to the default rather than failing to boot.
         logger.warning("uvicorn ws='websockets' unavailable — falling back to the default "
                        "implementation (WebSocket keepalive pings will be disabled)")
-        uvicorn.run("app:app", host="0.0.0.0", port=PORT, workers=workers)
+        uvicorn.run("app:app", host=bind_host, port=PORT, workers=workers)
